@@ -22,7 +22,6 @@ and potentially to enterprise/institutional use later.
 ## House rules
 - NEVER commit secrets. All credentials go in `.env` (gitignored), loaded
   via `config/settings.py` using python-dotenv.
-- Default to PAPER/SANDBOX mode for any broker connection unless I
   explicitly say to use live trading.
 - Every order attempt, fill, and signal must be logged with a timestamp
   via `storage/`.
@@ -37,7 +36,9 @@ and potentially to enterprise/institutional use later.
 - Repo scaffolded, folder structure in place.
 - `BrokerAdapter` interface defined in execution/broker_adapter.py.
 - Venue not yet chosen — deciding between IBKR+SPY and Coinbase+BTC/USDC.
-- No live or paper trading credentials configured yet.
+- `CoinbaseAdapter.connect()` and `get_quote()` are working against the live
+  Coinbase Advanced Trade API, using a CDP production key loaded from
+  `cdp_api_key.json`.
 
 ## Tech stack
 - Python 3.12, venv

@@ -26,6 +26,21 @@ class Order:
     status: str
 
 
+@dataclass
+class Position:
+    symbol: str
+    quantity: float
+    avg_cost: float
+
+
+@dataclass
+class OrderResult:
+    order_id: str
+    status: str
+    filled_qty: Decimal
+    avg_fill_price: Optional[Decimal]
+
+
 class BrokerAdapter(ABC):
     """Interface for all broker integrations."""
 
@@ -62,6 +77,16 @@ class BrokerAdapter(ABC):
         ...
 
     @abstractmethod
-    def get_account_balance(self) -> dict[str, Decimal]:
+    def get_balances(self) -> dict[str, Decimal]:
         """Return a mapping of asset symbol → available balance."""
+        ...
+
+    @abstractmethod
+    def get_balance(self) -> float:
+        """Return the available balance of the account's quote currency (e.g. USDC)."""
+        ...
+
+    @abstractmethod
+    def get_position(self, symbol: str) -> Optional[Position]:
+        """Return the current Position for *symbol*, or None if there is none."""
         ...
