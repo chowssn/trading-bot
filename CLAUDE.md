@@ -46,3 +46,5 @@ and potentially to enterprise/institutional use later.
 - SQLite (storage/) for now, may move to Postgres later
 - python-dotenv for config
 - pytest for testing
+
+Storage uses SQLite at DB_PATH (from .env, default storage/trading.db). Indexes exist on (symbol, timestamp) for all tables. Migration path to Postgres is via storage/db.py only — no other layer touches DB internals directly.
