@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -17,7 +18,7 @@ class CoinbaseAdapter(BrokerAdapter):
     """BrokerAdapter implementation backed by the Coinbase Advanced Trade REST API.
 
     Credentials are read from cdp_api_key.json at the repo root:
-        id         — CDP API key name (e.g. "organizations/.../apiKeys/...")
+        id         — CDP API key ID (used to build the full apiKeys/ path)
         privateKey — EC private key PEM string
     """
 
@@ -26,8 +27,13 @@ class CoinbaseAdapter(BrokerAdapter):
 
     def connect(self) -> None:
         """Instantiate and store a RESTClient using credentials from cdp_api_key.json."""
-        creds = json.loads(_CDP_KEY_FILE.read_text())
-        self.client = RESTClient(api_key=creds["id"], api_secret=creds["privateKey"])
+        key_data = json.loads(_CDP_KEY_FILE.read_text())
+        full_name = f"organizations/cdfa7c9a-4800-53ca-992e-a39d9cbc394d/apiKeys/{key_data['id']}"
+        self.client = RESTClient(
+            key_file=StringIO(
+                json.dumps({"name": full_name, "privateKey": key_data["privateKey"]})
+            )
+        )
 
     def _require_client(self) -> RESTClient:
         if self.client is None:
