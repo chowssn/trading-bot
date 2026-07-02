@@ -5,3 +5,4 @@ __pycache__/
 *.db
 .claude/
 cdp_api_key.json
+KILL_SWITCH
