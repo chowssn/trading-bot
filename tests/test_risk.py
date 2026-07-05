@@ -150,6 +150,75 @@ class TestRiskManager(unittest.TestCase):
         self.assertTrue(approved)
         self.assertEqual(reason, "approved")
 
+    def test_drawdown_within_threshold_approved(self):
+        approved, reason = self.risk.check_portfolio_drawdown(
+            current_value=90.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.assertTrue(approved)
+        self.assertEqual(reason, "approved")
+
+    def test_drawdown_exceeds_threshold_blocked(self):
+        approved, reason = self.risk.check_portfolio_drawdown(
+            current_value=80.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.assertFalse(approved)
+        self.assertEqual(
+            reason, "portfolio drawdown limit reached — manual reset required"
+        )
+
+    def test_drawdown_circuit_stays_tripped_until_reset(self):
+        self.risk.check_portfolio_drawdown(
+            current_value=80.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+
+        approved, reason = self.risk.check_portfolio_drawdown(
+            current_value=100.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.assertFalse(approved)
+        self.assertEqual(
+            reason, "portfolio drawdown limit reached — manual reset required"
+        )
+
+        self.risk.reset_drawdown_circuit()
+
+        approved, reason = self.risk.check_portfolio_drawdown(
+            current_value=100.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.assertTrue(approved)
+        self.assertEqual(reason, "approved")
+
+    def test_drawdown_peak_updates_internally(self):
+        self.risk.check_portfolio_drawdown(
+            current_value=100.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.risk.check_portfolio_drawdown(
+            current_value=120.0,
+            peak_value=120.0,
+            max_drawdown_threshold=0.15,
+        )
+
+        approved, reason = self.risk.check_portfolio_drawdown(
+            current_value=90.0,
+            peak_value=100.0,
+            max_drawdown_threshold=0.15,
+        )
+        self.assertFalse(approved)
+        self.assertEqual(
+            reason, "portfolio drawdown limit reached — manual reset required"
+        )
+
     def test_bearish_signal_approved(self):
         approved, reason = self.risk.check(
             signal_value=-1,

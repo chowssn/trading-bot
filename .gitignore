@@ -7,3 +7,5 @@ __pycache__/
 cdp_api_key.json
 KILL_SWITCH
 logs/
+backtest/data/
+backtest/results/

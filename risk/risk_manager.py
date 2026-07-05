@@ -35,6 +35,8 @@ class RiskManager:
         self.max_orders_per_hour = max_orders_per_hour
         self.kill_switch_path = kill_switch_path
         self._order_timestamps: list[datetime] = []
+        self._peak_value: float | None = None
+        self._drawdown_circuit_tripped = False
 
     def check(
         self,
@@ -87,6 +89,47 @@ class RiskManager:
     def reset_order_history(self) -> None:
         """Clear tracked order timestamps. Useful for testing."""
         self._order_timestamps = []
+
+    def check_portfolio_drawdown(
+        self,
+        current_value: float,
+        peak_value: float,
+        max_drawdown_threshold: float = 0.15,
+    ) -> tuple[bool, str]:
+        """Check current drawdown from peak portfolio value.
+
+        Tracks the highest peak value seen so far internally. Once the
+        drawdown limit is breached, the circuit stays tripped on every
+        subsequent call — even if current_value recovers — until
+        reset_drawdown_circuit() is called.
+
+        Args:
+            current_value: Current portfolio value, in USD.
+            peak_value: Peak portfolio value observed by the caller, in USD.
+            max_drawdown_threshold: Max allowed fractional drawdown from peak.
+
+        Returns:
+            (True, 'approved') if within the drawdown limit, otherwise
+            (False, 'portfolio drawdown limit reached — manual reset required').
+        """
+        if self._peak_value is None or peak_value > self._peak_value:
+            self._peak_value = peak_value
+        if current_value > self._peak_value:
+            self._peak_value = current_value
+
+        if self._drawdown_circuit_tripped:
+            return False, "portfolio drawdown limit reached — manual reset required"
+
+        drawdown = (self._peak_value - current_value) / self._peak_value
+        if drawdown > max_drawdown_threshold:
+            self._drawdown_circuit_tripped = True
+            return False, "portfolio drawdown limit reached — manual reset required"
+
+        return True, "approved"
+
+    def reset_drawdown_circuit(self) -> None:
+        """Re-enable trading after manual review of a tripped drawdown circuit."""
+        self._drawdown_circuit_tripped = False
 
     def is_kill_switch_active(self) -> bool:
         """Check whether the kill switch file currently exists.

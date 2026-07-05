@@ -5,6 +5,16 @@ Personal algorithmic trading system. Starts with one venue/instrument,
 designed to scale to multiple brokers/exchanges across TradFi and DeFi,
 and potentially to enterprise/institutional use later.
 
+The objective is not to predict market moves but to deploy capital where
+multiple independent evidence sources align, while preserving capital and
+optionality for high-conviction opportunities. The system follows a
+barbell architecture: a regime engine classifies the macro environment and
+dynamically adjusts exposure; a convex sleeve deploys into liquid momentum
+opportunities (BTC-USDC initially) only when technical, macro, and regime
+layers independently agree. Decision quality over prediction frequency.
+Position size scales with conviction. When evidence is ambiguous, the
+correct output is flat.
+
 ## Architecture (layers, in order of data flow)
 1. `data/` — market data ingestion, normalized into our own schema
 2. `signals/` — strategy logic. Pure functions. MUST NOT import anything
