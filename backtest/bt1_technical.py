@@ -7,7 +7,7 @@ by price/volume technical indicators computed on daily BTC OHLCV.
 import numpy as np
 import pandas as pd
 
-from backtest.data_fetcher import fetch_btc_candles
+from backtest.data_fetcher import fetch_instrument_data
 from backtest.engine import BacktestEngine
 from backtest.indicators import adx, atr, ema, rsi, sma, volume_sma
 
@@ -105,7 +105,7 @@ def print_signal_summary(signals: pd.Series) -> None:
 
 def main() -> None:
     """Fetch BTC data, run BT1, and print/plot the results."""
-    data = fetch_btc_candles()
+    data = fetch_instrument_data("BTC-USDC")
 
     signals, position_sizes, stops = build_signals(data)
     print_signal_summary(signals)

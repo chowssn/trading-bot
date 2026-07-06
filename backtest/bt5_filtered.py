@@ -221,7 +221,7 @@ def print_trade_log(trades: list[dict]) -> None:
 
 def main() -> None:
     """Fetch combined BTC+macro data, run BT1-BT5, and compare them."""
-    data = fetch_all()
+    data = fetch_all("BTC-USDC")
 
     bt1_signals, bt1_position_sizes, bt1_stops = bt1_build_signals(data)
     bt2_signals, bt2_position_sizes, bt2_stops = bt2_build_signals(data)

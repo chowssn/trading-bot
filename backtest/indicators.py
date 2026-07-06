@@ -84,9 +84,9 @@ def volume_sma(volume: pd.Series, period: int = 20) -> pd.Series:
 
 
 if __name__ == "__main__":
-    from backtest.data_fetcher import fetch_btc_candles
+    from backtest.data_fetcher import fetch_instrument_data
 
-    df = fetch_btc_candles()
+    df = fetch_instrument_data("BTC-USDC")
 
     results = {
         "ema": ema(df["close"], 20),
