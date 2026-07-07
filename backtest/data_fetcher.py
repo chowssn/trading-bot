@@ -185,6 +185,19 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     +1 when the spread is below its moving average (invert=True). credit_stress_score
     sums discrete flags (blown-out HY level, accelerating HY widening, cracking IG,
     both HY timeframes deteriorating at once) into a 0 (healthy) to 5 (stress) score.
+
+    USO (oil_close) gets the same short/long trend treatment as copper
+    (oil_short_trend: EMA10 vs SMA30, banded at 1%; oil_long_trend: close vs
+    SMA200), plus an inflation-conditional oil_context_score. Long-term trend
+    (SMA200) distinguishes sustained commodity cycles from short-term price
+    noise. oil_context_score is capped at ±0.5 by design — it provides macro
+    context only and never drives a signal on its own: rising oil confirmed by
+    both trend horizons while inflation is falling/at_target reads as a growth
+    positive (+0.5, or +0.25 if only the short-term trend confirms); rising oil
+    while inflation is stable_elevated/reaccelerating reads as an inflation
+    headwind (-0.5) regardless of the long-term trend; oil breaking down on
+    both horizons reads as demand deterioration (-0.25); a short-term pullback
+    within a long-term uptrend is neutral (0); all other combinations are 0.
     """
     cache_file = DATA_DIR / f"macro_v2_{days_back}d.csv"
     if _is_cache_fresh(cache_file):
@@ -199,6 +212,7 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
         "UUP": "uup_close",
         "^VIX": "vix_close",
         "CPER": "copper_close",
+        "USO": "oil_close",
     }
     closes = {}
     for ticker, col_name in tickers.items():
@@ -249,6 +263,12 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     copper_long_trend = _trend_binary(prices["copper_close"], copper_sma200).rename(
         "copper_long_trend"
     )
+
+    oil_ema10 = _ema(prices["oil_close"], 10).rename("oil_ema10")
+    oil_sma30 = _sma(prices["oil_close"], 30).rename("oil_sma30")
+    oil_sma200 = _sma(prices["oil_close"], 200).rename("oil_sma200")
+    oil_short_trend = _trend_banded(oil_ema10, oil_sma30, band=0.01).rename("oil_short_trend")
+    oil_long_trend = _trend_binary(prices["oil_close"], oil_sma200).rename("oil_long_trend")
 
     load_dotenv()
     api_key = os.getenv("FRED_API_KEY")
@@ -522,6 +542,7 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
             qqq_spy_short_trend, qqq_spy_long_trend,
             uup_ema10, uup_sma30, uup_sma200, uup_short_trend, uup_long_trend,
             copper_ema10, copper_sma30, copper_sma200, copper_short_trend, copper_long_trend,
+            oil_ema10, oil_sma30, oil_sma200, oil_short_trend, oil_long_trend,
             fed_balance_sheet, us_m2,
             fed_bs_ema10, fed_bs_sma30, fed_bs_sma200, fed_bs_short_trend, fed_bs_long_trend,
             fed_bs_13wk_change_pct, global_m2_regime,
@@ -553,6 +574,34 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     df = df.reindex(full_index).ffill()
     df.index.name = "date"
 
+    # oil_context_score mixes oil's daily trend columns with the monthly
+    # inflation_regime, so it's computed here once both are on the same
+    # forward-filled daily calendar rather than at their native, mismatched
+    # frequencies.
+    oil_context_score = pd.Series(
+        np.select(
+            [
+                (df["oil_short_trend"] == 1)
+                & (df["oil_long_trend"] == 1)
+                & df["inflation_regime"].isin(["falling", "at_target"]),
+                (df["oil_short_trend"] == 1)
+                & (df["oil_long_trend"] == -1)
+                & df["inflation_regime"].isin(["falling", "at_target"]),
+                (df["oil_short_trend"] == 1)
+                & df["inflation_regime"].isin(["stable_elevated", "reaccelerating"]),
+                (df["oil_short_trend"] == -1) & (df["oil_long_trend"] == -1),
+                (df["oil_short_trend"] == -1) & (df["oil_long_trend"] == 1),
+            ],
+            [0.5, 0.25, -0.5, -0.25, 0.0],
+            default=0.0,
+        ),
+        index=df.index,
+    ).mask(
+        df["oil_short_trend"].isna() | df["oil_long_trend"].isna() | df["inflation_regime"].isna()
+    )
+    oil_context_score.name = "oil_context_score"
+    df["oil_context_score"] = oil_context_score
+
     _save_cache(df, cache_file)
     return df
 
@@ -582,6 +631,8 @@ if __name__ == "__main__":
         "uup_ema10", "uup_sma30", "uup_sma200", "uup_short_trend", "uup_long_trend",
         "copper_close", "copper_ema10", "copper_sma30", "copper_sma200",
         "copper_short_trend", "copper_long_trend",
+        "oil_close", "oil_ema10", "oil_sma30", "oil_sma200",
+        "oil_short_trend", "oil_long_trend",
     ]
 
     print("\nlast 5 rows of new columns:")
@@ -611,6 +662,9 @@ if __name__ == "__main__":
 
     print("\ncredit_stress_score (last 60 days):")
     print(result["credit_stress_score"].tail(60))
+
+    print("\noil_context_score, oil_long_trend, inflation_regime (last 60 days):")
+    print(result[["oil_context_score", "oil_long_trend", "inflation_regime"]].tail(60))
 
     new_sma200_columns = ["fed_bs_sma200", "hy_spread_sma200", "ig_spread_sma200"]
     print("\nnew SMA200 columns (last 5 rows):")
