@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -46,6 +47,30 @@ def _save_cache(df: pd.DataFrame, path: Path) -> None:
 def _normalize_to_utc_dates(index: pd.Index) -> pd.DatetimeIndex:
     """Collapse a (possibly tz-aware) DatetimeIndex to midnight-UTC dates."""
     return pd.to_datetime(pd.Index(index).date).tz_localize("UTC")
+
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _sma(series: pd.Series, window: int) -> pd.Series:
+    return series.rolling(window).mean()
+
+
+def _trend_binary(a: pd.Series, b: pd.Series, invert: bool = False) -> pd.Series:
+    """+1 if a>b else -1 (or the reverse if `invert`); NaN while either input is NaN."""
+    cond = a < b if invert else a > b
+    trend = pd.Series(np.where(cond, 1, -1), index=a.index, dtype=float)
+    return trend.mask(a.isna() | b.isna())
+
+
+def _trend_banded(a: pd.Series, b: pd.Series, band: float = 0.005) -> pd.Series:
+    """+1/-1 if a is more than `band` fraction above/below b, else 0; NaN while either input is NaN."""
+    diff = (a - b) / b
+    trend = pd.Series(
+        np.where(diff > band, 1, np.where(diff < -band, -1, 0)), index=a.index, dtype=float
+    )
+    return trend.mask(a.isna() | b.isna())
 
 
 def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.DataFrame:
@@ -95,26 +120,86 @@ def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.
 
 
 def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
-    """Fetch QQQ, UUP, VIX (yfinance) and FRED HY credit spreads, ffilled daily.
+    """Fetch SPY, QQQ, UUP, VIX, CPER (yfinance) and FRED HY credit spreads.
 
-    Extended in subsequent prompts with additional macro series.
+    Trend/moving-average columns are computed on each series' native trading-day
+    frequency (so weekend repeats from forward-fill don't distort EMA/SMA), then
+    the whole frame is forward-filled onto BTC's 7-day calendar.
+
+    QQQ vs SPY relative strength (qqq_spy_ratio and its trend columns) tracks tech
+    leadership over the broad market: qqq_spy_short_trend and qqq_spy_long_trend
+    both positive means sustained tech leadership, read as a risk-on confirmation
+    for BTC.
+
+    UUP (DXY proxy) trend columns are inverted: a weakening dollar (uup below its
+    moving average) is bullish, so uup_short_trend/uup_long_trend are +1 in that case.
+
+    Copper (CPER) is a global-growth proxy: copper_long_trend captures multi-month
+    growth cycles, copper_short_trend captures near-term momentum.
     """
-    cache_file = DATA_DIR / f"macro_data_{days_back}d.csv"
+    cache_file = DATA_DIR / "macro_v2.csv"
     if _is_cache_fresh(cache_file):
         return _load_cached_csv(cache_file)
 
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
-    tickers = {"QQQ": "qqq_close", "UUP": "uup_close", "^VIX": "vix_close"}
-    series_list = []
+    tickers = {
+        "SPY": "spy_close",
+        "QQQ": "qqq_close",
+        "UUP": "uup_close",
+        "^VIX": "vix_close",
+        "CPER": "copper_close",
+    }
+    closes = {}
     for ticker, col_name in tickers.items():
         hist = yf.Ticker(ticker).history(
             start=start_date.date(), end=end_date.date() + timedelta(days=1)
         )
         close = hist["Close"].rename(col_name)
         close.index = _normalize_to_utc_dates(close.index)
-        series_list.append(close)
+        closes[col_name] = close
+
+    prices = pd.concat(closes.values(), axis=1, sort=True).sort_index()
+
+    spy_ema10 = _ema(prices["spy_close"], 10).rename("spy_ema10")
+    spy_sma30 = _sma(prices["spy_close"], 30).rename("spy_sma30")
+    spy_sma200 = _sma(prices["spy_close"], 200).rename("spy_sma200")
+    spy_short_trend = _trend_banded(spy_ema10, spy_sma30).rename("spy_short_trend")
+    spy_long_trend = _trend_binary(prices["spy_close"], spy_sma200).rename("spy_long_trend")
+
+    qqq_ema10 = _ema(prices["qqq_close"], 10).rename("qqq_ema10")
+    qqq_sma30 = _sma(prices["qqq_close"], 30).rename("qqq_sma30")
+    qqq_sma200 = _sma(prices["qqq_close"], 200).rename("qqq_sma200")
+    qqq_short_trend = _trend_banded(qqq_ema10, qqq_sma30).rename("qqq_short_trend")
+    qqq_long_trend = _trend_binary(prices["qqq_close"], qqq_sma200).rename("qqq_long_trend")
+
+    qqq_spy_ratio = (prices["qqq_close"] / prices["spy_close"]).rename("qqq_spy_ratio")
+    qqq_spy_ratio_ema10 = _ema(qqq_spy_ratio, 10).rename("qqq_spy_ratio_ema10")
+    qqq_spy_ratio_sma30 = _sma(qqq_spy_ratio, 30).rename("qqq_spy_ratio_sma30")
+    qqq_spy_ratio_sma200 = _sma(qqq_spy_ratio, 200).rename("qqq_spy_ratio_sma200")
+    qqq_spy_short_trend = _trend_binary(qqq_spy_ratio_ema10, qqq_spy_ratio_sma30).rename(
+        "qqq_spy_short_trend"
+    )
+    qqq_spy_long_trend = _trend_binary(qqq_spy_ratio, qqq_spy_ratio_sma200).rename(
+        "qqq_spy_long_trend"
+    )
+
+    uup_ema10 = _ema(prices["uup_close"], 10).rename("uup_ema10")
+    uup_sma30 = _sma(prices["uup_close"], 30).rename("uup_sma30")
+    uup_sma200 = _sma(prices["uup_close"], 200).rename("uup_sma200")
+    uup_short_trend = _trend_binary(uup_ema10, uup_sma30, invert=True).rename("uup_short_trend")
+    uup_long_trend = _trend_binary(prices["uup_close"], uup_sma200, invert=True).rename(
+        "uup_long_trend"
+    )
+
+    copper_ema10 = _ema(prices["copper_close"], 10).rename("copper_ema10")
+    copper_sma30 = _sma(prices["copper_close"], 30).rename("copper_sma30")
+    copper_sma200 = _sma(prices["copper_close"], 200).rename("copper_sma200")
+    copper_short_trend = _trend_binary(copper_ema10, copper_sma30).rename("copper_short_trend")
+    copper_long_trend = _trend_binary(prices["copper_close"], copper_sma200).rename(
+        "copper_long_trend"
+    )
 
     load_dotenv()
     api_key = os.getenv("FRED_API_KEY")
@@ -129,9 +214,21 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     )
     hy_spread.index = _normalize_to_utc_dates(hy_spread.index)
     hy_spread.name = "hy_spread"
-    series_list.append(hy_spread)
 
-    df = pd.concat(series_list, axis=1, sort=True).sort_index()
+    df = pd.concat(
+        [
+            prices,
+            spy_ema10, spy_sma30, spy_sma200, spy_short_trend, spy_long_trend,
+            qqq_ema10, qqq_sma30, qqq_sma200, qqq_short_trend, qqq_long_trend,
+            qqq_spy_ratio, qqq_spy_ratio_ema10, qqq_spy_ratio_sma30, qqq_spy_ratio_sma200,
+            qqq_spy_short_trend, qqq_spy_long_trend,
+            uup_ema10, uup_sma30, uup_sma200, uup_short_trend, uup_long_trend,
+            copper_ema10, copper_sma30, copper_sma200, copper_short_trend, copper_long_trend,
+            hy_spread,
+        ],
+        axis=1,
+        sort=True,
+    ).sort_index()
 
     full_index = pd.date_range(
         start=start_date.replace(hour=0, minute=0, second=0, microsecond=0),
@@ -162,3 +259,26 @@ if __name__ == "__main__":
     print(f"shape: {result.shape}")
     print(f"date range: {result.index.min()} to {result.index.max()}")
     print(f"columns: {list(result.columns)}")
+
+    new_columns = [
+        "spy_close", "spy_ema10", "spy_sma30", "spy_sma200", "spy_short_trend", "spy_long_trend",
+        "qqq_ema10", "qqq_sma30", "qqq_sma200", "qqq_short_trend", "qqq_long_trend",
+        "qqq_spy_ratio", "qqq_spy_ratio_ema10", "qqq_spy_ratio_sma30", "qqq_spy_ratio_sma200",
+        "qqq_spy_short_trend", "qqq_spy_long_trend",
+        "uup_ema10", "uup_sma30", "uup_sma200", "uup_short_trend", "uup_long_trend",
+        "copper_close", "copper_ema10", "copper_sma30", "copper_sma200",
+        "copper_short_trend", "copper_long_trend",
+    ]
+
+    print("\nlast 5 rows of new columns:")
+    with pd.option_context("display.max_columns", None, "display.width", 200):
+        print(result[new_columns].tail(5))
+
+    last_30 = result[new_columns].tail(30)
+    nan_counts = last_30.isna().sum()
+    offending = nan_counts[nan_counts > 0]
+    if offending.empty:
+        print("\nno NaN in last 30 rows of any new column")
+    else:
+        print("\nNaN found in last 30 rows for:")
+        print(offending)
