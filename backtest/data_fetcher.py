@@ -171,6 +171,20 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     tracked alongside as the Fed's preferred inflation gauge but doesn't drive the
     regime classification. Both series are monthly, forward-filled onto the daily
     calendar.
+
+    Fed balance sheet / Global M2 proxy: fed_balance_sheet (WALCL) and us_m2 (M2SL)
+    are reindexed onto an explicit daily calendar and forward-filled before any
+    EMA/SMA is computed on them, since both are far sparser (weekly/monthly) than
+    the daily/business-day series above. fed_bs_short_trend (EMA10 vs SMA30) and
+    fed_bs_long_trend (level vs SMA200) combine into global_m2_regime: 'expanding'
+    when both agree bullish, 'contracting' when both agree bearish, else
+    'transitioning'.
+
+    HY (BAMLH0A0HYM2) and IG (BAMLC0A0CM) credit spread trend columns follow the
+    same tightening-is-healthy convention as UUP: *_short_trend/*_long_trend are
+    +1 when the spread is below its moving average (invert=True). credit_stress_score
+    sums discrete flags (blown-out HY level, accelerating HY widening, cracking IG,
+    both HY timeframes deteriorating at once) into a 0 (healthy) to 5 (stress) score.
     """
     cache_file = DATA_DIR / f"macro_v2_{days_back}d.csv"
     if _is_cache_fresh(cache_file):
@@ -242,6 +256,58 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
         raise RuntimeError("FRED_API_KEY not set in .env")
 
     fred = Fred(api_key=api_key)
+
+    # WALCL (weekly) and M2SL (monthly) are far sparser than the daily/business-day
+    # FRED series above, so a plain .ffill() on the raw series wouldn't produce daily
+    # values — reindex onto an explicit daily calendar first, per fed_balance_sheet/
+    # us_m2 being defined as the forward-filled-to-daily series.
+    daily_calendar = pd.date_range(
+        start=start_date.replace(hour=0, minute=0, second=0, microsecond=0),
+        end=end_date.replace(hour=0, minute=0, second=0, microsecond=0),
+        freq="D",
+        tz="UTC",
+    )
+
+    walcl = fred.get_series(
+        "WALCL",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    walcl.index = _normalize_to_utc_dates(walcl.index)
+    fed_balance_sheet = walcl.reindex(daily_calendar).ffill().rename("fed_balance_sheet")
+
+    m2sl = fred.get_series(
+        "M2SL",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    m2sl.index = _normalize_to_utc_dates(m2sl.index)
+    us_m2 = m2sl.reindex(daily_calendar).ffill().rename("us_m2")
+
+    fed_bs_ema10 = _ema(fed_balance_sheet, 10).rename("fed_bs_ema10")
+    fed_bs_sma30 = _sma(fed_balance_sheet, 30).rename("fed_bs_sma30")
+    fed_bs_sma200 = _sma(fed_balance_sheet, 200).rename("fed_bs_sma200")
+    fed_bs_short_trend = _trend_binary(fed_bs_ema10, fed_bs_sma30).rename("fed_bs_short_trend")
+    fed_bs_long_trend = _trend_binary(fed_balance_sheet, fed_bs_sma200).rename(
+        "fed_bs_long_trend"
+    )
+    fed_bs_13wk_change_pct = (fed_balance_sheet.pct_change(13 * 7) * 100).rename(
+        "fed_bs_13wk_change_pct"
+    )
+
+    global_m2_regime = pd.Series(
+        np.select(
+            [
+                (fed_bs_short_trend == 1) & (fed_bs_long_trend == 1),
+                (fed_bs_short_trend == -1) & (fed_bs_long_trend == -1),
+            ],
+            ["expanding", "contracting"],
+            default="transitioning",
+        ),
+        index=fed_bs_short_trend.index,
+    ).mask(fed_bs_short_trend.isna() | fed_bs_long_trend.isna())
+    global_m2_regime.name = "global_m2_regime"
+
     hy_spread = fred.get_series(
         "BAMLH0A0HYM2",
         observation_start=start_date.date(),
@@ -250,6 +316,49 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     hy_spread.index = _normalize_to_utc_dates(hy_spread.index)
     hy_spread.name = "hy_spread"
     hy_spread = hy_spread.ffill()
+
+    hy_spread_ema10 = _ema(hy_spread, 10).rename("hy_spread_ema10")
+    hy_spread_sma30 = _sma(hy_spread, 30).rename("hy_spread_sma30")
+    hy_spread_sma200 = _sma(hy_spread, 200).rename("hy_spread_sma200")
+    hy_spread_short_trend = _trend_binary(hy_spread_ema10, hy_spread_sma30, invert=True).rename(
+        "hy_spread_short_trend"
+    )
+    hy_spread_long_trend = _trend_binary(hy_spread, hy_spread_sma200, invert=True).rename(
+        "hy_spread_long_trend"
+    )
+    hy_spread_5d_change = hy_spread.diff(5).rename("hy_spread_5d_change")
+    hy_spread_acceleration = (hy_spread_5d_change - hy_spread_5d_change.shift(5)).rename(
+        "hy_spread_acceleration"
+    )
+
+    ig_spread = fred.get_series(
+        "BAMLC0A0CM",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    ig_spread.index = _normalize_to_utc_dates(ig_spread.index)
+    ig_spread.name = "ig_spread"
+    ig_spread = ig_spread.ffill()
+
+    ig_spread_ema10 = _ema(ig_spread, 10).rename("ig_spread_ema10")
+    ig_spread_sma30 = _sma(ig_spread, 30).rename("ig_spread_sma30")
+    ig_spread_sma200 = _sma(ig_spread, 200).rename("ig_spread_sma200")
+    ig_spread_short_trend = _trend_binary(ig_spread_ema10, ig_spread_sma30, invert=True).rename(
+        "ig_spread_short_trend"
+    )
+    ig_spread_long_trend = _trend_binary(ig_spread, ig_spread_sma200, invert=True).rename(
+        "ig_spread_long_trend"
+    )
+    ig_spread_5d_change = ig_spread.diff(5).rename("ig_spread_5d_change")
+
+    credit_stress_score = pd.Series(
+        np.where(hy_spread > 600, 2, 0)
+        + np.where(hy_spread > 450, 1, 0)
+        + np.where(hy_spread_acceleration > 0.2, 1, 0)
+        + np.where(ig_spread_5d_change > 0.1, 1, 0)
+        + np.where((hy_spread_long_trend == -1) & (hy_spread_short_trend == -1), 1, 0),
+        index=hy_spread.index,
+    ).rename("credit_stress_score")
 
     dgs2 = fred.get_series(
         "DGS2",
@@ -413,7 +522,17 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
             qqq_spy_short_trend, qqq_spy_long_trend,
             uup_ema10, uup_sma30, uup_sma200, uup_short_trend, uup_long_trend,
             copper_ema10, copper_sma30, copper_sma200, copper_short_trend, copper_long_trend,
-            hy_spread, dgs2, dgs10,
+            fed_balance_sheet, us_m2,
+            fed_bs_ema10, fed_bs_sma30, fed_bs_sma200, fed_bs_short_trend, fed_bs_long_trend,
+            fed_bs_13wk_change_pct, global_m2_regime,
+            hy_spread,
+            hy_spread_ema10, hy_spread_sma30, hy_spread_sma200,
+            hy_spread_short_trend, hy_spread_long_trend,
+            hy_spread_5d_change, hy_spread_acceleration,
+            ig_spread, ig_spread_ema10, ig_spread_sma30, ig_spread_sma200,
+            ig_spread_short_trend, ig_spread_long_trend, ig_spread_5d_change,
+            credit_stress_score,
+            dgs2, dgs10,
             yield_curve_2s10s, yield_curve_direction, yield_curve_regime,
             dff, dfedtaru, dfedtarl, fed_target_mid,
             ff_futures_price, ff_implied_rate, ff_implied_rate_vs_target,
@@ -486,6 +605,23 @@ if __name__ == "__main__":
 
     print("\ninflation_regime (full date range):")
     print(result["inflation_regime"])
+
+    print("\nglobal_m2_regime (full date range):")
+    print(result["global_m2_regime"])
+
+    print("\ncredit_stress_score (last 60 days):")
+    print(result["credit_stress_score"].tail(60))
+
+    new_sma200_columns = ["fed_bs_sma200", "hy_spread_sma200", "ig_spread_sma200"]
+    print("\nnew SMA200 columns (last 5 rows):")
+    print(result[new_sma200_columns].tail(5))
+    new_sma200_nan_counts = result[new_sma200_columns].tail(5).isna().sum()
+    offending_sma200 = new_sma200_nan_counts[new_sma200_nan_counts > 0]
+    if offending_sma200.empty:
+        print("\nno NaN in last 5 rows of any new SMA200 column")
+    else:
+        print("\nNaN found in last 5 rows for:")
+        print(offending_sma200)
 
     # DGS2/DGS10 and CPI/Fed target series go back decades on FRED; pull a longer
     # window than the default 730-day backtest lookback so the 2022-2023 inversion,
