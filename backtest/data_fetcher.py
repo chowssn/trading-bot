@@ -73,6 +73,13 @@ def _trend_banded(a: pd.Series, b: pd.Series, band: float = 0.005) -> pd.Series:
     return trend.mask(a.isna() | b.isna())
 
 
+def _consecutive_streak(condition: pd.Series) -> pd.Series:
+    """Length of the current run of consecutive True values ending at each row (0 where False/NaN)."""
+    cond = condition.fillna(False)
+    streak = cond.groupby((~cond).cumsum()).cumcount() + 1
+    return streak.where(cond, 0)
+
+
 def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.DataFrame:
     """Fetch daily OHLCV for `symbol` from Coinbase's public candles endpoint."""
     cache_file = DATA_DIR / f"{symbol}_ohlcv.csv"
@@ -120,7 +127,7 @@ def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.
 
 
 def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
-    """Fetch SPY, QQQ, UUP, VIX, CPER (yfinance) and FRED HY credit spreads.
+    """Fetch SPY, QQQ, UUP, VIX, CPER (yfinance) and FRED HY spreads/Treasury yields.
 
     Trend/moving-average columns are computed on each series' native trading-day
     frequency (so weekend repeats from forward-fill don't distort EMA/SMA), then
@@ -136,8 +143,36 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
 
     Copper (CPER) is a global-growth proxy: copper_long_trend captures multi-month
     growth cycles, copper_short_trend captures near-term momentum.
+
+    yield_curve_2s10s (DGS10 - DGS2) tracks the 2s10s Treasury curve. A negative
+    curve (inversion) has historically preceded recessions; steepening back above
+    -0.1 after an inversion (yield_curve_regime == 'steepening_after_inversion') is
+    watched as a late-cycle warning sign rather than a bullish signal.
+
+    Fed meeting probability tracking approximates Bloomberg WIRP functionality
+    using publicly available data: FRED gives the current Fed Funds target range
+    (fed_target_upper/lower/mid), and the front-month 30-day Fed Funds futures
+    (ZQ=F) give the market-implied rate for month-end. The spread between the two
+    (ff_implied_rate_vs_target) is converted into fed_cut_probability /
+    fed_hike_probability by scaling against a 25bp hike/cut increment.
+    fed_probability_4wk_change and fed_expectations_direction track the 20
+    trading-day shift in cut probability: positive/​+1 means the market is pricing
+    in more cuts than a month ago (dovish shift, read as bullish for BTC), negative/
+    -1 means fewer cuts or more hikes (hawkish shift). For a specific upcoming
+    meeting, the futures contract expiring in that meeting's month is the more
+    direct read; this front-month proxy is a broad approximation, not a
+    meeting-by-meeting probability curve.
+
+    Inflation regime (inflation_regime) classifies CPI (cpi_yoy, from CPIAUCSL)
+    trend into 'reaccelerating' (rising 2+ consecutive months), 'falling'
+    (declining 3+ consecutive months while still above 2.5%), 'at_target' (between
+    1.5% and 2.5%), 'stable_elevated' (above 2.5%, not clearly falling or rising),
+    or 'below_target' (below 1.5%, not falling). PCE (pce_yoy, from PCEPI) is
+    tracked alongside as the Fed's preferred inflation gauge but doesn't drive the
+    regime classification. Both series are monthly, forward-filled onto the daily
+    calendar.
     """
-    cache_file = DATA_DIR / "macro_v2.csv"
+    cache_file = DATA_DIR / f"macro_v2_{days_back}d.csv"
     if _is_cache_fresh(cache_file):
         return _load_cached_csv(cache_file)
 
@@ -214,6 +249,160 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     )
     hy_spread.index = _normalize_to_utc_dates(hy_spread.index)
     hy_spread.name = "hy_spread"
+    hy_spread = hy_spread.ffill()
+
+    dgs2 = fred.get_series(
+        "DGS2",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    dgs2.index = _normalize_to_utc_dates(dgs2.index)
+    dgs2.name = "dgs2"
+    dgs2 = dgs2.ffill()
+
+    dgs10 = fred.get_series(
+        "DGS10",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    dgs10.index = _normalize_to_utc_dates(dgs10.index)
+    dgs10.name = "dgs10"
+    dgs10 = dgs10.ffill()
+
+    yield_curve_2s10s = (dgs10 - dgs2).rename("yield_curve_2s10s")
+
+    curve_change_5d = yield_curve_2s10s.diff(5)
+    yield_curve_direction = pd.Series(
+        np.where(
+            curve_change_5d > 0.05, 1, np.where(curve_change_5d < -0.05, -1, 0)
+        ),
+        index=yield_curve_2s10s.index,
+        dtype=float,
+    ).mask(curve_change_5d.isna())
+    yield_curve_direction.name = "yield_curve_direction"
+
+    curve_20d_ago = yield_curve_2s10s.shift(20)
+    regime_conditions = [
+        (curve_20d_ago < -0.1) & (yield_curve_2s10s >= -0.1),
+        yield_curve_2s10s > 0.1,
+        yield_curve_2s10s < -0.1,
+    ]
+    regime_choices = ["steepening_after_inversion", "normal", "inverted"]
+    yield_curve_regime = pd.Series(
+        np.select(regime_conditions, regime_choices, default="flat"),
+        index=yield_curve_2s10s.index,
+    ).mask(yield_curve_2s10s.isna())
+    yield_curve_regime.name = "yield_curve_regime"
+
+    dff = fred.get_series(
+        "DFF",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    dff.index = _normalize_to_utc_dates(dff.index)
+    dff.name = "fed_funds_effective"
+    dff = dff.ffill()
+
+    dfedtaru = fred.get_series(
+        "DFEDTARU",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    dfedtaru.index = _normalize_to_utc_dates(dfedtaru.index)
+    dfedtaru.name = "fed_target_upper"
+    dfedtaru = dfedtaru.ffill()
+
+    dfedtarl = fred.get_series(
+        "DFEDTARL",
+        observation_start=start_date.date(),
+        observation_end=end_date.date(),
+    )
+    dfedtarl.index = _normalize_to_utc_dates(dfedtarl.index)
+    dfedtarl.name = "fed_target_lower"
+    dfedtarl = dfedtarl.ffill()
+
+    fed_target_mid = ((dfedtaru + dfedtarl) / 2).rename("fed_target_mid")
+
+    ff_hist = yf.Ticker("ZQ=F").history(
+        start=start_date.date(), end=end_date.date() + timedelta(days=1)
+    )
+    ff_futures_price = ff_hist["Close"].rename("ff_futures_price")
+    ff_futures_price.index = _normalize_to_utc_dates(ff_futures_price.index)
+
+    fed_block = pd.concat(
+        [dff, dfedtaru, dfedtarl, fed_target_mid, ff_futures_price], axis=1, sort=True
+    ).sort_index()
+    fed_block = fed_block.ffill()
+
+    ff_implied_rate = (100 - fed_block["ff_futures_price"]).rename("ff_implied_rate")
+    ff_implied_rate_vs_target = (ff_implied_rate - fed_block["fed_target_mid"]).rename(
+        "ff_implied_rate_vs_target"
+    )
+
+    fed_cut_probability = (
+        ((fed_block["fed_target_mid"] - ff_implied_rate) / 0.25)
+        .clip(0, 1)
+        .rename("fed_cut_probability")
+    )
+    fed_hike_probability = (
+        ((ff_implied_rate - fed_block["fed_target_mid"]) / 0.25)
+        .clip(0, 1)
+        .rename("fed_hike_probability")
+    )
+
+    fed_probability_4wk_change = (
+        fed_cut_probability - fed_cut_probability.shift(20)
+    ).rename("fed_probability_4wk_change")
+
+    fed_expectations_direction = pd.Series(
+        np.select(
+            [fed_probability_4wk_change > 0.10, fed_probability_4wk_change < -0.10],
+            [1, -1],
+            default=0,
+        ),
+        index=fed_probability_4wk_change.index,
+        dtype=float,
+    ).mask(fed_probability_4wk_change.isna())
+    fed_expectations_direction.name = "fed_expectations_direction"
+
+    # cpi_yoy/pce_yoy need 12 months of history before start_date to compute a
+    # valid year-over-year change there, so fetch with an extra lookback buffer;
+    # the final reindex onto full_index trims anything before start_date back off.
+    inflation_lookback_start = (start_date - timedelta(days=400)).date()
+
+    cpi = fred.get_series(
+        "CPIAUCSL",
+        observation_start=inflation_lookback_start,
+        observation_end=end_date.date(),
+    )
+    cpi.index = _normalize_to_utc_dates(cpi.index)
+
+    pce = fred.get_series(
+        "PCEPI",
+        observation_start=inflation_lookback_start,
+        observation_end=end_date.date(),
+    )
+    pce.index = _normalize_to_utc_dates(pce.index)
+
+    cpi_yoy = (cpi.pct_change(12) * 100).rename("cpi_yoy")
+    pce_yoy = (pce.pct_change(12) * 100).rename("pce_yoy")
+
+    cpi_yoy_diff = cpi_yoy.diff()
+    rising_streak = _consecutive_streak(cpi_yoy_diff > 0)
+    falling_streak = _consecutive_streak(cpi_yoy_diff < 0)
+
+    inflation_conditions = [
+        rising_streak >= 2,
+        (falling_streak >= 3) & (cpi_yoy > 2.5),
+        (cpi_yoy >= 1.5) & (cpi_yoy <= 2.5),
+        cpi_yoy > 2.5,
+    ]
+    inflation_choices = ["reaccelerating", "falling", "at_target", "stable_elevated"]
+    inflation_regime = pd.Series(
+        np.select(inflation_conditions, inflation_choices, default="below_target"),
+        index=cpi_yoy.index,
+    ).mask(cpi_yoy.isna())
+    inflation_regime.name = "inflation_regime"
 
     df = pd.concat(
         [
@@ -224,7 +413,13 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
             qqq_spy_short_trend, qqq_spy_long_trend,
             uup_ema10, uup_sma30, uup_sma200, uup_short_trend, uup_long_trend,
             copper_ema10, copper_sma30, copper_sma200, copper_short_trend, copper_long_trend,
-            hy_spread,
+            hy_spread, dgs2, dgs10,
+            yield_curve_2s10s, yield_curve_direction, yield_curve_regime,
+            dff, dfedtaru, dfedtarl, fed_target_mid,
+            ff_futures_price, ff_implied_rate, ff_implied_rate_vs_target,
+            fed_cut_probability, fed_hike_probability,
+            fed_probability_4wk_change, fed_expectations_direction,
+            cpi_yoy, pce_yoy, inflation_regime,
         ],
         axis=1,
         sort=True,
@@ -282,3 +477,29 @@ if __name__ == "__main__":
     else:
         print("\nNaN found in last 30 rows for:")
         print(offending)
+
+    print("\nyield_curve_regime (last 30 days):")
+    print(result["yield_curve_regime"].tail(30))
+
+    print("\nfed_cut_probability and fed_expectations_direction (last 60 days):")
+    print(result[["fed_cut_probability", "fed_expectations_direction"]].tail(60))
+
+    print("\ninflation_regime (full date range):")
+    print(result["inflation_regime"])
+
+    # DGS2/DGS10 and CPI/Fed target series go back decades on FRED; pull a longer
+    # window than the default 730-day backtest lookback so the 2022-2023 inversion,
+    # hiking cycle, and inflation peak/decline are all covered.
+    long_macro = fetch_macro_data(days_back=1700)
+    print("\nyield_curve_regime spot-check, 2022-01-01 to 2023-12-31:")
+    print(long_macro.loc["2022-01-01":"2023-12-31", "yield_curve_regime"].value_counts())
+
+    print("\ninflation_regime spot-check, 2022 (expect elevated/reaccelerating CPI):")
+    print(long_macro.loc["2022-01-01":"2022-12-31", "inflation_regime"].value_counts())
+    print("\nfed_expectations_direction spot-check, 2022 (expect hawkish/-1 tilt):")
+    print(long_macro.loc["2022-01-01":"2022-12-31", "fed_expectations_direction"].value_counts())
+
+    print("\ninflation_regime spot-check, late 2023 (expect falling/at_target CPI):")
+    print(long_macro.loc["2023-07-01":"2023-12-31", "inflation_regime"].value_counts())
+    print("\nfed_expectations_direction spot-check, late 2023 (expect dovish/+1 shift):")
+    print(long_macro.loc["2023-07-01":"2023-12-31", "fed_expectations_direction"].value_counts())
