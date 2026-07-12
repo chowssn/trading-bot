@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from fredapi import Fred
 
 from backtest.etf_flows import fetch_etf_flows
+from backtest.funding_rates import fetch_funding_rates
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,6 +99,20 @@ def _merge_etf_flows(df: pd.DataFrame, days_back: int) -> pd.DataFrame:
     flow_cols = list(etf_flows.columns)
     df[flow_cols] = df[flow_cols].ffill(limit=3)
     df["flow_score"] = df["flow_score"].fillna(0.5)
+    return df
+
+
+def _merge_funding_rates(df: pd.DataFrame, days_back: int) -> pd.DataFrame:
+    """Join BTC perpetual funding rate columns onto `df`, gap-filled up to 3 days.
+
+    funding_adjustment defaults to 1.0 (neutral) rather than NaN wherever funding
+    data is unavailable, so downstream position sizing always has a valid multiplier.
+    """
+    funding = fetch_funding_rates(days_back=days_back)
+    df = df.join(funding, how="left")
+    funding_cols = list(funding.columns)
+    df[funding_cols] = df[funding_cols].ffill(limit=3)
+    df["funding_adjustment"] = df["funding_adjustment"].fillna(1.0)
     return df
 
 
@@ -229,6 +244,10 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
     gap-filled up to 3 days; flow_score falls back to 0.5 (neutral) rather than
     NaN wherever flow data is unavailable so downstream signal logic always has
     a valid conviction modifier.
+
+    BTC perpetual funding rates (see backtest/funding_rates.py) are joined in
+    last and gap-filled up to 3 days; funding_adjustment falls back to 1.0
+    (neutral) rather than NaN wherever funding data is unavailable.
     """
     cache_file = DATA_DIR / f"macro_v2_{days_back}d.csv"
     if _is_cache_fresh(cache_file):
@@ -637,6 +656,7 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
     df["oil_context_score"] = oil_context_score
 
     df = _merge_etf_flows(df, days_back)
+    df = _merge_funding_rates(df, days_back)
 
     _save_cache(df, cache_file)
     return df
