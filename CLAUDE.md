@@ -50,6 +50,19 @@ correct output is flat.
   Coinbase Advanced Trade API, using a CDP production key loaded from
   `cdp_api_key.json`.
 
+## Data Maintenance
+ETF flow data is sourced from a manually downloaded SoSoValue CSV at
+`backtest/data/btc_etf_flows_sosovalue.csv`. This file does not auto-update.
+Re-download periodically (monthly or when data appears stale) from
+sosovalue.com/assets/etf/us-btc-spot — export the total net flow history,
+replace the existing file, and delete `backtest/data/btc_etf_flows.csv` to
+force cache refresh on next run.
+
+yfinance shares outstanding for BTC ETFs (IBIT, FBTC, ARKB, BITB, GBTC)
+currently returns None from Yahoo Finance — the yfinance extension path is
+implemented but contributes zero rows until Yahoo fixes this. The SoSoValue
+seed is the sole data source until then.
+
 ## Tech stack
 - Python 3.12, venv
 - pandas for data handling
