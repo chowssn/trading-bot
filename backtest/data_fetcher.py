@@ -80,14 +80,19 @@ def _consecutive_streak(condition: pd.Series) -> pd.Series:
     return streak.where(cond, 0)
 
 
-def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.DataFrame:
+def fetch_instrument_data(
+    symbol: str = "BTC-USDC", days_back: int = 1460, start_date: str | None = None
+) -> pd.DataFrame:
     """Fetch daily OHLCV for `symbol` from Coinbase's public candles endpoint."""
     cache_file = DATA_DIR / f"{symbol}_ohlcv.csv"
     if _is_cache_fresh(cache_file):
         return _load_cached_csv(cache_file)
 
     end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=days_back)
+    if start_date is not None:
+        start_time = pd.Timestamp(start_date, tz="UTC").to_pydatetime()
+    else:
+        start_time = end_time - timedelta(days=days_back)
     chunk_delta = timedelta(days=COINBASE_MAX_CANDLES_PER_REQUEST - 1)
 
     candles_url = COINBASE_CANDLES_URL_TEMPLATE.format(symbol=symbol)
@@ -126,7 +131,7 @@ def fetch_instrument_data(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.
     return df
 
 
-def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
+def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd.DataFrame:
     """Fetch SPY, QQQ, UUP, VIX, CPER (yfinance) and FRED HY spreads/Treasury yields.
 
     Trend/moving-average columns are computed on each series' native trading-day
@@ -204,7 +209,10 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
         return _load_cached_csv(cache_file)
 
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=days_back)
+    if start_date is not None:
+        start_date = pd.Timestamp(start_date, tz="UTC").to_pydatetime()
+    else:
+        start_date = end_date - timedelta(days=days_back)
 
     tickers = {
         "SPY": "spy_close",
@@ -606,10 +614,12 @@ def fetch_macro_data(days_back: int = 730) -> pd.DataFrame:
     return df
 
 
-def fetch_all(symbol: str = "BTC-USDC", days_back: int = 730) -> pd.DataFrame:
+def fetch_all(
+    symbol: str = "BTC-USDC", days_back: int = 1460, start_date: str | None = None
+) -> pd.DataFrame:
     """Fetch instrument OHLCV and macro data and merge into one frame."""
-    instrument = fetch_instrument_data(symbol, days_back)
-    macro = fetch_macro_data(days_back)
+    instrument = fetch_instrument_data(symbol, days_back, start_date)
+    macro = fetch_macro_data(days_back, start_date)
 
     combined = instrument.join(macro, how="outer")
     combined = combined.sort_index().ffill()
@@ -678,7 +688,7 @@ if __name__ == "__main__":
         print(offending_sma200)
 
     # DGS2/DGS10 and CPI/Fed target series go back decades on FRED; pull a longer
-    # window than the default 730-day backtest lookback so the 2022-2023 inversion,
+    # window than the default 1460-day backtest lookback so the 2022-2023 inversion,
     # hiking cycle, and inflation peak/decline are all covered.
     long_macro = fetch_macro_data(days_back=1700)
     print("\nyield_curve_regime spot-check, 2022-01-01 to 2023-12-31:")
