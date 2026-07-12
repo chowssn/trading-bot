@@ -16,6 +16,8 @@ import yfinance as yf
 from dotenv import load_dotenv
 from fredapi import Fred
 
+from backtest.etf_flows import fetch_etf_flows
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -74,10 +76,29 @@ def _trend_banded(a: pd.Series, b: pd.Series, band: float = 0.005) -> pd.Series:
 
 
 def _consecutive_streak(condition: pd.Series) -> pd.Series:
-    """Length of the current run of consecutive True values ending at each row (0 where False/NaN)."""
+    """Length of the current run of consecutive True values ending at each row (0 elsewhere).
+
+    NaN/missing input is treated as False, not as a streak-breaking special case, so the
+    run-length groupby stays correct across gaps (see tests/test_indicators.py).
+    """
     cond = condition.fillna(False)
-    streak = cond.groupby((~cond).cumsum()).cumcount() + 1
+    run_id = (cond != cond.shift()).cumsum()
+    streak = cond.groupby(run_id).cumcount() + 1
     return streak.where(cond, 0)
+
+
+def _merge_etf_flows(df: pd.DataFrame, days_back: int) -> pd.DataFrame:
+    """Join BTC ETF flow columns onto `df`, gap-filled up to 3 days.
+
+    flow_score defaults to 0.5 (neutral) rather than NaN wherever flow data is
+    unavailable, so downstream signal logic always has a valid conviction modifier.
+    """
+    etf_flows = fetch_etf_flows(days_back=days_back)
+    df = df.join(etf_flows, how="left")
+    flow_cols = list(etf_flows.columns)
+    df[flow_cols] = df[flow_cols].ffill(limit=3)
+    df["flow_score"] = df["flow_score"].fillna(0.5)
+    return df
 
 
 def fetch_instrument_data(
@@ -203,6 +224,11 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
     headwind (-0.5) regardless of the long-term trend; oil breaking down on
     both horizons reads as demand deterioration (-0.25); a short-term pullback
     within a long-term uptrend is neutral (0); all other combinations are 0.
+
+    BTC spot ETF flows (see backtest/etf_flows.py) are joined in last and
+    gap-filled up to 3 days; flow_score falls back to 0.5 (neutral) rather than
+    NaN wherever flow data is unavailable so downstream signal logic always has
+    a valid conviction modifier.
     """
     cache_file = DATA_DIR / f"macro_v2_{days_back}d.csv"
     if _is_cache_fresh(cache_file):
@@ -609,6 +635,8 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
     )
     oil_context_score.name = "oil_context_score"
     df["oil_context_score"] = oil_context_score
+
+    df = _merge_etf_flows(df, days_back)
 
     _save_cache(df, cache_file)
     return df
