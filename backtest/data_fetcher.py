@@ -6,7 +6,7 @@ cached as CSVs in backtest/data/ and reused for 24 hours before refetching.
 
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +50,26 @@ def _save_cache(df: pd.DataFrame, path: Path) -> None:
 def _normalize_to_utc_dates(index: pd.Index) -> pd.DatetimeIndex:
     """Collapse a (possibly tz-aware) DatetimeIndex to midnight-UTC dates."""
     return pd.to_datetime(pd.Index(index).date).tz_localize("UTC")
+
+
+def _fred_observation_start(
+    fred: Fred, series_id: str, start_date: datetime, extra_days: int = 365
+) -> date:
+    """Observation_start to request for `series_id`, extended if FRED's own
+    series inception postdates `start_date`.
+
+    Some FRED series (e.g. BAMLH0A0HYM2/BAMLC0A0CM) start later than our
+    desired backtest start, or get retroactively truncated to a rolling
+    window by the publisher. Requesting further back than `start_date` is
+    harmless (the final reindex onto our own calendar trims it back off) and
+    picks up any extra history FRED is still willing to serve.
+    """
+    info = fred.get_series_info(series_id)
+    series_start = pd.Timestamp(info["observation_start"])
+    target_start = pd.Timestamp(start_date.date())
+    if series_start > target_start:
+        return (start_date - timedelta(days=extra_days)).date()
+    return target_start.date()
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -383,12 +403,13 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
 
     hy_spread = fred.get_series(
         "BAMLH0A0HYM2",
-        observation_start=start_date.date(),
+        observation_start=_fred_observation_start(fred, "BAMLH0A0HYM2", start_date),
         observation_end=end_date.date(),
     )
     hy_spread.index = _normalize_to_utc_dates(hy_spread.index)
     hy_spread.name = "hy_spread"
-    hy_spread = hy_spread.ffill()
+    hy_spread = hy_spread.ffill(limit=7)
+    print(f"hy_spread first non-null date: {hy_spread.dropna().index.min()}")
 
     hy_spread_ema10 = _ema(hy_spread, 10).rename("hy_spread_ema10")
     hy_spread_sma30 = _sma(hy_spread, 30).rename("hy_spread_sma30")
@@ -406,12 +427,13 @@ def fetch_macro_data(days_back: int = 1460, start_date: str | None = None) -> pd
 
     ig_spread = fred.get_series(
         "BAMLC0A0CM",
-        observation_start=start_date.date(),
+        observation_start=_fred_observation_start(fred, "BAMLC0A0CM", start_date),
         observation_end=end_date.date(),
     )
     ig_spread.index = _normalize_to_utc_dates(ig_spread.index)
     ig_spread.name = "ig_spread"
-    ig_spread = ig_spread.ffill()
+    ig_spread = ig_spread.ffill(limit=7)
+    print(f"ig_spread first non-null date: {ig_spread.dropna().index.min()}")
 
     ig_spread_ema10 = _ema(ig_spread, 10).rename("ig_spread_ema10")
     ig_spread_sma30 = _sma(ig_spread, 30).rename("ig_spread_sma30")
@@ -675,6 +697,196 @@ def fetch_all(
     return combined
 
 
+def _fmt_value(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    text = str(value)
+    return text if len(text) <= 20 else text[:17] + "..."
+
+
+_SMA200_DERIVED_COLS = frozenset({"global_m2_regime", "oil_context_score"})
+
+
+def _null_pct_threshold(col: str) -> float:
+    """Null% warning threshold, widened for columns with expected startup NaN.
+
+    Rolling-window columns can't produce a value until the window fills, so
+    a flat 5% threshold flags them as false positives on every run:
+    - *_sma200 / *_long_trend: up to 200/730 days of startup NaN is normal.
+    - *_sma30: up to 30 days of startup NaN is normal.
+    - fed_bs_13wk_change_pct (90-day pct_change window): ditto at 90 days.
+    - global_m2_regime / oil_context_score: not named *_long_trend themselves,
+      but each is masked null wherever the *_long_trend column it's gated on
+      is null, so they inherit that column's 200-day startup window too.
+    Everything else keeps the original 5% threshold.
+    """
+    if col.endswith("_sma200") or col.endswith("_long_trend") or col in _SMA200_DERIVED_COLS:
+        return 22.0
+    if col.endswith("_sma30"):
+        return 6.0
+    if col == "fed_bs_13wk_change_pct":
+        return 8.0
+    return 5.0
+
+
+# Columns (or column-name prefixes) with a known, understood data limitation.
+# A column matching an entry here is reported as INFO instead of WARNING and
+# does not count toward FAIL — the underlying cause is documented, expected,
+# and not a signal of a genuine data quality regression. See the "Data
+# Maintenance" section of CLAUDE.md for the operational detail behind each.
+_KNOWN_LIMITATIONS: list[dict] = [
+    {
+        "prefixes": ("hy_spread", "ig_spread"),
+        "exact": frozenset({"credit_stress_score"}),
+        "reason": (
+            "FRED series truncated to 3-year rolling window since April 2026, "
+            "data unavailable before 2023-07-11"
+        ),
+    },
+    {
+        "prefixes": ("funding",),
+        "exact": frozenset({"fundingRate"}),
+        "reason": "Binance/Bybit geo-blocked in this environment, defaults to neutral 1.0",
+    },
+    {
+        "prefixes": (),
+        "exact": frozenset({
+            "ibit_flow_musd", "fbtc_flow_musd", "arkb_flow_musd",
+            "bitb_flow_musd", "gbtc_flow_musd", "ex_gbtc_flow_musd",
+        }),
+        "reason": "yfinance does not serve BTC ETF shares outstanding, per CLAUDE.md",
+    },
+    {
+        "prefixes": ("flow_",),
+        "exact": frozenset({"daily_flow_musd", "ex_gbtc_flow_score", "gbtc_outflow_pressure"}),
+        "reason": (
+            "ETF data only available from January 2024 (BTC ETF launch date), "
+            "pre-launch rows are correctly null"
+        ),
+    },
+]
+
+
+def _known_limitation_reason(col: str) -> str | None:
+    """Return the documented reason `col` is a known limitation, or None."""
+    for entry in _KNOWN_LIMITATIONS:
+        if col in entry["exact"] or col.startswith(entry["prefixes"]):
+            return entry["reason"]
+    return None
+
+
+def verify_data_quality(df: pd.DataFrame) -> None:
+    """Print a data-quality report for `df` and a final PASS/FAIL summary.
+
+    Every column is reported (dtype, null count/%, min, max). A column is
+    flagged WARNING if its null% exceeds its threshold (see
+    `_null_pct_threshold`; 5% by default, widened for known rolling-window
+    columns), or if it holds a value considered implausible for its kind
+    (negative prices, >20% yields, >2000bps credit spreads, or a funding
+    rate outside -0.5%/+0.5%) — unless the column matches `_KNOWN_LIMITATIONS`,
+    in which case it's printed as INFO instead. PASS requires zero warnings;
+    INFO messages don't count toward FAIL.
+    """
+    warnings: list[str] = []
+    infos: list[str] = []
+    total_rows = len(df)
+
+    if isinstance(df.index, pd.DatetimeIndex) and total_rows:
+        date_range = f"{df.index.min()} to {df.index.max()}"
+    else:
+        date_range = "n/a"
+
+    print(f"Total rows: {total_rows}")
+    print(f"Date range: {date_range}")
+    print()
+
+    header = f"{'column':<35}{'dtype':<10}{'nulls':>8}{'null %':>9}{'min':>22}{'max':>22}"
+    print(header)
+    print("-" * len(header))
+
+    for col in df.columns:
+        series = df[col]
+        null_count = int(series.isna().sum())
+        null_pct = (null_count / total_rows * 100) if total_rows else 0.0
+
+        non_null = series.dropna()
+        try:
+            col_min = non_null.min() if not non_null.empty else "n/a"
+            col_max = non_null.max() if not non_null.empty else "n/a"
+        except TypeError:
+            col_min, col_max = "n/a", "n/a"
+
+        print(
+            f"{col:<35}{str(series.dtype):<10}{null_count:>8}{null_pct:>8.1f}%"
+            f"{_fmt_value(col_min):>22}{_fmt_value(col_max):>22}"
+        )
+
+        threshold = _null_pct_threshold(col)
+        if null_pct > threshold:
+            reason = _known_limitation_reason(col)
+            if reason:
+                infos.append(
+                    f"INFO: '{col}' has {null_pct:.1f}% null values (> {threshold:.0f}%) "
+                    f"— known limitation: {reason}"
+                )
+            else:
+                warnings.append(
+                    f"WARNING: '{col}' has {null_pct:.1f}% null values (> {threshold:.0f}%)"
+                )
+
+    print()
+
+    negative_price_cols = ["close", "spy_close", "qqq_close", "copper_close", "oil_close"]
+    for col in negative_price_cols:
+        if col in df.columns:
+            n_bad = int((df[col] < 0).sum())
+            if n_bad:
+                warnings.append(f"WARNING: '{col}' has {n_bad} negative value(s)")
+
+    yield_cols = ["dgs2", "dgs10"]
+    for col in yield_cols:
+        if col in df.columns:
+            n_bad = int((df[col] > 20).sum())
+            if n_bad:
+                warnings.append(f"WARNING: '{col}' has {n_bad} value(s) > 20% yield")
+
+    spread_cols = ["hy_spread", "ig_spread"]
+    for col in spread_cols:
+        if col in df.columns:
+            n_bad = int((df[col] > 2000).sum())
+            if n_bad:
+                warnings.append(f"WARNING: '{col}' has {n_bad} value(s) > 2000bps spread")
+
+    # funding rate is exposed either as a percentage (funding_rate_pct, e.g.
+    # 0.01 = 0.01%) or a raw fraction (fundingRate, e.g. 0.0001); check
+    # whichever is present against the equivalent -0.5%/+0.5% bound.
+    if "funding_rate_pct" in df.columns:
+        n_bad = int((df["funding_rate_pct"].abs() > 0.5).sum())
+        if n_bad:
+            warnings.append(
+                f"WARNING: 'funding_rate_pct' has {n_bad} value(s) outside -0.5%/+0.5%"
+            )
+    if "fundingRate" in df.columns:
+        n_bad = int((df["fundingRate"].abs() > 0.005).sum())
+        if n_bad:
+            warnings.append(
+                f"WARNING: 'fundingRate' has {n_bad} value(s) outside -0.5%/+0.5%"
+            )
+
+    for i in infos:
+        print(i)
+    if infos:
+        print()
+
+    if warnings:
+        for w in warnings:
+            print(w)
+        print()
+        print(f"FAIL ({len(warnings)} warning(s))")
+    else:
+        print("PASS")
+
+
 if __name__ == "__main__":
     result = fetch_all("BTC-USDC")
     print(f"shape: {result.shape}")
@@ -751,3 +963,6 @@ if __name__ == "__main__":
     print(long_macro.loc["2023-07-01":"2023-12-31", "inflation_regime"].value_counts())
     print("\nfed_expectations_direction spot-check, late 2023 (expect dovish/+1 shift):")
     print(long_macro.loc["2023-07-01":"2023-12-31", "fed_expectations_direction"].value_counts())
+
+    print("\ndata quality report:")
+    verify_data_quality(result)

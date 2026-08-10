@@ -61,7 +61,32 @@ force cache refresh on next run.
 yfinance shares outstanding for BTC ETFs (IBIT, FBTC, ARKB, BITB, GBTC)
 currently returns None from Yahoo Finance — the yfinance extension path is
 implemented but contributes zero rows until Yahoo fixes this. The SoSoValue
-seed is the sole data source until then.
+seed is the sole data source until then. Affects `ibit_flow_musd`,
+`fbtc_flow_musd`, `arkb_flow_musd`, `bitb_flow_musd`, `gbtc_flow_musd`,
+`ex_gbtc_flow_musd`.
+
+FRED's HY/IG credit spread series (`hy_spread`, `ig_spread`, and everything
+derived from them, plus `credit_stress_score`) were truncated to a 3-year
+rolling window starting April 2026 — data is unavailable before 2023-07-11.
+Backtest rows before that date are correctly null for these columns; the
+regime engine treats them as neutral rather than penalizing the missing
+history.
+
+BTC perpetual funding rates (Binance primary, Bybit fallback — see
+`backtest/funding_rates.py`) are geo-blocked from this WSL environment, so
+`fundingRate`, `funding_rate_pct`, and their derived columns are null here
+and `funding_adjustment` falls back to its neutral value (1.0). Test funding
+rate fetches from an unrestricted network before relying on them in
+production — geo-blocking is an environment property, not a permanent data
+gap.
+
+BTC spot ETFs launched January 11, 2024. `daily_flow_musd`, `flow_*`,
+`ex_gbtc_flow_score`, and `gbtc_outflow_pressure` are correctly null for any
+row before that date — there is no pre-launch flow data to backfill.
+
+`backtest/data_fetcher.py`'s `verify_data_quality()` knows about all three
+limitations above (`_KNOWN_LIMITATIONS`) and reports them as INFO rather
+than WARNING, so PASS reflects genuinely unexpected data issues only.
 
 ## Tech stack
 - Python 3.12, venv
