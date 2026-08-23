@@ -1,0 +1,31 @@
+ticker,field,label,source,value_ours,value_bbg,deviation_pct,deviation_pp,flag,screening_use,caveat
+MSFT,roic_current,ROIC Current,FMP,24.23183649522869,25.02,,0.7881635047713083,GREEN,Primary quality sort,Custom calc via NOPAT/AvgIC. Omits pension/FX adj (unavailable in FMP).
+MSFT,roic_5y_avg,ROIC 5Y Avg,FMP,26.03563889812121,28.11,,2.0743611018787895,GREEN,Quality trend / consistency filter,"Simple average of annual ROIC, not T12M-weighted (see roic_calculator methodology_notes)."
+MSFT,cfo_t12m,CFO T12M,YF,182935.0,182935.0,0.0,,GREEN,CFO >= Net Income earnings quality check,
+MSFT,net_income_t12m,Net Income T12M,YF,133749.0,133749.0,0.0,,GREEN,CFO >= Net Income earnings quality check; profitability filter,
+MSFT,ebitda_t12m,EBITDA T12M,YF,198685.0,200739.0,1.023219205037387,,GREEN,Net Debt/EBITDA leverage ratio denominator,"Op Income + D&A method, not yfinance's pre-calculated EBITDA row."
+MSFT,ebitda_margin_3y_avg,EBITDA Margin 3Y Avg,YF,55.885606446403735,58.46,,2.5743935535962663,GREEN,Margin quality / stability filter,3Y average (not Bloomberg's window); Op Income + D&A method.
+MSFT,net_debt,Net Debt,YF,19359.0,51970.0,62.749663267269575,32611.0,APPROVED_WITH_CAVEAT,Input to Net Debt/EBITDA leverage ratio only -- not screened on directly,"Deviates from Bloomberg due to financial-subsidiary adjustments. Use the tiered ratio, not the absolute value."
+MSFT,net_debt_ebitda,Net Debt/EBITDA,YF,0.09743563932858545,0.259,62.38006203529519,0.16156436067141455,DIRECTIONAL,Leverage tier classification (excellent/good/flag/exclude),Directional only -- see Net Debt caveat. Tier ours=excellent bbg=excellent -- Agreement: PASS.
+MSFT,trailing_pe,Trailing P/E,YF,26.951477,29.12,7.446850961538462,2.1685230000000004,DIRECTIONAL,"Valuation context, not a hard screen",Directional signal only. Agreement (within 15%): PASS.
+MSFT,forward_pe,Forward P/E,YF,20.49948,20.547,0.23127463863338799,0.04752000000000223,DIRECTIONAL,"Valuation context, not a hard screen",Directional signal only; consensus-estimate composition may differ from Bloomberg's. Agreement (within 15%): PASS.
+MSFT,return_1y,1Y Return,YF,-3.3761756015752598,-3.9413,14.33852785691879,0.5651243984247403,RED,Momentum sleeve input,
+MSFT,rsi_14d,RSI 14D,YF,62.95966956030975,62.419,0.8661938837689673,0.5406695603097518,GREEN,Technical overbought/oversold filter,
+MSFT,rsi_30d,RSI 30D,YF,61.166519488388914,60.89,0.4541295588584558,0.2765194883889137,GREEN,Technical overbought/oversold filter (slower),
+MSFT,share_count_direction,Share Count Direction,YF,buyback,buyback,,,DIRECTIONAL,Buyback/dilution quality filter,Direction agreement only. Agreement: PASS.
+MSFT,share_count_5y_geo,Share Count CAGR,YF,-0.07616149176330467,-0.31,,0.23383850823669533,DIRECTIONAL,Buyback/dilution magnitude context,yfinance limited to 3-4Y annual periods vs. Bloomberg's 5Y geometric average. Sign agreement: PASS.
+ADBE,roic_current,ROIC Current,FMP,37.53298206384373,38.92,,1.3870179361562691,GREEN,Primary quality sort,Custom calc via NOPAT/AvgIC. Omits pension/FX adj (unavailable in FMP).
+ADBE,roic_5y_avg,ROIC 5Y Avg,FMP,28.962770705789925,27.25,,1.712770705789925,GREEN,Quality trend / consistency filter,"Simple average of annual ROIC, not T12M-weighted (see roic_calculator methodology_notes)."
+ADBE,cfo_t12m,CFO T12M,YF,10481.0,10481.0,0.0,,GREEN,CFO >= Net Income earnings quality check,
+ADBE,net_income_t12m,Net Income T12M,YF,7229.0,7130.0,1.388499298737728,,GREEN,CFO >= Net Income earnings quality check; profitability filter,
+ADBE,ebitda_t12m,EBITDA T12M,YF,9849.0,9849.0,0.0,,GREEN,Net Debt/EBITDA leverage ratio denominator,"Op Income + D&A method, not yfinance's pre-calculated EBITDA row."
+ADBE,ebitda_margin_3y_avg,EBITDA Margin 3Y Avg,YF,39.60187125339832,38.55,,1.0518712533983248,GREEN,Margin quality / stability filter,3Y average (not Bloomberg's window); Op Income + D&A method.
+ADBE,net_debt,Net Debt,YF,1726.0,53.0,3156.603773584906,1673.0,APPROVED_WITH_CAVEAT,Input to Net Debt/EBITDA leverage ratio only -- not screened on directly,"Deviates from Bloomberg due to financial-subsidiary adjustments. Use the tiered ratio, not the absolute value."
+ADBE,net_debt_ebitda,Net Debt/EBITDA,YF,0.17524621789014114,0.0054,3145.30033129891,0.16984621789014115,DIRECTIONAL,Leverage tier classification (excellent/good/flag/exclude),Directional only -- see Net Debt caveat. Tier ours=excellent bbg=excellent -- Agreement: PASS.
+ADBE,trailing_pe,Trailing P/E,YF,15.749428,15.49,1.674809554551322,0.25942799999999977,DIRECTIONAL,"Valuation context, not a hard screen",Directional signal only. Agreement (within 15%): PASS.
+ADBE,forward_pe,Forward P/E,YF,10.014408,10.043,0.2846958080254877,0.02859199999999973,DIRECTIONAL,"Valuation context, not a hard screen",Directional signal only; consensus-estimate composition may differ from Bloomberg's. Agreement (within 15%): PASS.
+ADBE,return_1y,1Y Return,YF,-22.106218063526097,-23.9692,7.7723993144281165,1.8629819364739042,YELLOW,Momentum sleeve input,
+ADBE,rsi_14d,RSI 14D,YF,62.5135926518698,62.514,0.0006516110474500649,0.0004073481302029336,GREEN,Technical overbought/oversold filter,
+ADBE,rsi_30d,RSI 30D,YF,58.232204944838,58.232,0.0003519453874218379,0.00020494483800348462,GREEN,Technical overbought/oversold filter (slower),
+ADBE,share_count_direction,Share Count Direction,YF,buyback,buyback,,,DIRECTIONAL,Buyback/dilution quality filter,Direction agreement only. Agreement: PASS.
+ADBE,share_count_5y_geo,Share Count CAGR,YF,-3.2233509354852585,-2.4,,0.8233509354852586,DIRECTIONAL,Buyback/dilution magnitude context,yfinance limited to 3-4Y annual periods vs. Bloomberg's 5Y geometric average. Sign agreement: PASS.
