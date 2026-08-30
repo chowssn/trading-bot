@@ -64,6 +64,13 @@ COLUMN_MAP = {
 
 OUTPUT_COLUMNS = ["ticker", "name", "sector", "asset_class", "weight_pct", "market_value"]
 
+# Tickers confirmed unavailable on yfinance — either genuinely delisted
+# or taken private. Remove from this set if/when they return to public markets.
+# Last verified: 2026-08-30
+DELISTED_TICKERS = {
+    'HOLX',   # Hologic — taken private by Blackstone, deal closed late 2025
+}
+
 # A tradable US-equity ticker as it appears in this feed: 1-5 uppercase
 # letters. Used to find where the real holdings table ends (see
 # `_parse_raw_holdings`) — futures/cash line items sorted to the tail
@@ -76,6 +83,27 @@ TICKER_PATTERN = re.compile(r"^[A-Z]{1,5}$")
 # tradable US equities (cash sweep, futures margin, etc.), belt-and-suspenders
 # on top of the asset_class == 'Equity' filter.
 NON_EQUITY_TICKER_BLACKLIST = {"USD", "CASH"}
+
+# Maps iShares CSV ticker -> yfinance ticker format.
+# iShares sometimes omits hyphens/dots that yfinance requires for
+# multi-class share tickers. Applied in _clean_holdings() AFTER the
+# TICKER_PATTERN/valid_ticker filters above run on the original iShares
+# format (those filters would reject 'BRK-B' or 'HEI.A' outright), so the
+# untranslated key is what needs to look like a plain 1-5 letter ticker.
+# Add new entries here when new mismatches are discovered.
+TICKER_TRANSLATION = {
+    'BRKB':  'BRK-B',   # Berkshire Hathaway Class B
+    'BRKA':  'BRK-A',   # Berkshire Hathaway Class A
+    'HEIA':  'HEI-A',   # yfinance uses HEI-A not HEI.A
+    'BFB':   'BF-B',    # Brown-Forman Class B
+    'BFA':   'BF-A',    # Brown-Forman Class A
+    'LENB':  'LEN-B',   # Lennar Corp Class B
+    'UHALB': 'UHAL-B',  # U-Haul Holding Class B
+}
+# HOLX (Hologic) intentionally has no entry here: the iShares ticker was
+# already in yfinance's expected format (plain 'HOLX'), so this was never a
+# ticker-format mismatch. HOLX went private (Blackstone, late 2025) and is
+# now excluded upstream via DELISTED_TICKERS instead.
 
 
 def _is_cache_fresh(path: Path) -> bool:
@@ -157,6 +185,9 @@ def _clean_holdings(df_raw: pd.DataFrame) -> pd.DataFrame:
     # Asset class: equities only.
     df = df[df["asset_class"] == "Equity"]
 
+    # Remove confirmed delisted/private tickers
+    df = df[~df['ticker'].isin(DELISTED_TICKERS)]
+
     # Ticker validity: non-blank, no dots, no spaces, not a known non-equity symbol.
     valid_ticker = (
         df["ticker"].notna()
@@ -171,6 +202,12 @@ def _clean_holdings(df_raw: pd.DataFrame) -> pd.DataFrame:
     # IWB's position size, not company market cap. Market cap filtering
     # happens downstream in price_filter.py using yfinance data.
     df = df.drop_duplicates(subset="ticker").reset_index(drop=True)
+
+    # Translate iShares tickers to yfinance format. Runs last, after the
+    # ticker-validity filters and dedup above (which operate on the
+    # original iShares format) — see TICKER_TRANSLATION comment.
+    df["ticker"] = df["ticker"].map(lambda t: TICKER_TRANSLATION.get(t, t))
+
     return df
 
 
@@ -213,6 +250,11 @@ def fetch_russell_1000(force_refresh: bool = False) -> pd.DataFrame:
 def get_universe_tickers() -> list[str]:
     """Just the ticker list from `fetch_russell_1000()`."""
     return fetch_russell_1000()["ticker"].tolist()
+
+
+def translate_ticker(ticker: str) -> str:
+    """Translates an iShares CSV ticker to yfinance format. Returns unchanged if no translation exists."""
+    return TICKER_TRANSLATION.get(ticker, ticker)
 
 
 if __name__ == "__main__":

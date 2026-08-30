@@ -10,3 +10,6 @@ logs/
 backtest/data/
 backtest/results/
 equity/data/briefs/
+equity/data/cache/
+equity/data/universe/
+equity/data/briefs/
