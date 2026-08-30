@@ -7,3 +7,4 @@
 
 ## 2026-08-30
 - market_config.py: FOMC_DATES_FALLBACK updated to ['2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17', '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09'] — Fix 2026-05-06 → 2026-04-29 per live Fed website scrape
+- market_config.py: FOMC_DATES_VALID_THROUGH updated to '2027-12-31' — Extended through 2027 — live Fed scrape confirmed 2027 dates available

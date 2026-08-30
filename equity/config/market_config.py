@@ -71,7 +71,7 @@ IMPORTANT_RELEASES = {
 # Hardcoded list below is the fallback if fetch fails.
 # FOMC_DATES_VALID_THROUGH: when hardcoded list expires.
 # System warns 60 days before expiry if no auto-fetch available.
-FOMC_DATES_VALID_THROUGH = '2026-12-31'
+FOMC_DATES_VALID_THROUGH = '2027-12-31'
 FOMC_DATES_FALLBACK = ['2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17', '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09']
 FOMC_PROXIMITY_DAYS = 2   # flag if FOMC within this many days
 FOMC_FETCH_URL = 'https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm'
