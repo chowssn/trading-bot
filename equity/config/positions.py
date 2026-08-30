@@ -1,58 +1,26 @@
-"""Manual equity holdings and watchlist.
+"""Portfolio positions and watchlist configuration.
 
-This file is hand-maintained. `POSITIONS` holds names actually owned;
-`WATCHLIST` holds names being monitored but not yet (fully) entered.
-
-`thesis_breakers` drives `news_triage` alerts — keep these specific and
-falsifiable so an alert can actually fire on them, not vague sentiment.
-
-Fields marked TODO below need real numbers filled in (entry date/price,
-position size, thesis date) — they were not specified when this file was
-generated and are placeholders.
+IMPORTANT: This file is version-controlled — every change is tracked in git.
+Do not edit manually outside of approved AI-assisted discussions.
+Position sizes and entry prices come from IBKR API (Module 4 — not yet connected).
+Thesis entries are AI-assisted drafts approved by the portfolio manager.
+See config/changelog.md for human-readable change history.
 """
 
+import json
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_OVERRIDE_PATH = Path(__file__).with_name("positions_override.json")
+
+
 POSITIONS = {
-    "APP": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
-        "tier": "high_conviction",
-
-        # Thesis
-        "thesis": (
-            "Multiple compression on growth narrative reset, not fundamental "
-            "deterioration. E-commerce ramp timing issue, not structural "
-            "ceiling. FCF, margins, EPS trajectory remain strong. RSI near "
-            "30, deeply oversold."
-        ),
-        "thesis_date": "2026-08",
-
-        # What would break the thesis — these drive news_triage alerts
-        "thesis_breakers": [
-            "E-commerce pixel growth fails to scale beyond gaming over 2+ quarters",
-            "Gaming market share drops below 40%",
-            "FCF margin deteriorates below 40%",
-            "Management changes key engineering leadership",
-        ],
-
-        # Sector and macro context
-        "sector": "Communication Services",
-        "macro_thesis": (
-            "Ad tech benefits from AI-driven targeting improvements. "
-            "E-commerce TAM 3x gaming."
-        ),
-
-        # Exit notes
-        "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
-        "stop_thesis": False,
-    },
     "CCJ": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
         "tier": "core",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -81,11 +49,9 @@ POSITIONS = {
         "stop_thesis": False,
     },
     "CEG": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
         "tier": "core",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -111,11 +77,9 @@ POSITIONS = {
         "stop_thesis": False,
     },
     "MSFT": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
         "tier": "core",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -145,11 +109,9 @@ POSITIONS = {
         "stop_thesis": False,
     },
     "UMAC": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
         "tier": "speculative",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -179,11 +141,9 @@ POSITIONS = {
         "stop_thesis": False,
     },
     "PGR": {
-        # Position details
-        "entry_date": "YYYY-MM",  # TODO: fill in actual entry date
-        "entry_price": 0.00,  # TODO: fill in actual entry price
-        "current_size_pct": 0.0,  # TODO: fill in % of portfolio
         "tier": "core",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -216,11 +176,9 @@ POSITIONS = {
 
 WATCHLIST = {
     "APP": {
-        # Position details
-        "entry_date": "YYYY-MM",  # not yet entered
-        "entry_price": 0.00,  # limit orders opened, not yet filled
-        "current_size_pct": 0.0,
         "tier": "watchlist",
+        "thesis_source": "ai_assisted",
+        "last_reviewed": "2026-08",
 
         # Thesis
         "thesis": (
@@ -251,6 +209,38 @@ WATCHLIST = {
         "stop_thesis": False,
     },
 }
+
+
+def _load_override() -> dict:
+    """Load positions_override.json, tolerating a missing or malformed file.
+
+    `config_manager.save_thesis_update()` and `.add_to_watchlist()` write
+    this file directly (rather than editing this module's source) so
+    pending, AI-assisted thesis changes can be committed without parsing
+    Python source. See `equity.config.config_manager`.
+    """
+    if not _OVERRIDE_PATH.exists():
+        return {"POSITIONS": {}, "WATCHLIST": {}}
+    try:
+        with open(_OVERRIDE_PATH) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load positions_override.json — ignoring overrides: %s", exc)
+        return {"POSITIONS": {}, "WATCHLIST": {}}
+    return {"POSITIONS": data.get("POSITIONS", {}), "WATCHLIST": data.get("WATCHLIST", {})}
+
+
+def _apply_overrides(base: dict, overrides: dict) -> dict:
+    """Merge per-ticker field overrides on top of `base`; new tickers pass through as-is."""
+    merged = dict(base)
+    for ticker, fields in overrides.items():
+        merged[ticker] = {**merged.get(ticker, {}), **fields}
+    return merged
+
+
+_override = _load_override()
+POSITIONS = _apply_overrides(POSITIONS, _override["POSITIONS"])
+WATCHLIST = _apply_overrides(WATCHLIST, _override["WATCHLIST"])
 
 
 def get_all_tickers() -> list[str]:
