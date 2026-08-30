@@ -9,3 +9,4 @@ KILL_SWITCH
 logs/
 backtest/data/
 backtest/results/
+equity/data/briefs/
