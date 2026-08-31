@@ -97,3 +97,77 @@ NEWS_IGNORE_WORDS = {             # common words excluded from keyword matching
     'at', 'by', 'from', 'as', 'its', 'this', 'that', 'it',
     'be', 'been', 'will', 'would', 'could', 'may', 'might',
 }
+
+# ============================================================
+# BENCHMARKS AND SECTOR ETFS
+# ============================================================
+BENCHMARK_TICKERS = {
+    # Broad market
+    'SPY':  'S&P 500',
+    'QQQ':  'Nasdaq 100',
+    'IWM':  'Russell 2000',
+    'EEM':  'Emerging Markets',
+    'EFA':  'Developed International (EAFE)',
+    # Sectors
+    'XLK':  'Technology',
+    'XLB':  'Basic Materials',
+    'XLF':  'Financials',
+    'XLE':  'Energy',
+    'XLI':  'Industrials',
+    'TLT':  'Long Treasury / Government',
+    'XLY':  'Consumer Cyclical',
+    'XLC':  'Communication Services',
+    'XLRE': 'Real Estate',
+    'XLV':  'Healthcare',
+    'XLU':  'Utilities',
+    'BIL':  'Cash (3M T-Bill proxy)',
+    # Specialist
+    'URA':  'Uranium / Nuclear',
+    # Factors and commodities
+    'GLD':  'Gold',
+    'SLV':  'Silver',
+    'CPER': 'Copper (COMEX — LME proxy)',
+    'SHY':  'Short Treasury (1-3Y)',
+    'IEF':  'Intermediate Treasury (7-10Y)',
+}
+
+# Position-to-sector ETF mapping for relative performance
+POSITION_SECTOR_MAP = {
+    'CCJ':  'URA',    # uranium ETF
+    'CEG':  'XLU',    # utilities ETF
+    'MSFT': 'XLK',    # tech ETF
+    'PGR':  'XLF',    # financials ETF
+    'UMAC': 'XLI',    # industrials ETF
+    'APP':  'XLC',    # communication services ETF
+}
+
+# SLV/GLD ratio — risk-on indicator
+# Rising ratio = silver outperforming gold = risk-on sentiment
+# (silver has more industrial demand than gold)
+SILVER_GOLD_RATIO_RISK_ON_THRESHOLD = 0.0  # positive change = risk-on signal
+
+# PERFORMANCE / EARNINGS / SECTOR MONITOR THRESHOLDS
+POSITION_UNDERPERFORM_ALERT_PCT = 2.0  # flag if position lags sector by this much
+CORRELATION_CONCENTRATION_THRESHOLD = 0.70  # flag correlated positions
+CORRELATION_HEDGE_THRESHOLD = -0.30  # flag natural hedges
+SECTOR_CONCENTRATION_MAX_PCT = 40    # flag if one sector > this % of portfolio
+EARNINGS_LOOKAHEAD_DAYS = 7          # days ahead to show earnings
+EARNINGS_ALERT_DAYS = 2              # days before earnings to send alert
+
+# Precious metals futures tickers (yfinance front-month)
+GOLD_FUTURES_TICKER = 'GC=F'    # COMEX gold front-month, USD/troy oz
+SILVER_FUTURES_TICKER = 'SI=F'  # COMEX silver front-month, USD/troy oz
+
+# SLV holds ~1 troy oz of silver per share, so unlike GLD (~0.1oz/share,
+# intentionally ~10x below GC=F) its ETF price should track SI=F closely.
+# In practice a several-% gap is routine (SLV's cash-market close vs.
+# SI=F's front-month futures basis, plus trust expense drag) — e.g. SLV
+# $60.0 vs. SI=F $66.7 (~10%) is not itself a problem. Flag the SLV
+# commodities line only past this, wider, threshold — signals a data
+# problem (wrong ticker, stale price, decimal error), not a level worth
+# reading into.
+SLV_SI_DIVERGENCE_ALERT_PCT = 15.0
+# Note: FRED does not carry gold/silver spot series (removed ~2015)
+# Front-month futures are the standard market reference price
+# Same approach as copper: HG=F (COMEX front month) via yfinance
+# LME copper monthly available via FRED PCOPPUSDM but too stale for daily brief

@@ -1,10 +1,17 @@
 """Assembles the full daily morning brief from every brief/portfolio/screener module.
 
 `build_morning_brief()` calls each section's fetch + format pair in
-sequence (market snapshot, eco calendar, portfolio monitor, news triage,
-screener) and stitches the results together. Each section is wrapped
-independently in try/except — one broken data source degrades to an error
-placeholder for that section, never takes down the whole brief.
+sequence (market snapshot, eco calendar, portfolio monitor, performance
+tracker, earnings calendar, sector monitor, news triage, screener) and
+stitches the results together. Each section is wrapped independently in
+try/except — one broken data source degrades to an error placeholder for
+that section, never takes down the whole brief.
+
+Performance/earnings/sector sit after portfolio monitor and before news
+triage: they extend the same holdings-focused picture portfolio monitor
+starts (price action -> benchmark-relative performance -> upcoming
+earnings -> correlation/concentration risk) before the brief moves on to
+qualitative news and then new-idea screening.
 
 `get_regime_adjusted_screener_params()` is a separate utility (not part of
 the assembly above): it fetches the current market regime and looks up
@@ -18,7 +25,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-from equity.brief import eco_calendar, market_snapshot
+from equity.brief import earnings_monitor, eco_calendar, market_snapshot, performance_tracker, sector_monitor
 from equity.config import positions, settings
 from equity.config.market_config import REGIME_SCREENER_ADJUSTMENTS
 from equity.portfolio import monitor, news_triage
@@ -45,10 +52,24 @@ def _run_section(name: str, fetch_fn, format_fn) -> str:
         return f"⚠️ {name} unavailable: {exc}"
 
 
+def _fetch_performance_data() -> tuple[dict, dict, dict, dict]:
+    """Bundle performance_tracker's four fetches into one tuple for `_run_section()`.
+
+    `format_performance_section()` takes four separate dicts rather than
+    one — this just gives `_run_section()` a single fetch_fn to call, in
+    keeping with its (name, fetch_fn, format_fn) contract.
+    """
+    benchmark_data = performance_tracker.fetch_benchmark_performance()
+    portfolio_data = performance_tracker.fetch_portfolio_performance()
+    relative_data = performance_tracker.fetch_position_relative_performance(benchmark_data)
+    spot_data = performance_tracker.fetch_spot_prices(benchmark_data)
+    return benchmark_data, portfolio_data, relative_data, spot_data
+
+
 def build_morning_brief() -> str:
     """Assemble the full morning brief: header, market snapshot, eco calendar, portfolio,
-    news triage, screener, and a footer — in that order, each section independently
-    fault-tolerant (see module docstring).
+    performance tracker, earnings calendar, sector monitor, news triage, screener, and a
+    footer — in that order, each section independently fault-tolerant (see module docstring).
     """
     sections = [format_morning_brief_header()]
 
@@ -60,6 +81,17 @@ def build_morning_brief() -> str:
     ))
     sections.append(_run_section(
         "Portfolio monitor", monitor.run_portfolio_monitor, monitor.format_portfolio_monitor,
+    ))
+    sections.append(_run_section(
+        "Performance tracker",
+        _fetch_performance_data,
+        lambda data: performance_tracker.format_performance_section(*data),
+    ))
+    sections.append(_run_section(
+        "Earnings calendar", earnings_monitor.fetch_earnings_calendar, earnings_monitor.format_earnings_section,
+    ))
+    sections.append(_run_section(
+        "Sector monitor", sector_monitor.fetch_sector_data, sector_monitor.format_sector_section,
     ))
     sections.append(_run_section(
         "News triage",

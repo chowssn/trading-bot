@@ -84,6 +84,10 @@ BTC spot ETFs launched January 11, 2024. `daily_flow_musd`, `flow_*`,
 `ex_gbtc_flow_score`, and `gbtc_outflow_pressure` are correctly null for any
 row before that date — there is no pre-launch flow data to backfill.
 
+Gold and silver prices use COMEX front-month futures (GC=F, SI=F) via
+yfinance. FRED does not carry precious metals spot series. This is
+consistent with copper (HG=F) and is standard market practice.
+
 `backtest/data_fetcher.py`'s `verify_data_quality()` knows about all three
 limitations above (`_KNOWN_LIMITATIONS`) and reports them as INFO rather
 than WARNING, so PASS reflects genuinely unexpected data issues only.
