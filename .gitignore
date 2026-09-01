@@ -13,3 +13,5 @@ equity/data/briefs/
 equity/data/cache/
 equity/data/universe/
 equity/data/briefs/
+equity/data/advisor.db
+equity/data/security.log
