@@ -1,4 +1,21 @@
 {
   "POSITIONS": {},
-  "WATCHLIST": {}
+  "WATCHLIST": {
+    "ONON": {
+      "last_reviewed": "2026-09",
+      "macro_thesis": "ONON is exposed to consumer discretionary spending which is under pressure from high interest rates, student loan resumption, and softening real wage growth in key markets. A hard landing scenario would compress premium footwear demand as consumers trade down. However, the athletic premium segment has historically shown resilience relative to broader discretionary because core enthusiast consumers prioritize performance gear. If the Fed pivots and rate relief flows through to consumer sentiment in 2025, ONON is positioned to re-rate meaningfully as growth multiples expand alongside improving consumer confidence. The risk-reward is skewed positively if macro lands softly or improves, and manageable if entry is staged over time.",
+      "sector": "Consumer Discretionary",
+      "target_exit_conditions": "Exit or significantly reduce if: two consecutive quarters of gross margin contraction below 53%, revenue growth sustained below 18%, RSI mean-reversion above 75 with thesis fully priced in, or if a structural competitive threat emerges from Nike or Adidas directly targeting the CloudTec performance niche with comparable product at lower price points. Do not exit on macro noise alone \u2014 only exit on thesis deterioration.",
+      "thesis": "On Running (ONON) is a premium athletic footwear and apparel brand with exceptional brand momentum, rapidly expanding distribution, and structurally high ROIC driven by direct-to-consumer mix shift. Revenue growth has consistently exceeded 25-30% YoY with gross margins expanding toward the mid-50s as DTC penetration rises. The stock has undergone a meaningful sentiment reset from peak growth valuations, creating a potential entry window for a business that is still in early innings of global market share capture. ONON trades at a premium to legacy peers but at a discount to its own growth trajectory when measured on PEG or forward EV/EBIT. The brand is gaining shelf space, athlete credibility (Zendaya partnership, Iga Swiatek), and international traction particularly in North America and Asia. ROIC is expanding as operating leverage kicks in. This is a quality compounder temporarily repriced by macro risk-off rotation out of consumer discretionary and growth-multiple compression. Entry in pieces with a multi-year hold horizon is appropriate.",
+      "thesis_breakers": [
+        "Gross margin deterioration driven by promotional activity or DTC mix reversal signaling brand fatigue or competitive pricing pressure",
+        "Revenue growth decelerates materially below 20% for two consecutive quarters without a credible recovery catalyst",
+        "Loss of key brand ambassador relationships or a public brand reputation event that damages premium positioning",
+        "Inventory buildup relative to revenue growth suggesting demand softness or channel stuffing masking true sell-through",
+        "Structural margin compression from rising input costs or China supply chain disruption that cannot be passed through to consumers"
+      ],
+      "thesis_source": "ai_assisted",
+      "tier": "high_conviction"
+    }
+  }
 }
