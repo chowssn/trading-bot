@@ -47,6 +47,11 @@ POSITIONS = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
     "CEG": {
         "tier": "core",
@@ -75,6 +80,11 @@ POSITIONS = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
     "MSFT": {
         "tier": "core",
@@ -107,6 +117,11 @@ POSITIONS = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
     "UMAC": {
         "tier": "speculative",
@@ -139,6 +154,11 @@ POSITIONS = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
     "PGR": {
         "tier": "core",
@@ -170,6 +190,11 @@ POSITIONS = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
 }
 
@@ -207,6 +232,11 @@ WATCHLIST = {
         # Exit notes
         "target_exit_conditions": "TODO: define price/thesis-based exit conditions",
         "stop_thesis": False,
+
+        # Optional: tickers considered meaningful peers (style/sub-sector)
+        # even before they show high price correlation — surfaced by the
+        # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
+        "peer_tickers": [],
     },
 }
 

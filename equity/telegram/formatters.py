@@ -160,13 +160,64 @@ def make_portfolio_actions(tickers: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def make_news_actions(alert_tickers: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(f"⚠️ Discuss {t}", callback_data=f"discuss_{t}")]
-        for t in alert_tickers
-    ]
-    rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
-    return InlineKeyboardMarkup(rows)
+def make_news_actions(alert_tickers: list[str], all_tickers: list[str] | None = None) -> InlineKeyboardMarkup | None:
+    """Discuss buttons for thesis-alert tickers, plus a headline-pagination button per ticker with news."""
+    buttons = []
+    if alert_tickers:
+        row = [InlineKeyboardButton(f"⚠️ {t}", callback_data=f"discuss_{t}") for t in alert_tickers[:3]]
+        buttons.append(row)
+    if all_tickers:
+        row = []
+        for t in all_tickers[:4]:
+            row.append(InlineKeyboardButton(f"📰 {t}", callback_data=f"headlines_{t}_0"))
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def make_tickers_keyboard(tickers: list[str], label: str = "Discuss") -> InlineKeyboardMarkup:
+    """Discuss buttons for up to 8 tickers, 3 per row — used by brief_builder for alert/screener call-outs."""
+    buttons = []
+    row = []
+    for ticker in tickers[:8]:
+        row.append(InlineKeyboardButton(f"{label} {ticker}", callback_data=f"discuss_{ticker}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def make_article_keyboard(articles: list[dict]) -> InlineKeyboardMarkup:
+    """Read/Discuss button pair for up to 3 thesis-alert articles (each `{'url', 'ticker'}`)."""
+    buttons = []
+    for article in articles[:3]:
+        row = []
+        if article.get("url"):
+            row.append(InlineKeyboardButton("🔗 Read", url=article["url"]))
+        row.append(InlineKeyboardButton("💬 Discuss", callback_data=f"discuss_{article.get('ticker', 'MACRO')}"))
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def make_headline_page_keyboard(
+    ticker: str, page: int, total_headlines: int, page_size: int = 10
+) -> InlineKeyboardMarkup:
+    """Prev/page-indicator/Next row plus a Discuss-ticker row, for `format_headline_page()`'s output."""
+    total_pages = max(1, (total_headlines + page_size - 1) // page_size)
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"headlines_{ticker}_{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if (page + 1) * page_size < total_headlines:
+        nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"headlines_{ticker}_{page + 1}"))
+    action_row = [InlineKeyboardButton(f"💬 Discuss {ticker}", callback_data=f"discuss_{ticker}")]
+    return InlineKeyboardMarkup([nav_row, action_row])
 
 
 def make_confirm_cancel(change_id: int, description: str) -> InlineKeyboardMarkup:
@@ -248,4 +299,23 @@ def format_thread_list(threads: list[dict]) -> str:
         count = t.get("message_count", 0)
         last_active = _relative_time(t.get("last_active"))
         lines.append(f"{icon} {subject} ({kind}) — {count} messages — last active {last_active}")
+    return "\n".join(lines)
+
+
+def format_headline_page(ticker: str, headlines: list[dict], page: int, page_size: int = 10) -> str:
+    """One page of `ticker`'s full (untruncated) headline list — see `news_triage.run_news_triage()`'s `all_headlines`."""
+    start = page * page_size
+    page_headlines = headlines[start:start + page_size]
+    lines = [f"📰 {ticker} — All Headlines (page {page + 1})"]
+    for h in page_headlines:
+        tier = h.get("source_tier", 3)
+        pub = h.get("publisher", "")
+        url = h.get("url", "")
+        title = h.get("title", "")
+        unverified = " [unverified]" if tier == 3 else ""
+        thesis = " ⚠️" if h.get("thesis_breaker_match") else ""
+        if url:
+            lines.append(f"• [{title}]({url}) [{pub}]{unverified}{thesis}")
+        else:
+            lines.append(f"• {title} [{pub}]{unverified}{thesis}")
     return "\n".join(lines)

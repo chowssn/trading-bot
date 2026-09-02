@@ -26,6 +26,11 @@ from datetime import date
 import yfinance as yf
 
 from equity.config import positions as positions_config
+from equity.config.market_config import (
+    NEWS_MAX_TIER3_PER_TICKER,
+    NEWS_SOURCE_TIER1,
+    NEWS_SOURCE_TIER2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +68,20 @@ def _fetch_news(ticker: str) -> list[dict]:
     return raw or []
 
 
+def _get_source_tier(publisher: str) -> int:
+    """1 (top-tier wire/paper), 2 (industry trade press), or 3 (everything else — 'unverified')."""
+    pub_lower = publisher.lower() if publisher else ""
+    for source in NEWS_SOURCE_TIER1:
+        if source in pub_lower:
+            return 1
+    for source in NEWS_SOURCE_TIER2:
+        if source in pub_lower:
+            return 2
+    return 3
+
+
 def _extract_headline(item: dict) -> dict | None:
-    """Pull title/published/url out of one yf.Ticker.news item, or None if unusable."""
+    """Pull title/published/url/publisher out of one yf.Ticker.news item, or None if unusable."""
     content = item.get("content", item)  # tolerate the pre-1.5 flat schema too
     title = content.get("title")
     if not title:
@@ -76,26 +93,47 @@ def _extract_headline(item: dict) -> dict | None:
         or content.get("link")
         or ""
     )
+    publisher = (content.get("provider") or {}).get("displayName") or content.get("publisher") or ""
 
     return {
         "title": title,
         "published": content.get("pubDate") or content.get("displayTime") or "",
         "url": url,
+        "publisher": publisher,
+        "source_tier": _get_source_tier(publisher),
     }
+
+
+def _cap_tier3(headlines: list[dict]) -> list[dict]:
+    """All tier-1/2 headlines, plus at most `NEWS_MAX_TIER3_PER_TICKER` tier-3 ones, in original order."""
+    kept = []
+    tier3_kept = 0
+    for h in headlines:
+        if h.get("source_tier") == 3:
+            if tier3_kept >= NEWS_MAX_TIER3_PER_TICKER:
+                continue
+            tier3_kept += 1
+        kept.append(h)
+    return kept
 
 
 def run_news_triage(tickers: list[str]) -> dict:
     """Fetch and thesis-breaker-check recent news for each ticker in `tickers`.
 
-    A ticker with no news, or whose fetch fails, gets an empty
-    `headlines` list rather than being dropped from the result — never
-    crash the whole run over one bad ticker.
+    `headlines` is capped at `NEWS_MAX_TIER3_PER_TICKER` tier-3 (lowest
+    credibility) headlines per ticker — tier-1/2 sources are never capped.
+    `all_headlines` is the full, untruncated list (used for the Telegram
+    headline-pagination flow — see `equity.telegram.formatters`).
+
+    A ticker with no news, or whose fetch fails, gets empty
+    `headlines`/`all_headlines` lists rather than being dropped from the
+    result — never crash the whole run over one bad ticker.
     """
     result = {}
 
     for ticker in tickers:
         thesis_breakers = positions_config.get_thesis_breakers(ticker)
-        headlines = []
+        all_headlines = []
         thesis_alerts = []
 
         for item in _fetch_news(ticker):
@@ -109,15 +147,33 @@ def run_news_triage(tickers: list[str]) -> dict:
             if matched and matched not in thesis_alerts:
                 thesis_alerts.append(matched)
 
-            headlines.append(headline)
+            all_headlines.append(headline)
+
+        headlines = _cap_tier3(all_headlines)
 
         result[ticker] = {
             "headlines": headlines,
+            "all_headlines": all_headlines,
             "has_thesis_alert": bool(thesis_alerts),
             "thesis_alerts": thesis_alerts,
         }
 
     return result
+
+
+def _format_title(headline: dict) -> str:
+    """Markdown link `[Title](url)` when a URL is available, else the bare title."""
+    title, url = headline["title"], headline.get("url")
+    return f"[{title}]({url})" if url else title
+
+
+def _format_headline_line(headline: dict, *, prefix: str = "  • ") -> str:
+    tier = headline.get("source_tier", 3)
+    marker = " ⚠️" if headline.get("thesis_breaker_match") else ""
+    unverified = " [unverified]" if tier == 3 else ""
+    publisher = headline.get("publisher") or ""
+    pub_str = f" [{publisher}]" if publisher and tier != 3 else ""
+    return f"{prefix}{_format_title(headline)}{pub_str}{unverified}{marker}"
 
 
 def format_news_triage(triage_data: dict) -> str:
@@ -131,11 +187,12 @@ def format_news_triage(triage_data: dict) -> str:
             data = triage_data[ticker]
             for breaker in data["thesis_alerts"]:
                 lines.append(f"{ticker}: '{breaker}'")
-                matched_titles = [
-                    h["title"] for h in data["headlines"] if h.get("matched_breaker") == breaker
-                ]
-                for title in matched_titles:
-                    lines.append(f"  → '{title}'")
+                matched = [h for h in data["headlines"] if h.get("matched_breaker") == breaker]
+                for h in matched:
+                    # Tier 3 (unverified) source matching a thesis-breaker phrase
+                    # is flagged louder — worth a skeptical look before acting.
+                    prefix = "  ⚠️ LOW CREDIBILITY — '" if h.get("source_tier") == 3 else "  → '"
+                    lines.append(f"{prefix}{h['title']}'")
         lines.append("")
 
     lines.append("📋 HEADLINES")
@@ -148,8 +205,7 @@ def format_news_triage(triage_data: dict) -> str:
 
         lines.append(f"{ticker} ({len(headlines)} article{'s' if len(headlines) != 1 else ''})")
         for headline in headlines[:MAX_HEADLINES_SHOWN]:
-            marker = " ⚠️" if headline.get("thesis_breaker_match") else ""
-            lines.append(f"  • {headline['title']}{marker}")
+            lines.append(_format_headline_line(headline))
 
     lines.append(_DIVIDER)
     return "\n".join(lines)

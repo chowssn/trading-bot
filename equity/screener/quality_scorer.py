@@ -17,7 +17,11 @@ pulls fundamentals from two sources:
     treat "ROIC unavailable" as a single, uniform case.
 
 Scoring: six components (ROIC, CFO quality, leverage, share count, revenue
-growth, EBITDA margin, valuation direction) sum to a 0-100 `quality_score`.
+growth, EBITDA margin) sum to a 0-90 `quality_score` (see `MAX_QUALITY_SCORE`).
+Forward P/E used to be a 7th, 10pt "valuation direction" component; it's
+now display-only (`forward_pe`/`trailing_pe` in the result dict, with a
+"verify against Bloomberg" note in screener output) — see
+`_score_ebitda_margin()`'s docstring and `_score_ticker_uncached()`.
 A metric that can't be computed gets a documented neutral/partial-credit
 fallback (see the `_score_*` functions) rather than being treated as a
 red flag — the trading thesis here is capital preservation, so we want
@@ -63,11 +67,21 @@ RESULT_KEYS = [
     "ticker", "quality_score", "tier", "red_flags", "yellow_flags", "green_flags",
     "roic_current", "roic_5y_avg", "roic_available",
     "cfo_t12m", "net_income_t12m", "cfo_gte_ni",
+    "cfo_3y_avg", "ni_3y_avg", "cfo_ni_ratio_3y_avg", "cfo_ni_ratio_single",
     "ebitda_t12m", "net_debt_ebitda",
     "ebitda_margin_3y_avg", "revenue_cagr_3y", "share_count_direction",
+    # forward_pe/trailing_pe are display-only fields (see _score_ticker_uncached
+    # / module docstring) — no longer part of quality_score's scoring.
     "forward_pe", "trailing_pe", "sector",
     "score_components", "data_warnings",
 ]
+
+# quality_score max — was 100 with a 10pt valuation component; that
+# component moved to display-only (forward_pe/trailing_pe fields), so the
+# six remaining components (roic 25 + cfo_quality 15 + leverage 15 +
+# share_count 10 + revenue_growth 15 + ebitda_margin 10) sum to 90.
+# settings.MIN_QUALITY_SCORE (50) is unaffected — still a valid bar.
+MAX_QUALITY_SCORE = 90
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +259,16 @@ def _fetch_quarterly_metrics(tk: "yf.Ticker", warnings: list[str]) -> dict:
     }
 
 
+def _avg_first_n(row: pd.Series | None, n: int) -> float | None:
+    """Mean of the first `n` non-null values of `row` (most-recent-first), or None if fewer than `n`."""
+    if row is None:
+        return None
+    vals = row.dropna()
+    if len(vals) < n:
+        return None
+    return float(vals.iloc[:n].mean())
+
+
 def _fetch_annual_metrics(tk: "yf.Ticker", warnings: list[str]) -> dict:
     inc = getattr(tk, "income_stmt", None)
     cf = getattr(tk, "cashflow", None)
@@ -273,11 +297,30 @@ def _fetch_annual_metrics(tk: "yf.Ticker", warnings: list[str]) -> dict:
     else:
         share_direction = "neutral"
 
+    # 3-year average CFO/NI — primary signal for _score_cfo_quality(),
+    # compared against the single-period (T12M) ratio to distinguish
+    # temporary distress from sustained weakness. Same defensive
+    # missing-row/short-history -> None handling as every other annual
+    # metric in this function.
+    cfo_3y_avg = _avg_first_n(_get_row(cf, ["Operating Cash Flow"]), 3)
+    if cfo_3y_avg is None:
+        warnings.append("cfo_3y_avg unavailable: fewer than 3 annual 'Operating Cash Flow' periods")
+    else:
+        cfo_3y_avg /= MUSD
+
+    ni_3y_avg = _avg_first_n(_get_row(inc, ["Net Income"]), 3)
+    if ni_3y_avg is None:
+        warnings.append("ni_3y_avg unavailable: fewer than 3 annual 'Net Income' periods")
+    else:
+        ni_3y_avg /= MUSD
+
     return {
         "ebitda_margin_3y_avg": margin,
         "revenue_cagr_3y": revenue_cagr,
         "share_count_direction": share_direction,
         "share_count_cagr": share_cagr,  # internal only — not part of the public result schema
+        "cfo_3y_avg": cfo_3y_avg,
+        "ni_3y_avg": ni_3y_avg,
     }
 
 
@@ -323,17 +366,53 @@ def _score_roic(roic_current: float | None, roic_available: bool) -> tuple[int, 
     return 0, ["low_roic"], [], []
 
 
-def _score_cfo_quality(cfo_t12m: float | None, net_income_t12m: float | None, cfo_gte_ni: bool) -> tuple[int, list, list, list]:
-    if cfo_gte_ni:
-        return 15, [], [], []
-    if cfo_t12m is None or not net_income_t12m or net_income_t12m <= 0:
-        return 0, [], ["weak_cfo"], []
-    ratio = cfo_t12m / net_income_t12m
-    if ratio >= 0.8:
-        return 12, [], [], []
-    if ratio >= 0.6:
-        return 8, [], [], []
-    return 0, [], ["weak_cfo"], []
+def _score_cfo_quality(
+    cfo_t12m: float | None, net_income_t12m: float | None,
+    cfo_3y_avg: float | None, ni_3y_avg: float | None,
+) -> tuple[int, list, list]:
+    """3-year average CFO/NI ratio as the primary quality signal, compared to the single (T12M) period.
+
+    Returns (score, yellow_flags, green_flags) — see module docstring's
+    Part 3a: single-period distress against a strong 3Y average is only
+    partially penalized (likely temporary); single-period strength against
+    a weak 3Y average is a positive (improving) signal.
+    """
+    flags_yellow: list[str] = []
+    flags_green: list[str] = []
+
+    sp_ratio = cfo_t12m / net_income_t12m if net_income_t12m else None
+    avg_ratio = cfo_3y_avg / ni_3y_avg if cfo_3y_avg and ni_3y_avg else None
+
+    # Use 3Y avg as primary; fall back to single-period if unavailable.
+    primary_ratio = avg_ratio if avg_ratio is not None else sp_ratio
+
+    if primary_ratio is None:
+        return 8, ["cfo_data_limited"], []  # neutral if no data
+
+    if primary_ratio >= 1.2:
+        score = 15
+        flags_green.append("strong_cash_conversion")
+    elif primary_ratio >= 1.0:
+        score = 15
+    elif primary_ratio >= 0.8:
+        score = 12
+    elif primary_ratio >= 0.6:
+        score = 8
+    else:
+        score = 0
+        flags_yellow.append("weak_cfo_quality")
+
+    if sp_ratio is not None and avg_ratio is not None:
+        if sp_ratio < 0.6 and avg_ratio >= 1.0:
+            # Single-period distress vs. strong history — likely temporary.
+            flags_yellow.append("cfo_single_period_distress_vs_strong_history")
+            score = max(score - 3, 0)
+        elif sp_ratio >= 1.2 and avg_ratio < 0.8:
+            # Improving: single period much better than history.
+            flags_green.append("cfo_improving_vs_history")
+            score = min(score + 2, 15)
+
+    return score, flags_yellow, flags_green
 
 
 def _score_leverage(net_debt: float | None, net_debt_ebitda: float | None) -> tuple[int, list, list, list]:
@@ -377,39 +456,60 @@ def _score_revenue_growth(cagr: float | None) -> tuple[int, list, list, list]:
     return 0, [], ["declining_revenue"], []
 
 
-def _score_ebitda_margin(roic_current: float | None, roic_available: bool, margin: float | None) -> tuple[int, list, list, list]:
-    if margin is None or roic_current is None or not roic_available:
-        return 4, [], [], []
-    if roic_current > 25:
-        if margin >= 15:
-            return 10, [], [], []
-        if margin >= 10:
-            return 8, [], [], []
-        return 5, [], [], []
-    if roic_current >= 15:
-        if margin >= 20:
-            return 10, [], [], []
-        if margin >= 15:
-            return 8, [], [], []
-        return 4, [], [], []
-    # roic < 15%
-    if margin >= 25:
-        return 5, [], [], []
-    if margin >= 15:
-        # Gap in the spec (only "roic<15 and margin<15" is documented) — fill
-        # conservatively, below every roic>=15 tier's output.
-        return 2, [], [], []
-    return 0, [], ["poor_margin_low_roic"], []
+def _score_ebitda_margin(ebitda_margin: float | None, roic_current: float | None) -> tuple[int, str]:
+    """Simplified ROIC-conditional margin scoring. Returns (score, interpretation_note).
+
+    ROIC > 25%: margin is informational only — score 10 regardless (high
+                capital efficiency compensates for a lower margin).
+    ROIC 15-25%: margin >= 15% required for full points; margin < 15% penalized.
+    ROIC < 15%: red flag regardless of margin — margin cannot rescue poor
+                capital efficiency.
+    ROIC unavailable: use margin alone with moderate (neutral) scoring.
+    """
+    if ebitda_margin is None:
+        return 5, "margin_unavailable"
+
+    roic = roic_current or 0
+
+    if roic > 25:
+        note = f"margin {ebitda_margin:.1f}% (informational — ROIC {roic:.1f}% compensates)"
+        return 10, note
+    if roic >= 15:
+        if ebitda_margin >= 20:
+            return 10, "strong_margin"
+        if ebitda_margin >= 15:
+            return 8, "adequate_margin"
+        return 4, "margin_below_threshold_for_roic_band"
+    # roic < 15 — margin cannot rescue poor capital efficiency
+    if ebitda_margin >= 25:
+        return 5, "high_margin_but_low_roic"
+    return 0, "poor_margin_and_low_roic"
 
 
-def _score_valuation(forward_pe: float | None, trailing_pe: float | None) -> tuple[int, list, list, list]:
-    if forward_pe is None or not trailing_pe:
-        return 5, [], [], []
-    if forward_pe < trailing_pe:
-        return 10, [], [], []
-    if abs(forward_pe - trailing_pe) <= 0.10 * abs(trailing_pe):
-        return 6, [], [], []
-    return 2, [], ["pe_expansion"], []
+# Maps _score_ebitda_margin()'s interpretation note to a (severity, flags.py-style
+# flag name) pair — folds the note into this module's usual red/yellow/green
+# flag lists (see _add() below) rather than adding a separate note field.
+# A note not present here (margin_unavailable's exact text varies via
+# f-string for the ROIC>25 case) means "no flag, informational only."
+_MARGIN_NOTE_FLAGS: dict[str, tuple[str, str]] = {
+    "margin_unavailable": ("yellow", "margin_data_unavailable"),
+    "strong_margin": ("green", "strong_margin"),
+    "margin_below_threshold_for_roic_band": ("yellow", "margin_below_threshold_for_roic_band"),
+    "high_margin_but_low_roic": ("yellow", "high_margin_but_low_roic"),
+    "poor_margin_and_low_roic": ("red", "poor_margin_and_low_roic"),
+}
+
+
+def _margin_flags(note: str) -> tuple[list, list, list]:
+    kind = _MARGIN_NOTE_FLAGS.get(note)
+    if kind is None:
+        return [], [], []  # informational note (ROIC>25 case) or 'adequate_margin' — no flag
+    severity, flag = kind
+    if severity == "red":
+        return [flag], [], []
+    if severity == "yellow":
+        return [], [flag], []
+    return [], [], [flag]
 
 
 def _tier_for(score: int) -> str:
@@ -437,6 +537,10 @@ def _empty_result(ticker: str) -> dict:
         "cfo_t12m": None,
         "net_income_t12m": None,
         "cfo_gte_ni": False,
+        "cfo_3y_avg": None,
+        "ni_3y_avg": None,
+        "cfo_ni_ratio_3y_avg": None,
+        "cfo_ni_ratio_single": None,
         "ebitda_t12m": None,
         "net_debt_ebitda": None,
         "ebitda_margin_3y_avg": None,
@@ -472,15 +576,29 @@ def _score_ticker_uncached(ticker: str, api_key: str) -> dict:
         yellow_flags.extend(yellow)
         green_flags.extend(green)
 
+    cfo_score, cfo_yellow, cfo_green = _score_cfo_quality(
+        quarterly["cfo_t12m"], quarterly["net_income_t12m"], annual["cfo_3y_avg"], annual["ni_3y_avg"],
+    )
+    margin_score, margin_note = _score_ebitda_margin(annual["ebitda_margin_3y_avg"], roic_current)
+    margin_red, margin_yellow, margin_green = _margin_flags(margin_note)
+
     _add("roic", *_score_roic(roic_current, roic_available))
-    _add("cfo_quality", *_score_cfo_quality(quarterly["cfo_t12m"], quarterly["net_income_t12m"], quarterly["cfo_gte_ni"]))
+    _add("cfo_quality", cfo_score, [], cfo_yellow, cfo_green)
     _add("leverage", *_score_leverage(quarterly["net_debt"], quarterly["net_debt_ebitda"]))
     _add("share_count", *_score_share_count(annual["share_count_direction"], annual["share_count_cagr"]))
     _add("revenue_growth", *_score_revenue_growth(annual["revenue_cagr_3y"]))
-    _add("ebitda_margin", *_score_ebitda_margin(roic_current, roic_available, annual["ebitda_margin_3y_avg"]))
-    _add("valuation", *_score_valuation(info_metrics["forward_pe"], info_metrics["trailing_pe"]))
+    _add("ebitda_margin", margin_score, margin_red, margin_yellow, margin_green)
+    # Forward P/E is display-only now (Part 3c) — no "valuation" scoring
+    # component, and no "valuation" key in score_components.
 
     quality_score = sum(components.values())
+
+    cfo_ni_ratio_3y_avg = (
+        annual["cfo_3y_avg"] / annual["ni_3y_avg"] if annual["cfo_3y_avg"] and annual["ni_3y_avg"] else None
+    )
+    cfo_ni_ratio_single = (
+        quarterly["cfo_t12m"] / quarterly["net_income_t12m"] if quarterly["net_income_t12m"] else None
+    )
 
     result = _empty_result(ticker)
     result.update({
@@ -495,11 +613,17 @@ def _score_ticker_uncached(ticker: str, api_key: str) -> dict:
         "cfo_t12m": quarterly["cfo_t12m"],
         "net_income_t12m": quarterly["net_income_t12m"],
         "cfo_gte_ni": quarterly["cfo_gte_ni"],
+        "cfo_3y_avg": annual["cfo_3y_avg"],
+        "ni_3y_avg": annual["ni_3y_avg"],
+        "cfo_ni_ratio_3y_avg": cfo_ni_ratio_3y_avg,
+        "cfo_ni_ratio_single": cfo_ni_ratio_single,
         "ebitda_t12m": quarterly["ebitda_t12m"],
         "net_debt_ebitda": quarterly["net_debt_ebitda"],
         "ebitda_margin_3y_avg": annual["ebitda_margin_3y_avg"],
         "revenue_cagr_3y": annual["revenue_cagr_3y"],
         "share_count_direction": annual["share_count_direction"],
+        # Display only — verify against Bloomberg before acting on either;
+        # neither feeds quality_score (see _score_ebitda_margin/module docstring).
         "forward_pe": info_metrics["forward_pe"],
         "trailing_pe": info_metrics["trailing_pe"],
         "sector": info_metrics["sector"],

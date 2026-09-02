@@ -30,6 +30,12 @@ import yfinance as yf
 
 from backtest.indicators import rsi
 from equity.config import settings
+from equity.config.market_config import (
+    RETURN_3M_GRADUAL_GRIND,
+    RETURN_3M_SHARP_DROP,
+    RSI_30D_THRESHOLD_BY_REGIME,
+)
+from equity.screener.timing_signal import classify_timing
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,8 @@ MIN_TRADING_DAYS = 260
 OUTPUT_COLUMNS = [
     "ticker",
     "return_1y",
+    "return_3m",
+    "price_action_type",
     "rsi_30d",
     "rsi_14d",
     "rsi_14d_direction",
@@ -52,6 +60,8 @@ OUTPUT_COLUMNS = [
     "passes_dislocation",
     "market_cap_b",
     "market_cap_unverified",
+    "timing_signal",
+    "timing_note",
 ]
 
 
@@ -89,7 +99,45 @@ def _extract_ticker_frame(data: pd.DataFrame, ticker: str, single_ticker: bool) 
     return sub
 
 
-def _compute_row(ticker: str, sub: pd.DataFrame) -> dict:
+def _get_rsi_threshold(regime_flags: list[str] | None) -> float:
+    """Active RSI 30D dislocation threshold for today's regime.
+
+    `settings.RSI_30D_MAX` is the fallback when `regime_flags` is empty/None
+    (regime unknown or not yet classified) — everything else comes from
+    `market_config.RSI_30D_THRESHOLD_BY_REGIME`. HIGH_VOL / ELEVATED_VOL
+    take priority over a RISK_ON_DAY flag (a volatile risk-on day is still
+    a volatile day), and a RISK_ON_DAY only relaxes the bar when there's no
+    offsetting RISK_OFF_DAY flag active the same day.
+    """
+    if not regime_flags:
+        return settings.RSI_30D_MAX
+    if "HIGH_VOL" in regime_flags:
+        return RSI_30D_THRESHOLD_BY_REGIME["HIGH_VOL"]
+    if "ELEVATED_VOL" in regime_flags:
+        return RSI_30D_THRESHOLD_BY_REGIME["ELEVATED_VOL"]
+    if "RISK_ON_DAY" in regime_flags and "RISK_OFF_DAY" not in regime_flags:
+        return RSI_30D_THRESHOLD_BY_REGIME["RISK_ON"]
+    return RSI_30D_THRESHOLD_BY_REGIME["NEUTRAL"]
+
+
+def _classify_price_action(return_1y: float, return_3m: float) -> str:
+    """Classifies the nature of the price dislocation.
+
+    SHARP_RECENT:  3M drop > RETURN_3M_SHARP_DROP — recent sharp selloff
+    SLOW_GRIND:    1Y bad but 3M only slightly negative — sustained weakness
+    RECENT_BOUNCE: 1Y bad but 3M positive — may be recovering, watch RSI
+    MIXED:         everything else
+    """
+    if return_3m < RETURN_3M_SHARP_DROP:
+        return "SHARP_RECENT"
+    if return_1y < settings.DISLOCATION_ZONE_MIN and return_3m > RETURN_3M_GRADUAL_GRIND:
+        return "SLOW_GRIND"
+    if return_1y < settings.DISLOCATION_ZONE_MIN and return_3m > 0:
+        return "RECENT_BOUNCE"
+    return "MIXED"
+
+
+def _compute_row(ticker: str, sub: pd.DataFrame, rsi_threshold: float) -> dict:
     """Compute the price-filter row for one ticker's OHLCV frame, or raise ValueError."""
     if "Volume" not in sub.columns:
         raise ValueError("missing Volume column")
@@ -109,6 +157,13 @@ def _compute_row(ticker: str, sub: pd.DataFrame) -> dict:
     if not price_1y_ago or pd.isna(price_1y_ago) or pd.isna(price_today):
         raise ValueError("invalid price for return_1y calc")
     return_1y = (price_today / price_1y_ago - 1) * 100
+
+    # return_3m: price closest to 3 calendar months ago vs. today.
+    three_months_ago = idx[-1] - pd.DateOffset(months=3)
+    idx_3m = idx.searchsorted(three_months_ago)
+    idx_3m = min(max(int(idx_3m), 0), len(idx) - 1)
+    price_3m_ago = close.iloc[idx_3m]
+    return_3m = (price_today / price_3m_ago - 1) * 100 if price_3m_ago else None
 
     rsi_30d_series = rsi(close, period=30)
     rsi_14d_series = rsi(close, period=14)
@@ -136,18 +191,32 @@ def _compute_row(ticker: str, sub: pd.DataFrame) -> dict:
 
     passes = (
         settings.DISLOCATION_ZONE_MAX <= return_1y <= settings.DISLOCATION_ZONE_MIN
-        and rsi_30d_val <= settings.RSI_30D_MAX
+        and rsi_30d_val <= rsi_threshold
         and avg_volume_30d >= settings.UNIVERSE_MIN_AVG_VOLUME
+    )
+
+    price_action_type = _classify_price_action(return_1y, return_3m) if return_3m is not None else None
+
+    # Multi-factor entry timing — computed here (not in screener.py) while
+    # the full RSI/volume/price series are still in scope; only the scalar
+    # timing_signal/timing_note survive into the cached CSV row.
+    timing = classify_timing(
+        rsi_14d_val, direction,
+        rsi_14d_series=rsi_14d_series, volume_series=volume, price_series=close,
     )
 
     return {
         "ticker": ticker,
         "return_1y": return_1y,
+        "return_3m": return_3m,
+        "price_action_type": price_action_type,
         "rsi_30d": rsi_30d_val,
         "rsi_14d": rsi_14d_val,
         "rsi_14d_direction": direction,
         "avg_volume_30d": avg_volume_30d,
         "passes_dislocation": passes,
+        "timing_signal": timing["timing_signal"],
+        "timing_note": timing["timing_note"],
     }
 
 
@@ -175,7 +244,7 @@ def _fetch_market_cap(ticker: str) -> tuple[float, bool]:
     return market_cap / 1e9, False
 
 
-def _process_batch(batch: list[str]) -> list[dict]:
+def _process_batch(batch: list[str], rsi_threshold: float) -> list[dict]:
     try:
         data = yf.download(
             batch,
@@ -197,17 +266,17 @@ def _process_batch(batch: list[str]) -> list[dict]:
     for ticker in batch:
         try:
             sub = _extract_ticker_frame(data, ticker, single_ticker=len(batch) == 1)
-            rows.append(_compute_row(ticker, sub))
+            rows.append(_compute_row(ticker, sub, rsi_threshold))
         except Exception as exc:
             logger.warning("Skipping %s: %s", ticker, exc)
             continue
     return rows
 
 
-def _run_price_filter_uncached(tickers: list[str], batch_size: int) -> pd.DataFrame:
+def _run_price_filter_uncached(tickers: list[str], batch_size: int, rsi_threshold: float) -> pd.DataFrame:
     rows: list[dict] = []
     for batch in _chunk(tickers, batch_size):
-        rows.extend(_process_batch(batch))
+        rows.extend(_process_batch(batch, rsi_threshold))
 
     if not rows:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -228,16 +297,23 @@ def _run_price_filter_uncached(tickers: list[str], batch_size: int) -> pd.DataFr
     return passing[OUTPUT_COLUMNS]
 
 
-def run_price_filter(tickers: list[str], batch_size: int = 100) -> pd.DataFrame:
+def run_price_filter(
+    tickers: list[str], batch_size: int = 100, regime_flags: list[str] | None = None
+) -> pd.DataFrame:
     """Run the price/RSI/volume dislocation pre-filter over `tickers`.
 
     Fetches price history from yfinance in batches of `batch_size` via
     `yf.download()`. Returns only the tickers that PASS the dislocation
     filter (see module docstring) AND clear the `UNIVERSE_MIN_MARKET_CAP_B`
     market cap floor (or have `market_cap_unverified=True`, in which case
-    they pass through regardless — see `_fetch_market_cap`). Columns:
-    ticker, return_1y, rsi_30d, rsi_14d, rsi_14d_direction, avg_volume_30d,
-    passes_dislocation, market_cap_b, market_cap_unverified.
+    they pass through regardless — see `_fetch_market_cap`). Columns: see
+    `OUTPUT_COLUMNS`.
+
+    `regime_flags` (today's active flags from `market_snapshot.fetch_market_snapshot()`)
+    adjusts the RSI 30D dislocation threshold via
+    `_get_rsi_threshold()`/`market_config.RSI_30D_THRESHOLD_BY_REGIME` —
+    a more volatile regime demands a deeper oversold reading to pass.
+    Falls back to `settings.RSI_30D_MAX` when `regime_flags` is None/empty.
 
     Individual ticker failures (no data, insufficient history, etc.) are
     logged and skipped — never crash the whole run over one bad ticker.
@@ -246,12 +322,14 @@ def run_price_filter(tickers: list[str], batch_size: int = 100) -> pd.DataFrame:
     `settings.PRICE_CACHE_HOURS` hour(s). A run/pass/pass-rate summary for
     this call is attached to `result.attrs["summary"]` and logged.
     """
+    rsi_threshold = _get_rsi_threshold(regime_flags)
+
     cache_path = _cache_path()
     if _is_cache_fresh(cache_path):
         logger.info("Loading price filter results from fresh cache: %s", cache_path)
         result = pd.read_csv(cache_path)
     else:
-        result = _run_price_filter_uncached(tickers, batch_size)
+        result = _run_price_filter_uncached(tickers, batch_size, rsi_threshold)
         result.to_csv(cache_path, index=False)
         logger.info("Cached price filter results to %s", cache_path)
 

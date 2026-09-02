@@ -66,6 +66,26 @@ IMPORTANT_RELEASES = {
     'ISM Services PMI':                                 ('ISM Services', 'MEDIUM'),
 }
 
+# FRED series carrying the headline data point for each IMPORTANT_RELEASES
+# release — used by eco_calendar.py to show the prior reading alongside an
+# upcoming release date. Distinct from the release-*dates* calendar (which
+# uses FRED's /fred/releases/dates endpoint and release *names*, not data
+# series ids). ISM Manufacturing/Services have no entry — ISM is
+# proprietary data FRED does not carry at all (same limitation documented
+# on IMPORTANT_RELEASES' release-dates side in eco_calendar.py).
+RELEASE_DATA_SERIES = {
+    'Consumer Price Index':                            'CPIAUCSL',
+    'Employment Situation':                            'PAYEMS',
+    'Gross Domestic Product':                          'GDP',
+    'Personal Income and Outlays':                     'PCEPI',
+    'Producer Price Index':                            'PPIACO',
+    'Retail Sales':                                    'RSAFS',
+    'Industrial Production and Capacity Utilization':  'INDPRO',
+    'Housing Starts':                                  'HOUST',
+    'Consumer Sentiment':                               'UMCSENT',
+    'Job Openings and Labor Turnover Survey':          'JTSJOL',
+}
+
 # FOMC CALENDAR
 # Auto-fetched from Fed website at runtime (see eco_calendar.py).
 # Hardcoded list below is the fallback if fetch fails.
@@ -171,3 +191,166 @@ SLV_SI_DIVERGENCE_ALERT_PCT = 15.0
 # Front-month futures are the standard market reference price
 # Same approach as copper: HG=F (COMEX front month) via yfinance
 # LME copper monthly available via FRED PCOPPUSDM but too stale for daily brief
+
+# ============================================================
+# TREASURY CURVE
+# ============================================================
+TREASURY_TICKERS = {
+    '^IRX':  '3M',
+    '^FVX':  '5Y',
+    '^TNX':  '10Y',
+    '^TYX':  '30Y',
+}
+# 2Y and 20Y from FRED (not available on yfinance)
+TREASURY_FRED_SERIES = {
+    'DGS2':  '2Y',
+    'DGS20': '20Y',
+}
+# JGB 10Y from FRED — monthly, forward-filled
+JGB_10Y_FRED_SERIES = 'IRLTLT01JPM156N'
+
+TREASURY_SPREADS = {
+    '3M10Y': ('3M', '10Y'),
+    '2Y10Y': ('2Y', '10Y'),
+    '2Y30Y': ('2Y', '30Y'),
+}
+
+# ============================================================
+# FX PAIRS
+# ============================================================
+FX_TICKERS = {
+    'EURUSD=X': 'EUR/USD',
+    'USDJPY=X': 'USD/JPY',
+    'GBPUSD=X': 'GBP/USD',
+    'USDCHF=X': 'USD/CHF',
+    'AUDUSD=X': 'AUD/USD',
+    'USDCAD=X': 'USD/CAD',
+    'USDCNH=X': 'USD/CNH',
+    'EURJPY=X': 'EUR/JPY',
+    'EURGBP=X': 'EUR/GBP',
+}
+
+# FX forwards via CIP derivation
+FX_FORWARD_FOREIGN_RATES = {
+    'EURUSD=X': {'1M': 'ECBDFR', '3M': 'IRLTLT01DEM156N', '1Y': 'IRLTLT01DEM156N'},
+    'USDJPY=X': {'1M': 'IRSTCI01JPM156N', '3M': 'IRSTCI01JPM156N', '1Y': 'IRLTLT01JPM156N'},
+    'GBPUSD=X': {'1M': 'IUDSOIA', '3M': 'IUDSOIA', '1Y': 'IRLTLT01GBM156N'},
+    'USDCAD=X': {'1M': 'IRSTCI01CAM156N', '3M': 'IRSTCI01CAM156N', '1Y': 'IRSTCI01CAM156N'},
+    'AUDUSD=X': {'1M': 'IRSTCI01AUM156N', '3M': 'IRSTCI01AUM156N', '1Y': 'IRSTCI01AUM156N'},
+    'USDCHF=X': {'1M': 'IRSTCI01CHM156N', '3M': 'IRSTCI01CHM156N', '1Y': 'IRSTCI01CHM156N'},
+}
+FX_FORWARD_TENORS = ['1M', '3M', '6M', '1Y']
+FX_TENOR_DAYS = {'1W': 7, '1M': 30, '3M': 90, '6M': 180, '1Y': 365}
+
+# ============================================================
+# EXTENDED COMMODITIES
+# ============================================================
+COMMODITY_TICKERS_EXTENDED = {
+    'BZ=F':  'Brent Crude',
+    'CL=F':  'WTI Crude',
+    'NG=F':  'Natural Gas',
+    'GC=F':  'Gold',
+    'SI=F':  'Silver',
+    'PL=F':  'Platinum',
+    'HG=F':  'Copper (COMEX)',
+    'URA':   'Uranium (URA ETF)',
+}
+
+# ============================================================
+# MOVING AVERAGE AND EXTREMES HIGHLIGHTING
+# Applied to: rates, spreads, FX, commodities, positions
+# ============================================================
+HIGHLIGHT_MA_PERIODS = [20, 50, 200]
+HIGHLIGHT_MA_PROXIMITY_PCT = 1.0      # flag if within 1% of any SMA
+HIGHLIGHT_EXTREMES_LOOKBACK = '5y'
+HIGHLIGHT_EXTREMES_PCT = 2.0          # flag if within 2% of 5Y high or low
+
+# ============================================================
+# PERFORMANCE PERIODS
+# ============================================================
+PERFORMANCE_PERIODS = ['1D', '1W', '1M', '1Y', '3Y', '5Y']
+# 3Y and 5Y displayed as annualized CAGR
+
+# ============================================================
+# KNOWN ECO RELEASE TIMES (ET)
+# FRED does not provide release times — hardcoded for common releases
+# ============================================================
+KNOWN_RELEASE_TIMES = {
+    'Employment Situation':                              '8:30 AM ET',
+    'Consumer Price Index':                              '8:30 AM ET',
+    'Personal Income and Outlays':                       '8:30 AM ET',
+    'Producer Price Index':                              '8:30 AM ET',
+    'Retail Sales':                                      '8:30 AM ET',
+    'Gross Domestic Product':                            '8:30 AM ET',
+    'Consumer Sentiment':                                '10:00 AM ET',
+    'Job Openings and Labor Turnover Survey':            '10:00 AM ET',
+    'Advance Monthly Sales for Retail and Food Services':'8:30 AM ET',
+    'New Residential Construction':                      '8:30 AM ET',
+    'Surveys of Consumers':                              '10:00 AM ET',
+}
+
+# ============================================================
+# NEWS SOURCE CREDIBILITY TIERS
+# ============================================================
+NEWS_SOURCE_TIER1 = {
+    'reuters', 'bloomberg', 'associated press', 'ap news',
+    'wall street journal', 'wsj', 'financial times', 'ft',
+    'new york times', 'nyt', 'cnbc', 'marketwatch',
+    'barrons', "barron's", 'the economist', 'washington post',
+}
+NEWS_SOURCE_TIER2 = {
+    'seeking alpha', 'benzinga', 'the fly', 'streetinsider',
+    'globe newswire', 'pr newswire', 'business wire',
+    'motley fool', "investor's business daily", 'ibd',
+    'nuclear engineering international', 'defense news',
+    'breaking defense', 'aviation week', 'the war zone',
+    'uranium insider', 'world nuclear news',
+}
+NEWS_MAX_TIER3_PER_TICKER = 1
+NEWS_HEADLINE_PAGE_SIZE = 10
+
+# ============================================================
+# REGIME-ADJUSTED RSI THRESHOLDS
+# Applied in price_filter.py — RSI 30D threshold varies by regime.
+# RSI_30D_MAX (settings.py) remains the default/fallback value used
+# here when regime is unknown — not redeclared in this module to avoid
+# a second source of truth for the same constant.
+# ============================================================
+RSI_30D_THRESHOLD_BY_REGIME = {
+    'RISK_ON':      45,   # bull market — mild weakness is enough
+    'NEUTRAL':      40,   # base case (default)
+    'ELEVATED_VOL': 35,   # stress — only deeply oversold
+    'HIGH_VOL':     30,   # crisis — maximum selectivity
+}
+
+# ============================================================
+# CORRELATION GATE — entry check against existing positions
+# ============================================================
+CORRELATION_ENTRY_THRESHOLD = 0.70   # flag new candidate if correlated > this with any position
+CORRELATION_LOOKBACK_DAYS = 60
+
+# Extended correlation categories beyond price correlation
+# Used to surface relationship context in screener output
+CORRELATION_CATEGORIES = {
+    # Style
+    'value_etf':   'IVE',    # iShares S&P 500 Value ETF
+    'growth_etf':  'IVW',    # iShares S&P 500 Growth ETF
+    'em_etf':      'EEM',    # Emerging Markets
+    # Sectors (same as POSITION_SECTOR_MAP sources)
+    # Sub-sector relationships defined per-position in positions.py
+    # under optional 'peer_tickers' field
+}
+
+# ============================================================
+# VOLUME CONFIRMATION FOR ENTRY SIGNAL
+# ============================================================
+VOLUME_CONFIRMATION_DAYS = 5         # look back N days for volume analysis
+VOLUME_UP_DOWN_RATIO_MIN = 1.1       # buying pressure: up-day volume / down-day volume
+
+# ============================================================
+# RETURN ZONE — 3M window additions
+# DISLOCATION_ZONE_MIN/MAX (1Y return floor/ceiling) and RSI_30D_MAX
+# already live in equity.config.settings — not redeclared here.
+# ============================================================
+RETURN_3M_SHARP_DROP = -15.0         # flag as recent sharp drop if 3M return < this
+RETURN_3M_GRADUAL_GRIND = -5.0       # flag as slow grind if 1Y bad but 3M only slightly negative

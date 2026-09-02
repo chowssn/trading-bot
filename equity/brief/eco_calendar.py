@@ -45,6 +45,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from fredapi import Fred
 
 from equity.config.market_config import (
     FOMC_CACHE_DAYS,
@@ -53,6 +54,8 @@ from equity.config.market_config import (
     FOMC_FETCH_URL,
     FOMC_PROXIMITY_DAYS,
     IMPORTANT_RELEASES,
+    KNOWN_RELEASE_TIMES,
+    RELEASE_DATA_SERIES,
 )
 
 load_dotenv()
@@ -62,6 +65,7 @@ logger = logging.getLogger(__name__)
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 FRED_RELEASES_URL = "https://api.stlouisfed.org/fred/releases/dates"
 REQUEST_TIMEOUT_SECONDS = 15
+_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
 _CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
 _FOMC_CACHE_PATH = _CACHE_DIR / "fomc_dates.json"
@@ -100,8 +104,11 @@ def _fred_release_name(display_name: str) -> str:
 def _fetch_fred_release_dates(start: date, end: date) -> list[dict]:
     """Releases in `IMPORTANT_RELEASES` scheduled in [start, end] (inclusive).
 
-    Returns a list of {'date', 'event', 'importance', 'source'}. Returns []
-    on any request failure or if FRED_API_KEY isn't set — never raises.
+    Returns a list of {'date', 'event', 'importance', 'source', 'display_name'}
+    — `display_name` (the IMPORTANT_RELEASES key) is kept so callers can look
+    up `KNOWN_RELEASE_TIMES`/`RELEASE_DATA_SERIES`, keyed by that same name.
+    Returns [] on any request failure or if FRED_API_KEY isn't set — never
+    raises.
     """
     if not FRED_API_KEY:
         logger.warning("FRED_API_KEY not set — skipping FRED release calendar")
@@ -139,7 +146,10 @@ def _fetch_fred_release_dates(start: date, end: date) -> list[dict]:
         if display_name is None:
             continue  # not one of IMPORTANT_RELEASES — skip
         event, importance = IMPORTANT_RELEASES[display_name]
-        releases.append({"date": row["date"], "event": event, "importance": importance, "source": "FRED"})
+        releases.append({
+            "date": row["date"], "event": event, "importance": importance,
+            "source": "FRED", "display_name": display_name,
+        })
     return releases
 
 
@@ -303,18 +313,49 @@ def _fomc_staleness_warning(fomc_dates: list[str], today: date) -> str | None:
 # public API
 # ---------------------------------------------------------------------------
 
-def _drop_date(release: dict) -> dict:
-    return {"event": release["event"], "importance": release["importance"], "source": release["source"]}
+def _fetch_prior_value(series_id: str | None, warnings: list[str]) -> float | None:
+    """Second-to-last (prior) reading for `series_id` over the last ~2 years, or None.
+
+    Not `fred.get_series(series_id, limit=2).iloc[-2]` verbatim — FRED's
+    default sort order for a bare `limit` is ascending-by-date, so an
+    unqualified `limit=2` would return the *oldest* two observations in
+    the series' entire history (e.g. from the 1940s), not the most recent
+    two. Fetching the last ~2 years and sorting explicitly before indexing
+    sidesteps that. Never raises: any fetch failure just returns None
+    (+ a warning) — a missing prior value degrades that one release's
+    display, not the whole calendar.
+    """
+    if not FRED_API_KEY or not series_id:
+        return None
+    try:
+        fred = Fred(api_key=FRED_API_KEY)
+        start = (date.today() - timedelta(days=730)).isoformat()
+        series = fred.get_series(series_id, observation_start=start).dropna().sort_index()
+    except Exception as exc:
+        logger.warning("FRED prior-value fetch failed for %s: %s", series_id, exc)
+        warnings.append(f"{series_id}: prior value fetch failed: {exc}")
+        return None
+    return float(series.iloc[-2]) if len(series) >= 2 else None
 
 
-def fetch_eco_calendar(days_ahead: int = 1) -> dict:
-    """Economic events scheduled for today and tomorrow, plus FOMC proximity.
+def _enrich_release(release: dict, warnings: list[str]) -> dict:
+    display_name = release["display_name"]
+    return {
+        "event": release["event"],
+        "importance": release["importance"],
+        "source": release["source"],
+        "release_time": KNOWN_RELEASE_TIMES.get(display_name, "TBD"),
+        "prior_value": _fetch_prior_value(RELEASE_DATA_SERIES.get(display_name), warnings),
+    }
+
+
+def fetch_eco_calendar(days_ahead: int = 7) -> dict:
+    """Economic events scheduled over the next `days_ahead` days, grouped by day, plus FOMC proximity.
 
     Never raises: a FRED or FOMC fetch failure is recorded in the returned
     `warnings` list (and logged) rather than propagated.
     """
     today = date.today()
-    tomorrow = today + timedelta(days=1)
     window_end = today + timedelta(days=max(days_ahead, 1))
 
     warnings: list[str] = []
@@ -322,8 +363,10 @@ def fetch_eco_calendar(days_ahead: int = 1) -> dict:
         warnings.append("FRED_API_KEY not set — economic release calendar unavailable")
 
     releases = _fetch_fred_release_dates(today, window_end)
-    today_releases = [_drop_date(r) for r in releases if r["date"] == today.isoformat()]
-    tomorrow_releases = [_drop_date(r) for r in releases if r["date"] == tomorrow.isoformat()]
+
+    by_day: dict[str, list[dict]] = {}
+    for r in sorted(releases, key=lambda r: r["date"]):
+        by_day.setdefault(r["date"], []).append(_enrich_release(r, warnings))
 
     fomc_dates = fetch_fomc_dates()
     fomc_proximity, fomc_days_away, fomc_note = _fomc_proximity(fomc_dates, today)
@@ -333,8 +376,9 @@ def fetch_eco_calendar(days_ahead: int = 1) -> dict:
         warnings.append(staleness_warning)
 
     return {
-        "today": today_releases,
-        "tomorrow": tomorrow_releases,
+        "by_day": by_day,
+        "days_ahead": days_ahead,
+        "week_start": (today - timedelta(days=today.weekday())).isoformat(),
         "fomc_proximity": fomc_proximity,
         "fomc_days_away": fomc_days_away,
         "fomc_note": fomc_note,
@@ -342,28 +386,47 @@ def fetch_eco_calendar(days_ahead: int = 1) -> dict:
     }
 
 
+def _format_prior(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:,.1f}"
+
+
 def format_eco_calendar(cal: dict) -> str:
-    """Render `fetch_eco_calendar()`'s output dict as a Telegram-ready string."""
+    """Render `fetch_eco_calendar()`'s output dict as a Telegram-ready string, grouped by day."""
+    try:
+        week_start = date.fromisoformat(cal["week_start"])
+        header = f"📅 ECO CALENDAR — Week of {week_start.strftime('%b %-d')}"
+    except (KeyError, TypeError, ValueError):
+        header = "📅 ECO CALENDAR"
 
-    def _format_releases(releases: list[dict]) -> str:
-        if not releases:
-            return "No major releases"
-        return " | ".join(f"{r['event']} ({r['importance']})" for r in releases)
+    lines = [header, _DIVIDER]
 
-    lines = [
-        "📅 ECO CALENDAR",
-        f"Today: {_format_releases(cal.get('today', []))}",
-        f"Tomorrow: {_format_releases(cal.get('tomorrow', []))}",
-    ]
+    by_day = cal.get("by_day") or {}
+    if not by_day:
+        lines.append(f"No major releases in the next {cal.get('days_ahead', 7)} days.")
+    else:
+        for day_str in sorted(by_day):
+            try:
+                day_label = date.fromisoformat(day_str).strftime("%a %b %-d")
+            except ValueError:
+                day_label = day_str
+            lines.append(day_label)
+            for r in by_day[day_str]:
+                lines.append(f"  {r['event']} ({r['importance']})  {r['release_time']}  Prior: {_format_prior(r['prior_value'])}")
+            lines.append("")
 
     if cal.get("fomc_proximity") and cal.get("fomc_note"):
         lines.append(f"⚠️ {cal['fomc_note']}")
+    elif cal.get("fomc_days_away") is not None:
+        lines.append(f"FOMC in {cal['fomc_days_away']} days")
 
     warnings = cal.get("warnings") or []
     if warnings:
         lines.append("")
         lines.extend(f"⚠️ {w}" for w in warnings)
 
+    lines.append(_DIVIDER)
     return "\n".join(lines)
 
 

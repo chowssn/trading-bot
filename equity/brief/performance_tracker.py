@@ -51,6 +51,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from equity.brief.market_snapshot import compute_ma_flags, format_flag
 from equity.config import positions as positions_config
 from equity.config.market_config import (
     BENCHMARK_TICKERS,
@@ -175,6 +176,26 @@ def _pct_change(close: pd.Series, idx: int) -> float | None:
     return (float(close.iloc[-1]) / base - 1) * 100
 
 
+def _price_years_ago(close: pd.Series, years: float) -> float | None:
+    """Price closest to `years` calendar years before `close`'s last date, or None if not enough history."""
+    idx = close.index
+    target = idx[-1] - pd.Timedelta(days=int(365 * years))
+    if target < idx[0]:
+        return None  # series doesn't actually go back that far
+    pos = idx.searchsorted(target)
+    pos = min(max(int(pos), 0), len(idx) - 1)
+    base = float(close.iloc[pos])
+    return base if base else None
+
+
+def _cagr(close: pd.Series, years: float) -> float | None:
+    """Annualized return over `years`, or None if `close` doesn't have `years` of history."""
+    base = _price_years_ago(close, years)
+    if base is None:
+        return None
+    return ((float(close.iloc[-1]) / base) ** (1 / years) - 1) * 100
+
+
 # ---------------------------------------------------------------------------
 # Benchmark cache (1 hour)
 # ---------------------------------------------------------------------------
@@ -212,9 +233,14 @@ def _write_benchmark_cache(data: dict) -> None:
 def fetch_benchmark_performance() -> dict:
     """Batch-fetch every `market_config.BENCHMARK_TICKERS`, cache-first (1 hour).
 
+    Fetches 5 years of daily history (up from 'ytd') so 1D/1W/1M/1Y windows
+    plus 3Y/5Y annualized CAGR (`market_config.PERFORMANCE_PERIODS`) and
+    `compute_ma_flags()` (SMA20/50/200 proximity, 5Y high/low) are all
+    computable from one batch.
+
     Never raises: a failed batch download or a ticker missing enough
-    history for a given window (1W/1M/YTD) is recorded in `data_warnings`
-    and that field is left None rather than crashing the whole fetch.
+    history for a given window is recorded in `data_warnings` and that
+    field is left None rather than crashing the whole fetch.
     """
     cached = _load_benchmark_cache()
     if cached is not None:
@@ -222,7 +248,7 @@ def fetch_benchmark_performance() -> dict:
 
     data_warnings: list[str] = []
     tickers = list(BENCHMARK_TICKERS) + [COPPER_FUTURES_TICKER, GOLD_FUTURES_TICKER, SILVER_FUTURES_TICKER]
-    data = _download_batch(tickers, period="ytd")
+    data = _download_batch(tickers, period="5y")
     if data is None:
         data_warnings.append("yf.download returned no data for the benchmark batch")
 
@@ -233,13 +259,23 @@ def fetch_benchmark_performance() -> dict:
             data_warnings.append(f"{ticker}: price data unavailable")
             continue
 
+        price = float(close.iloc[-1])
+        # 1Y is a plain (non-annualized) return; 3Y/5Y are annualized CAGR
+        # per market_config.PERFORMANCE_PERIODS — years=1 would make
+        # _cagr()'s **(1/1) a no-op anyway, but _price_years_ago() directly
+        # makes that "plain return, not CAGR" distinction explicit.
+        price_1y_ago = _price_years_ago(close, 1)
         entry = {
-            "price": float(close.iloc[-1]),
+            "price": price,
             "change_1d_pct": _pct_change(close, -2),
             "change_1w_pct": _pct_change(close, -6),
             "change_1m_pct": _pct_change(close, -22),
-            "change_ytd_pct": _pct_change(close, 0),
+            "change_1y_pct": (price / price_1y_ago - 1) * 100 if price_1y_ago else None,
+            "cagr_3y": _cagr(close, 3),
+            "cagr_5y": _cagr(close, 5),
+            "ma_flags": compute_ma_flags(close, price),
         }
+
         if entry["change_1w_pct"] is None:
             data_warnings.append(f"{ticker}: fewer than 5 trading days — change_1w_pct unavailable")
         if entry["change_1m_pct"] is None:
@@ -332,7 +368,7 @@ def fetch_spot_prices(benchmark_data: dict | None = None) -> dict:
 
 
 def fetch_position_relative_performance(benchmark_data: dict | None = None) -> dict:
-    """Each `positions.POSITIONS` ticker's 1D return vs its mapped sector ETF.
+    """Each `positions.POSITIONS` ticker's 1D return vs its mapped sector ETF, plus its own MA/extremes flags.
 
     Reuses `benchmark_data` (fetching it fresh via
     `fetch_benchmark_performance()` if not supplied) for the sector-ETF side
@@ -341,13 +377,17 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
     entry is skipped (logged, not an error); a position whose own price
     fetch fails, or whose sector ETF has no benchmark data, comes back with
     an `'error'` key instead of raising.
+
+    Fetches 5 years of daily history per position (up from 5 days) so
+    `compute_ma_flags()` can flag SMA20/50/200 proximity and 5Y high/low —
+    surfaced as `position_flags` on each result.
     """
     if benchmark_data is None:
         benchmark_data = fetch_benchmark_performance()
     benchmarks = benchmark_data.get("benchmarks", {})
 
     tickers = list(positions_config.POSITIONS)
-    data = _download_batch(tickers, period="5d")
+    data = _download_batch(tickers, period="5y")
 
     result: dict[str, dict] = {}
     for ticker in tickers:
@@ -358,9 +398,10 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
 
         close = _ticker_close(data, ticker)
         if close is None or len(close) < 2:
-            result[ticker] = {"sector_etf": sector_etf, "error": "price data unavailable"}
+            result[ticker] = {"sector_etf": sector_etf, "error": "price data unavailable", "position_flags": []}
             continue
         position_change_1d_pct = _pct_change(close, -2)
+        position_flags = compute_ma_flags(close, float(close.iloc[-1]))
 
         sector_entry = benchmarks.get(sector_etf)
         if sector_entry is None or sector_entry.get("change_1d_pct") is None:
@@ -368,6 +409,7 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
                 "sector_etf": sector_etf,
                 "position_change_1d_pct": position_change_1d_pct,
                 "error": f"{sector_etf} price data unavailable",
+                "position_flags": position_flags,
             }
             continue
 
@@ -379,6 +421,7 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
             "sector_etf_change_1d_pct": sector_etf_change_1d_pct,
             "relative_performance_1d_pct": relative_performance_1d_pct,
             "outperforming": relative_performance_1d_pct > 0,
+            "position_flags": position_flags,
         }
 
     return result
@@ -396,8 +439,17 @@ def _fmt_amount(value: float | None, decimals: int) -> str:
     return f"${value:,.{decimals}f}" if value is not None else "n/a"
 
 
+def _fmt_multi_period(b: dict) -> str:
+    """1D / 1W / 1M / 1Y / 5Y-ann returns, space-separated — the common row shape for factor lines."""
+    return (
+        f"{_fmt_pct(b.get('change_1d_pct')):>7} {_fmt_pct(b.get('change_1w_pct')):>7} "
+        f"{_fmt_pct(b.get('change_1m_pct')):>7} {_fmt_pct(b.get('change_1y_pct')):>7} "
+        f"{_fmt_pct(b.get('cagr_5y')):>7}"
+    )
+
+
 def _format_gld_line(b: dict | None, gold_futures_price: float | None) -> str:
-    """GLD's ETF price, plus GC=F front-month futures when available — falls back to ETF-only otherwise.
+    """GLD's ETF returns (1D/1W/1M/1Y/5Yann), plus GC=F front-month futures price alongside.
 
     Labeled '(futures)', not '(spot)' — GC=F is a front-month futures
     price, not true spot (see module docstring on why FRED spot isn't
@@ -407,15 +459,15 @@ def _format_gld_line(b: dict | None, gold_futures_price: float | None) -> str:
     so should track its futures price closely — see `_format_slv_line()`).
     """
     if b is None:
-        return "GLD   data unavailable"
-    price, pct = _fmt_amount(b["price"], 0), _fmt_pct(b["change_1d_pct"])
+        return "GLD (ETF ~0.1oz)  data unavailable"
+    line = f"GLD (ETF ~0.1oz) {_fmt_multi_period(b)}"
     if gold_futures_price is not None:
-        return f"GLD (ETF ~0.1oz) {price} {pct} | GC=F: {_fmt_amount(gold_futures_price, 0)}/oz (futures)"
-    return f"GLD {price} {pct} (ETF price)"
+        line += f"  | GC=F {_fmt_amount(gold_futures_price, 0)}/oz"
+    return line + format_flag(b.get("ma_flags", []))
 
 
 def _format_slv_line(b: dict | None, silver_futures_price: float | None) -> str:
-    """SLV's ETF price, plus SI=F front-month futures when available — falls back to ETF-only otherwise.
+    """SLV's ETF returns (1D/1W/1M/1Y/5Yann), plus SI=F front-month futures price alongside.
 
     Labeled '(futures)', not '(spot)' — see `_format_gld_line()`. SLV holds
     ~1 troy oz of silver per share (vs. GLD's ~0.1oz), so unlike the GLD/
@@ -424,20 +476,19 @@ def _format_slv_line(b: dict | None, silver_futures_price: float | None) -> str:
     being displayed as if it were normal.
     """
     if b is None:
-        return "SLV   data unavailable"
-    price, pct = _fmt_amount(b["price"], 1), _fmt_pct(b["change_1d_pct"])
+        return "SLV (ETF ~1oz)  data unavailable"
+    line = f"SLV (ETF ~1oz)  {_fmt_multi_period(b)}"
     if silver_futures_price is not None:
-        line = f"SLV (ETF ~1oz) {price} {pct} | SI=F: {_fmt_amount(silver_futures_price, 1)}/oz (futures)"
-        if b["price"] is not None and silver_futures_price:
+        line += f"  | SI=F {_fmt_amount(silver_futures_price, 1)}/oz"
+        if b.get("price") is not None and silver_futures_price:
             divergence_pct = abs(b["price"] - silver_futures_price) / silver_futures_price * 100
             if divergence_pct > SLV_SI_DIVERGENCE_ALERT_PCT:
                 line += f" ⚠️ {divergence_pct:.1f}% divergence"
-        return line
-    return f"SLV {price} {pct} (ETF price)"
+    return line + format_flag(b.get("ma_flags", []))
 
 
 def _format_cper_line(b: dict | None, copper_futures_price: float | None) -> str:
-    """CPER's ETF price, plus HG=F (COMEX copper futures, $/lb) as a reference alongside.
+    """CPER's ETF returns (1D/1W/1M/1Y/5Yann), plus HG=F (COMEX copper futures, $/lb) as a reference.
 
     CPER keeps its plain ETF label throughout (no '(ETF)' annotation like
     GLD/SLV) — see module docstring: copper spot is adequately represented
@@ -445,10 +496,10 @@ def _format_cper_line(b: dict | None, copper_futures_price: float | None) -> str
     """
     if b is None:
         return "CPER  data unavailable"
-    line = f"CPER {_fmt_amount(b['price'], 1)} {_fmt_pct(b['change_1d_pct'])}"
+    line = f"CPER  {_fmt_multi_period(b)}"
     if copper_futures_price is not None:
-        line += f" | HG=F {_fmt_amount(copper_futures_price, 2)}/lb"
-    return line
+        line += f"  | HG=F {_fmt_amount(copper_futures_price, 2)}/lb"
+    return line + format_flag(b.get("ma_flags", []))
 
 
 def _relative_label(rel: float) -> tuple[str, str]:
@@ -465,28 +516,61 @@ def _relative_label(rel: float) -> tuple[str, str]:
     return "slight underperform", ""
 
 
-def _build_highlights(benchmark_data: dict, relative_data: dict) -> list[str]:
-    highlights = []
-    benchmarks = benchmark_data.get("benchmarks", {})
-
+def _sector_movers(benchmarks: dict, n: int = 2) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+    """Top-`n` and bottom-`n` sector ETFs by 1D% among `_SECTOR_ROWS` tickers."""
     sector_tickers = [ticker for row in _SECTOR_ROWS for ticker, _ in row]
     movers = [
         (ticker, benchmarks[ticker]["change_1d_pct"])
         for ticker in sector_tickers
         if benchmarks.get(ticker) and benchmarks[ticker].get("change_1d_pct") is not None
     ]
-    if movers:
-        ticker, pct = max(movers, key=lambda pair: abs(pair[1]))
-        highlights.append(f"Largest sector mover: {ticker} ({BENCHMARK_TICKERS.get(ticker, ticker)}) {_fmt_pct(pct)}")
+    ranked = sorted(movers, key=lambda pair: pair[1], reverse=True)
+    return ranked[:n], list(reversed(ranked[-n:])) if ranked else []
+
+
+def _sector_short_label(ticker: str) -> str:
+    for row in _SECTOR_ROWS:
+        for t, label in row:
+            if t == ticker:
+                return label
+    return ticker
+
+
+def _build_highlights(benchmark_data: dict, relative_data: dict) -> list[str]:
+    highlights = []
+    benchmarks = benchmark_data.get("benchmarks", {})
+
+    top, worst = _sector_movers(benchmarks)
+    if top:
+        ticker, pct = top[0]
+        highlights.append(f"Sector top: {ticker} {_sector_short_label(ticker)} {_fmt_pct(pct)}")
+    if worst:
+        ticker, pct = worst[0]
+        highlights.append(f"Sector worst: {ticker} {_sector_short_label(ticker)} {_fmt_pct(pct)}")
 
     divergences = [
         (ticker, entry["relative_performance_1d_pct"])
         for ticker, entry in relative_data.items()
-        if "relative_performance_1d_pct" in entry
+        if "relative_performance_1d_pct" in entry and abs(entry["relative_performance_1d_pct"]) > POSITION_UNDERPERFORM_ALERT_PCT
     ]
     if divergences:
-        ticker, rel = max(divergences, key=lambda pair: abs(pair[1]))
-        highlights.append(f"Biggest position vs sector divergence: {ticker} {_fmt_pct(rel)}")
+        for ticker, rel in sorted(divergences, key=lambda pair: abs(pair[1]), reverse=True):
+            highlights.append(f"Position divergence >{POSITION_UNDERPERFORM_ALERT_PCT:.0f}%: {ticker} {_fmt_pct(rel)}")
+    else:
+        highlights.append(f"Position divergence >{POSITION_UNDERPERFORM_ALERT_PCT:.0f}%: none today")
+
+    for ticker, entry in relative_data.items():
+        for flag in entry.get("position_flags") or []:
+            if "5Y" in flag:  # only the extremes flags, not every MA-proximity flag, rise to HIGHLIGHTS
+                highlights.append(f"{ticker} {flag} — review thesis")
+
+    for ticker in _SPECIALIST:
+        b = benchmarks.get(ticker)
+        if not b:
+            continue
+        for flag in b.get("ma_flags") or []:
+            if "5Y" in flag:
+                highlights.append(f"{ticker} {flag} — {BENCHMARK_TICKERS.get(ticker, ticker)} sector weak/strong")
 
     signal = benchmark_data.get("slv_gld_signal")
     if signal:
@@ -515,7 +599,7 @@ def format_performance_section(benchmark_data: dict, portfolio_data: dict, relat
 
     benchmarks = benchmark_data.get("benchmarks", {})
 
-    lines.append("Benchmarks (1D / 1W / 1M / YTD)")
+    lines.append("Benchmarks (1D / 1W / 1M / 1Y / 3Y ann / 5Y ann)")
     for ticker in _BROAD_MARKET:
         b = benchmarks.get(ticker)
         if b is None:
@@ -523,21 +607,36 @@ def format_performance_section(benchmark_data: dict, portfolio_data: dict, relat
             continue
         lines.append(
             f"{ticker:<6} {_fmt_pct(b['change_1d_pct']):>7} {_fmt_pct(b['change_1w_pct']):>7} "
-            f"{_fmt_pct(b['change_1m_pct']):>7} {_fmt_pct(b['change_ytd_pct']):>7}"
+            f"{_fmt_pct(b['change_1m_pct']):>7} {_fmt_pct(b['change_1y_pct']):>7} "
+            f"{_fmt_pct(b.get('cagr_3y')):>7} {_fmt_pct(b.get('cagr_5y')):>7}"
+            f"{format_flag(b.get('ma_flags', []))}"
         )
     lines.append("")
 
-    lines.append("Sectors (1D)")
+    lines.append("Sectors (1D / 1W / 1M / 1Y)")
     for row in _SECTOR_ROWS:
-        cells = []
         for ticker, label in row:
             b = benchmarks.get(ticker)
-            pct = _fmt_pct(b["change_1d_pct"]) if b else "n/a"
-            cells.append(f"{ticker} {label:<10}{pct:>7}")
-        lines.append("  ".join(cells))
+            if b is None:
+                lines.append(f"{ticker} {label:<10} data unavailable")
+                continue
+            lines.append(
+                f"{ticker} {label:<10}{_fmt_pct(b['change_1d_pct']):>7} {_fmt_pct(b['change_1w_pct']):>7} "
+                f"{_fmt_pct(b['change_1m_pct']):>7} {_fmt_pct(b['change_1y_pct']):>7}"
+                f"{format_flag(b.get('ma_flags', []))}"
+            )
     lines.append("")
 
-    lines.append("Commodities & Factors")
+    top, worst = _sector_movers(benchmarks)
+    if top or worst:
+        lines.append("Sector Highlights")
+        if top:
+            lines.append("  🟢 Top:   " + "  |  ".join(f"{t} {_sector_short_label(t)} {_fmt_pct(p)}" for t, p in top))
+        if worst:
+            lines.append("  🔴 Worst: " + "  |  ".join(f"{t} {_sector_short_label(t)} {_fmt_pct(p)}" for t, p in worst))
+        lines.append("")
+
+    lines.append("Commodities & Factors (1D / 1W / 1M / 1Y / 5Y ann)")
     spot_data = spot_data or {}
     lines.append(_format_gld_line(benchmarks.get("GLD"), spot_data.get("gold_spot_usd")))
     lines.append(_format_slv_line(benchmarks.get("SLV"), spot_data.get("silver_spot_usd")))
@@ -547,39 +646,39 @@ def format_performance_section(benchmark_data: dict, portfolio_data: dict, relat
     arrow = _SIGNAL_ARROWS.get(signal, "")
     lines.append(f"SLV/GLD ratio: {arrow} {signal or 'n/a'}")
 
-    for row in _COMMODITY_ROWS:
-        cells = []
-        for ticker, label, decimals in row:
-            b = benchmarks.get(ticker)
-            if b is None:
-                cells.append(f"{label:<5} data unavailable")
-                continue
-            cells.append(f"{label:<5} {_fmt_amount(b['price'], decimals):>8}  {_fmt_pct(b['change_1d_pct'])}")
-        lines.append("  | ".join(cells))
-    lines.append("")
-
     for ticker in _SPECIALIST:
         b = benchmarks.get(ticker)
-        pct = _fmt_pct(b["change_1d_pct"]) if b else "n/a"
+        if b is None:
+            lines.append(f"{ticker}  data unavailable")
+            continue
         relevant = sorted(pos for pos, etf in POSITION_SECTOR_MAP.items() if etf == ticker)
-        line = f"{ticker} ({BENCHMARK_TICKERS.get(ticker, ticker)})   {pct}"
+        line = f"{ticker:<5} {_fmt_multi_period(b)}{format_flag(b.get('ma_flags', []))}"
         if relevant:
             line += f"  ← relevant to {', '.join(relevant)}"
         lines.append(line)
+
+    for row in _COMMODITY_ROWS:
+        for ticker, label, _decimals in row:
+            b = benchmarks.get(ticker)
+            if b is None:
+                lines.append(f"{label:<5} data unavailable")
+                continue
+            lines.append(f"{label:<5} {_fmt_multi_period(b)}{format_flag(b.get('ma_flags', []))}")
     lines.append("")
 
-    lines.append("Your Positions vs Sector")
+    lines.append("Your Positions vs Sector (1D)")
     if relative_data:
         for ticker, entry in relative_data.items():
+            flag_str = format_flag(entry.get("position_flags") or [])
             if "relative_performance_1d_pct" not in entry:
-                lines.append(f"{ticker:<5} {entry.get('error', 'data unavailable')}")
+                lines.append(f"{ticker:<5} {entry.get('error', 'data unavailable')}{flag_str}")
                 continue
             rel = entry["relative_performance_1d_pct"]
             verb, marker = _relative_label(rel)
             suffix = f" {marker}" if marker else ""
             lines.append(
                 f"{ticker:<5} {_fmt_pct(entry['position_change_1d_pct'])}  vs {entry['sector_etf']:<4} "
-                f"{_fmt_pct(entry['sector_etf_change_1d_pct'])}  → {_fmt_pct(rel)} {verb}{suffix}"
+                f"{_fmt_pct(entry['sector_etf_change_1d_pct'])}  → {_fmt_pct(rel)} {verb}{suffix}{flag_str}"
             )
     else:
         lines.append("(no positions)")

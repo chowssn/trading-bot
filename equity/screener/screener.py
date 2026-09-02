@@ -5,9 +5,13 @@ Ties the three funnel stages together:
     universe.get_universe_tickers()   Russell 1000, from the IWB holdings CSV
         -> price_filter.run_price_filter()   cheap yfinance price/RSI/volume
            dislocation + market-cap pre-filter, ~1000 tickers -> ~30-80
+           (this stage now also computes timing_signal/timing_note itself,
+           via timing_signal.classify_timing() with the full RSI/volume/
+           price series still in scope — see price_filter.py)
               -> quality_scorer.score_ticker()   FMP/yfinance fundamentals,
-                 0-100 quality score, per surviving ticker
-                 -> timing_signal.classify_timing()   RSI-based entry timing
+                 0-90 quality score, per surviving ticker
+                 -> _check_entry_correlation()   price-correlation gate
+                    against existing positions, for names that pass quality
 
 `run_screener()` returns the top `settings.MAX_SCREENER_OUTPUT` names that
 clear `settings.MIN_QUALITY_SCORE` and carry no red flags, sorted ENTRY
@@ -21,9 +25,12 @@ from datetime import date
 from pprint import pprint
 
 import pandas as pd
+import yfinance as yf
 
 from equity.config import settings
-from equity.screener import price_filter, quality_scorer, timing_signal, universe
+from equity.config.market_config import CORRELATION_ENTRY_THRESHOLD, CORRELATION_LOOKBACK_DAYS
+from equity.config.positions import POSITIONS, get_position
+from equity.screener import price_filter, quality_scorer, universe
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +44,9 @@ _DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━�
 _RSI_ARROWS = {"rising": "↑", "falling": "↓", "neutral": "→"}
 
 RESULT_COLUMNS = quality_scorer.RESULT_KEYS + [
-    "timing_signal", "timing_note", "return_1y", "rsi_14d", "rsi_14d_direction", "market_cap_b",
+    "timing_signal", "timing_note", "return_1y", "return_3m", "price_action_type",
+    "rsi_14d", "rsi_14d_direction", "market_cap_b",
+    "max_correlation", "correlated_with", "correlation_flag", "relationship_notes",
 ]
 
 
@@ -61,18 +70,84 @@ def _clear_todays_cache() -> None:
     logger.info("force_refresh: cleared %d cache file(s) for %s", removed, today)
 
 
-def run_screener(force_refresh: bool = False) -> pd.DataFrame:
+def _check_entry_correlation(
+    candidate_ticker: str, position_tickers: list[str], lookback_days: int = CORRELATION_LOOKBACK_DAYS
+) -> dict:
+    """Price correlation between `candidate_ticker` and each existing position, plus relationship context.
+
+    Never raises: a failed batch download (or fewer than 2 tickers to
+    correlate) just comes back with `max_correlation=0.0`/no flag rather
+    than propagating.
+
+    Returns:
+    {
+        'max_correlation': float,
+        'correlated_with': str | None,   # ticker with highest |correlation|
+        'correlation_flag': bool,        # True if |max_correlation| > CORRELATION_ENTRY_THRESHOLD
+        'relationship_notes': list[str], # e.g. ['same sector as CCJ', 'defined peer of ABT']
+    }
+    """
+    empty = {"max_correlation": 0.0, "correlated_with": None, "correlation_flag": False, "relationship_notes": []}
+    if not position_tickers:
+        return empty
+
+    all_tickers = [candidate_ticker] + position_tickers
+    try:
+        hist = yf.download(all_tickers, period=f"{lookback_days + 5}d", auto_adjust=True, progress=False)["Close"]
+        returns = hist.pct_change().dropna()
+        corr_matrix = returns.corr()
+
+        max_corr = 0.0
+        corr_with = None
+        for pos in position_tickers:
+            if pos in corr_matrix.columns and candidate_ticker in corr_matrix.index:
+                c = corr_matrix.loc[candidate_ticker, pos]
+                if pd.isna(c):
+                    continue
+                if abs(c) > abs(max_corr):
+                    max_corr = float(c)
+                    corr_with = pos
+    except Exception as exc:  # yfinance can raise a variety of things on network/format issues
+        logger.warning("Correlation gate fetch failed for %s: %s", candidate_ticker, exc)
+        return empty
+
+    # Sector and defined-peer relationship notes — independent of price
+    # correlation, so these can surface a relationship even before it shows
+    # up in the 60-day return correlation above.
+    relationship_notes = []
+    candidate_info = get_position(candidate_ticker)
+    for pos_ticker, pos_data in POSITIONS.items():
+        if candidate_info and pos_data.get("sector") and pos_data.get("sector") == candidate_info.get("sector"):
+            relationship_notes.append(f"same sector as {pos_ticker}")
+        peers = pos_data.get("peer_tickers", [])
+        if candidate_ticker in peers:
+            relationship_notes.append(f"defined peer of {pos_ticker}")
+
+    flag = abs(max_corr) > CORRELATION_ENTRY_THRESHOLD
+    return {
+        "max_correlation": round(max_corr, 2),
+        "correlated_with": corr_with,
+        "correlation_flag": flag,
+        "relationship_notes": relationship_notes,
+    }
+
+
+def run_screener(force_refresh: bool = False, regime_flags: list[str] | None = None) -> pd.DataFrame:
     """Run the full screener funnel and return the ranked results DataFrame.
 
     If `force_refresh` is True, today's price-filter/quality-scorer cache
     files are cleared and the Russell 1000 universe is force-refreshed
     before the funnel runs — otherwise all three stages use their normal
-    cache TTLs (see each module).
+    cache TTLs (see each module). `regime_flags` (today's active flags from
+    `market_snapshot.fetch_market_snapshot()`) is passed through to
+    `price_filter.run_price_filter()`, which uses it to set a
+    regime-adjusted RSI dislocation threshold.
 
     Columns: see `RESULT_COLUMNS` (quality_scorer's full per-ticker schema,
-    plus timing_signal/timing_note/return_1y/rsi_14d/rsi_14d_direction/
-    market_cap_b). `result.attrs["summary"]` carries
-    {'scanned', 'dislocation', 'quality_pass'} counts for the report header.
+    plus timing_signal/timing_note/return_1y/return_3m/price_action_type/
+    rsi_14d/rsi_14d_direction/market_cap_b, plus the correlation-gate
+    fields). `result.attrs["summary"]` carries {'scanned', 'dislocation',
+    'quality_pass'} counts for the report header.
     """
     if force_refresh:
         _clear_todays_cache()
@@ -80,7 +155,8 @@ def run_screener(force_refresh: bool = False) -> pd.DataFrame:
     else:
         tickers = universe.get_universe_tickers()
 
-    price_df = price_filter.run_price_filter(tickers)
+    price_df = price_filter.run_price_filter(tickers, regime_flags=regime_flags)
+    position_tickers = list(POSITIONS)
 
     rows = []
     for _, prow in price_df.iterrows():
@@ -90,15 +166,19 @@ def run_screener(force_refresh: bool = False) -> pd.DataFrame:
         if quality["quality_score"] < settings.MIN_QUALITY_SCORE or quality["red_flags"]:
             continue
 
-        timing = timing_signal.classify_timing(prow["rsi_14d"], prow["rsi_14d_direction"])
+        correlation = _check_entry_correlation(ticker, position_tickers)
 
         rows.append({
             **quality,
-            **timing,
+            "timing_signal": prow.get("timing_signal"),
+            "timing_note": prow.get("timing_note"),
             "return_1y": prow["return_1y"],
+            "return_3m": prow.get("return_3m"),
+            "price_action_type": prow.get("price_action_type"),
             "rsi_14d": prow["rsi_14d"],
             "rsi_14d_direction": prow["rsi_14d_direction"],
             "market_cap_b": prow.get("market_cap_b"),
+            **correlation,
         })
 
     result = pd.DataFrame(rows, columns=RESULT_COLUMNS)
@@ -138,7 +218,25 @@ def _format_row(rank: int, row: pd.Series) -> str:
         f"{row['return_1y']:+.0f}% 1Y | RSI14:{row['rsi_14d']:.0f}{arrow} | Rev{rev_str}"
     )
     line2 = f"   Sector: {sector} | Net Debt: {leverage_str} | Margin: {margin_str}"
-    return line1 + "\n" + line2
+    lines = [line1, line2]
+
+    price_action = row.get("price_action_type")
+    return_3m = row.get("return_3m")
+    if price_action and pd.notna(price_action):
+        return_3m_str = f"{return_3m:+.0f}% 3M" if return_3m is not None and pd.notna(return_3m) else "3M n/a"
+        lines.append(f"   Price action: {price_action} ({return_3m_str})")
+
+    fwd_pe = row.get("forward_pe")
+    if fwd_pe is not None and pd.notna(fwd_pe):
+        lines.append(f"   Fwd P/E: {fwd_pe:.1f}x (display only — verify against Bloomberg)")
+
+    if row.get("correlation_flag"):
+        lines[0] += f"  ⚠️ {row['max_correlation']:.2f} corr with {row['correlated_with']}"
+    relationship_notes = row.get("relationship_notes") or []
+    if relationship_notes:
+        lines.append(f"   Rel: {'; '.join(relationship_notes)}")
+
+    return "\n".join(lines)
 
 
 def format_screener_output(df: pd.DataFrame) -> str:

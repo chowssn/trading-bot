@@ -43,6 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from equity.brief.brief_builder import build_morning_brief
+from equity.brief.market_snapshot import fetch_market_snapshot
 from equity.brief.performance_tracker import (
     fetch_benchmark_performance,
     fetch_portfolio_performance,
@@ -53,6 +54,7 @@ from equity.brief.performance_tracker import (
 from equity.brief.sector_monitor import fetch_sector_data, format_sector_section
 from equity.config import config_manager
 from equity.config import positions as positions_module
+from equity.config.market_config import NEWS_HEADLINE_PAGE_SIZE
 from equity.portfolio.monitor import format_portfolio_monitor, run_portfolio_monitor
 from equity.portfolio.news_triage import format_news_triage, run_news_triage
 from equity.screener.quality_scorer import score_ticker
@@ -61,9 +63,11 @@ from equity.telegram import config_commands
 from equity.telegram.advisor import Advisor
 from equity.telegram.auth import AuthManager
 from equity.telegram.formatters import (
+    format_headline_page,
     format_thread_list,
     make_confirm_cancel,
     make_discuss_menu,
+    make_headline_page_keyboard,
     make_main_menu,
     make_news_actions,
     make_portfolio_actions,
@@ -72,6 +76,7 @@ from equity.telegram.formatters import (
     make_thread_list_keyboard,
     make_ticker_actions,
     send_in_parts,
+    send_safe,
 )
 from equity.telegram.threads import ThreadManager
 
@@ -331,27 +336,26 @@ async def send_help(update, context):
 
 @authorized_only
 async def send_brief(update, context):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="🌅 Building morning brief..."
-    )
-    brief = await run_in_executor(build_morning_brief)
-    sections = [s.strip() for s in
-                brief.split("━━━━━━━━━━━━━━━━━━━━━━━━") if s.strip()]
-    for i, section in enumerate(sections):
-        kb = make_main_menu() if i == len(sections) - 1 else None
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=section[:4000],
-            reply_markup=kb
-        )
-        await asyncio.sleep(0.5)
+    chat_id = update.effective_chat.id
+    await context.bot.send_message(chat_id=chat_id, text="🌅 Building morning brief...")
+    sections = await run_in_executor(build_morning_brief)
+    for text, keyboard in sections:
+        if text and text.strip():
+            await send_safe(context.bot, chat_id, text, reply_markup=keyboard)
+            await asyncio.sleep(0.3)
 
 
 @authorized_only
 async def send_screener(update, context):
-    await update.message.reply_text("Running screener...")
-    df = await run_in_executor(run_screener)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 Running screener...")
+    # Load regime flags from the market snapshot (also 1h-cached) so the
+    # screener's RSI dislocation threshold matches today's regime.
+    try:
+        snapshot = await run_in_executor(fetch_market_snapshot)
+        regime_flags = snapshot.get("regime_flags", [])
+    except Exception:
+        regime_flags = []
+    df = await run_in_executor(run_screener, False, regime_flags)
     text = format_screener_output(df)
     passing_tickers = df["ticker"].tolist() if "ticker" in df.columns else []
     await send_in_parts(
@@ -671,6 +675,20 @@ async def handle_callback(update, context):
         await config_commands.handle_confirm_callback(query, context, thread_manager)
     elif data.startswith("cancel_"):
         await config_commands.handle_cancel_callback(query, context, thread_manager)
+    elif data.startswith("headlines_"):
+        parts = data.split("_")
+        ticker = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        triage = await run_in_executor(run_news_triage, [ticker])
+        all_headlines = triage.get(ticker, {}).get("all_headlines", [])
+        if not all_headlines:
+            await query.message.reply_text(f"No headlines available for {ticker}.")
+            return
+        text = format_headline_page(ticker, all_headlines, page, NEWS_HEADLINE_PAGE_SIZE)
+        kb = make_headline_page_keyboard(ticker, page, len(all_headlines), NEWS_HEADLINE_PAGE_SIZE)
+        await send_safe(context.bot, chat_id, text, reply_markup=kb)
+    elif data == "noop":
+        pass
     elif data.startswith("suggest_"):
         idx = int(data.split("_", 1)[1])
         suggestions = context.user_data.get("suggestions", [])
@@ -692,6 +710,17 @@ async def handle_callback(update, context):
                         chat_id=chat_id, text="💡 *You might ask:*", parse_mode="Markdown",
                         reply_markup=make_suggestions_keyboard(new_sugg),
                     )
+                # Always surface action buttons after an advisor response —
+                # same fix as handle_message() below, so the "Reply to
+                # continue, or choose an action" affordance isn't lost after
+                # a suggestion round-trip either.
+                if active_thread.startswith("ticker_"):
+                    await context.bot.send_message(
+                        chat_id=chat_id, text="Actions:",
+                        reply_markup=make_ticker_actions(active_thread.split("_", 1)[1]),
+                    )
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text="Actions:", reply_markup=make_main_menu())
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +841,22 @@ async def handle_message(update, context):
             reply_markup=make_suggestions_keyboard(suggestions),
         )
 
+    # Always show action buttons after an advisor response — previously
+    # only start_or_resume_discussion() did this, so the "choose an
+    # action" affordance vanished after the first reply in a thread.
+    if active_thread.startswith("ticker_"):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Actions:",
+            reply_markup=make_ticker_actions(active_thread.split("_", 1)[1]),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Actions:",
+            reply_markup=make_main_menu(),
+        )
+
 
 KNOWN_COMMANDS = [
     "discuss", "macro", "portfolio", "portfolio_review",
@@ -845,17 +890,11 @@ async def handle_unknown_command(update, context):
 
 async def scheduled_morning_brief(context):
     try:
-        brief = await run_in_executor(build_morning_brief)
-        sections = [s.strip() for s in
-                    brief.split("━━━━━━━━━━━━━━━━━━━━━━━━") if s.strip()]
-        for i, section in enumerate(sections):
-            kb = make_main_menu() if i == len(sections) - 1 else None
-            await context.bot.send_message(
-                chat_id=TELEGRAM_USER_ID,
-                text=section[:4000],
-                reply_markup=kb
-            )
-            await asyncio.sleep(0.5)
+        sections = await run_in_executor(build_morning_brief)
+        for text, keyboard in sections:
+            if text and text.strip():
+                await send_safe(context.bot, TELEGRAM_USER_ID, text, reply_markup=keyboard)
+                await asyncio.sleep(0.3)
     except Exception as e:
         await context.bot.send_message(
             chat_id=TELEGRAM_USER_ID,
