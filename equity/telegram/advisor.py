@@ -8,8 +8,11 @@ confirmation via Telegram + email 2FA before anything is written.
 
 import json
 import logging
+import random
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 
 import anthropic
 import pandas as pd
@@ -26,6 +29,21 @@ from equity.telegram.threads import ThreadManager
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-6"
+
+# Module-level cache for _build_full_portfolio_context() — shared across
+# Advisor instances since the content (positions + live prices) doesn't
+# vary per-instance. Avoids calling run_portfolio_monitor() (network
+# fetch per ticker) on every single chat message.
+_PORTFOLIO_CONTEXT_TTL_SECONDS = 900  # 15 minutes
+_portfolio_context_cache: dict = {"text": None, "timestamp": 0.0}
+
+# Same idea for _get_recent_brief_synthesis() — the morning brief doesn't
+# change during the day, so there's no reason to re-glob/re-read the briefs
+# directory on every chat message.
+_BRIEF_SYNTHESIS_TTL_SECONDS = 3600  # 1 hour
+_brief_synthesis_cache: dict = {"text": None, "timestamp": 0.0}
+
+_BRIEFS_DIR = Path(__file__).resolve().parents[1] / "data" / "briefs"
 
 _FRAMEWORK = """--- Investment Framework ---
 Liquidity-first, macro-aware, quality-at-discount strategy.
@@ -48,6 +66,11 @@ class Advisor:
     def __init__(self, api_key: str, thread_manager: ThreadManager):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.thread_manager = thread_manager
+        # Per-thread history of recently shown follow-up suggestions, so
+        # get_follow_up_suggestions() can avoid repeating itself within a
+        # session. In-memory only (not persisted via thread_manager) —
+        # this is UX polish, not state that needs to survive a restart.
+        self._suggestion_history: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # System prompt construction
@@ -98,25 +121,185 @@ class Advisor:
             sections.append(f"--- Current Regime ---\n{regime}")
 
         try:
-            from equity.portfolio.monitor import run_portfolio_monitor
-
-            monitor_data = run_portfolio_monitor()
-            live_prices = []
-            for ticker, data in monitor_data.get("positions", {}).items():
-                price = data.get("price_current")
-                change_1d = data.get("change_1d_pct", 0)
-                if price:
-                    live_prices.append(f"{ticker}: ${price:.2f} ({change_1d:+.1f}% today)")
-            if live_prices:
-                sections.append(
-                    "--- LIVE POSITION PRICES (fetched now, not from thesis) ---\n"
-                    + "\n".join(live_prices)
-                    + "\nUse these prices — not thesis language — when discussing current levels."
-                )
+            sections.append(self._build_full_portfolio_context())
         except Exception as exc:
-            logger.warning("build_system_prompt: live price fetch failed: %s", exc)
+            logger.warning("build_system_prompt: portfolio context failed: %s", exc)
+            sections.append("--- PORTFOLIO DATA UNAVAILABLE ---")
+
+        brief_synthesis = self._get_recent_brief_synthesis()
+        if brief_synthesis:
+            sections.append(brief_synthesis)
 
         return "\n\n".join(sections)
+
+    def _build_full_portfolio_context(self) -> str:
+        """Cached wrapper around `_build_full_portfolio_context_uncached()`.
+
+        The cache is module-level (not per-instance) and keyed by nothing
+        but time — the portfolio context is the same for every thread, so
+        one 15-minute-old snapshot is shared across all of them rather than
+        refetching live prices on every chat message.
+        """
+        now = time.time()
+        cached_text = _portfolio_context_cache["text"]
+        if cached_text is not None and now - _portfolio_context_cache["timestamp"] < _PORTFOLIO_CONTEXT_TTL_SECONDS:
+            return cached_text
+
+        result = self._build_full_portfolio_context_uncached()
+        _portfolio_context_cache["text"] = result
+        _portfolio_context_cache["timestamp"] = now
+        return result
+
+    def _build_full_portfolio_context_uncached(self) -> str:
+        """Build a complete portfolio snapshot for the system prompt.
+
+        Included in every thread type — ticker, macro, portfolio, general —
+        not just ticker threads, so avg_cost/size_pct/shares/P&L are
+        available from the first message regardless of what's being
+        discussed.
+
+        `positions_config.POSITIONS`/`.WATCHLIST` are already the merged
+        result of `positions.py` thesis data + `positions_override.json`
+        IBKR fields (see `positions._apply_overrides()`) — this function
+        reads those directly rather than re-parsing the override file, so
+        there's exactly one place that knows how the merge works. Live
+        price/1D-change data comes from `run_portfolio_monitor()`.
+        """
+        from equity.portfolio.monitor import run_portfolio_monitor
+
+        lines = ["--- COMPLETE PORTFOLIO (use this for ALL position-specific analysis) ---"]
+
+        total_market_value = sum(
+            cfg.get("market_value", 0)
+            for cfg in positions_config.POSITIONS.values()
+            if isinstance(cfg.get("market_value"), (int, float))
+        )
+        if total_market_value > 0:
+            lines.append(f"Total portfolio (IBKR import): ${total_market_value:,.0f}")
+
+        lines.append("Format: TICKER | Price | 1D% | Size% | Cost | P&L% | Tier | Thesis status")
+        lines.append("")
+
+        live_prices = {}
+        try:
+            monitor_data = run_portfolio_monitor()
+            live_prices = monitor_data.get("positions", {})
+        except Exception as exc:
+            logger.warning("_build_full_portfolio_context: live price fetch failed: %s", exc)
+
+        for ticker, cfg in sorted(positions_config.POSITIONS.items()):
+            live = live_prices.get(ticker, {})
+            price = live.get("price_current")
+            change_1d = live.get("change_1d_pct")
+            avg_cost = cfg.get("avg_cost")
+            size_pct = cfg.get("size_pct")
+            shares = cfg.get("shares")
+            tier = cfg.get("tier") or "core"
+            thesis_text = cfg.get("thesis", "")
+            has_thesis = bool(thesis_text) and "Imported from IBKR" not in thesis_text
+
+            parts = [ticker]
+            if price:
+                parts.append(f"${price:.2f}")
+            if change_1d is not None:
+                parts.append(f"{change_1d:+.1f}%")
+            if size_pct:
+                parts.append(f"{size_pct:.1f}% of portfolio")
+            if avg_cost and avg_cost > 0:
+                parts.append(f"cost ${avg_cost:.2f}")
+                if price and price > 0:
+                    pnl = (price / avg_cost - 1) * 100
+                    parts.append(f"P&L {pnl:+.1f}%")
+            if shares:
+                parts.append(f"{shares:.0f} shares")
+            parts.append(tier)
+            parts.append("has thesis" if has_thesis else "⚠️ needs thesis")
+            lines.append(" | ".join(parts))
+
+        # WATCHLIST is already merged with override data too; the only
+        # remaining edge case worth guarding is a ticker somehow present in
+        # both (e.g. a promotion pending a positions.py edit).
+        watchlist = {
+            t: c for t, c in positions_config.WATCHLIST.items() if t not in positions_config.POSITIONS
+        }
+        if watchlist:
+            lines.append("")
+            lines.append("WATCHLIST (monitoring, not held):")
+            for ticker, cfg in sorted(watchlist.items()):
+                live = live_prices.get(ticker, {})
+                price = live.get("price_current")
+                change_1d = live.get("change_1d_pct")
+                parts = [ticker]
+                if price:
+                    parts.append(f"${price:.2f}")
+                if change_1d is not None:
+                    parts.append(f"{change_1d:+.1f}%")
+                parts.append("watchlist")
+                lines.append(" | ".join(parts))
+
+        lines.append("")
+        lines.append("Note: Use the above data — not thesis text — for current price and P&L references.")
+        lines.append(
+            "Avg cost, size, and shares come from the IBKR import merged into positions.py. "
+            "Prices are live as of this context's cache refresh (up to 15 min old)."
+        )
+
+        return "\n".join(lines)
+
+    def _get_recent_brief_synthesis(self) -> str:
+        """Cached wrapper around `_get_recent_brief_synthesis_uncached()`."""
+        now = time.time()
+        cached_text = _brief_synthesis_cache["text"]
+        if cached_text is not None and now - _brief_synthesis_cache["timestamp"] < _BRIEF_SYNTHESIS_TTL_SECONDS:
+            return cached_text
+
+        result = self._get_recent_brief_synthesis_uncached()
+        _brief_synthesis_cache["text"] = result
+        _brief_synthesis_cache["timestamp"] = now
+        return result
+
+    def _get_recent_brief_synthesis_uncached(self) -> str:
+        """Load the MORNING SYNTHESIS section from the most recent saved brief.
+
+        `brief_builder.py` only writes `brief_<date>.txt` when run standalone
+        (there's no cron wired up in this repo yet), so a file for today
+        often won't exist — this falls back to the most recent brief on disk
+        rather than requiring an exact date match, and labels the date it's
+        from so Claude doesn't mistake a stale synthesis for this morning's.
+        Returns "" if no brief file exists or the section can't be found.
+        """
+        try:
+            candidates = sorted(_BRIEFS_DIR.glob("brief_*.txt"), reverse=True)
+        except OSError as exc:
+            logger.warning("_get_recent_brief_synthesis: could not list %s: %s", _BRIEFS_DIR, exc)
+            return ""
+        if not candidates:
+            return ""
+
+        brief_path = candidates[0]
+        brief_date = brief_path.stem.removeprefix("brief_")
+
+        try:
+            content = brief_path.read_text()
+        except OSError as exc:
+            logger.warning("_get_recent_brief_synthesis: could not read %s: %s", brief_path, exc)
+            return ""
+
+        # brief_builder.py wraps the header itself in a "════" banner
+        # (i.e. the section looks like "🎯 MORNING SYNTHESIS\n════...\n<body>"),
+        # so we skip past that closing divider and capture the body,
+        # stopping at the "Generated HH:MM / Reply /discuss TICKER" footer
+        # it appends right after this section, or end of string.
+        match = re.search(
+            r"🎯 MORNING SYNTHESIS\s*\n═+\s*\n(.*?)(?=\nGenerated |\Z)", content, re.DOTALL
+        )
+        if not match:
+            return ""
+
+        synthesis = match.group(1).strip()[:1500]  # cap at 1500 chars
+        today = datetime.now().strftime("%Y-%m-%d")
+        label = "this morning" if brief_date == today else f"{brief_date} — not today, may be stale"
+        return f"--- MORNING BRIEF SYNTHESIS ({label}) ---\n{synthesis}\n"
 
     # ------------------------------------------------------------------
     # Ticker / regime context
@@ -569,34 +752,104 @@ class Advisor:
     # Follow-up suggestions (pattern-based, no API call)
     # ------------------------------------------------------------------
 
-    def get_follow_up_suggestions(self, thread_type: str, response_text: str) -> list[str]:
-        upper = response_text.upper()
-        thread_type_upper = (thread_type or "").upper()
+    def get_follow_up_suggestions(self, thread_id: str, response_text: str) -> list[str]:
+        """Return 2 contextual follow-up suggestions based on response content.
 
-        if "ENTER" in upper or "ENTRY" in upper:
-            return [
-                "What position size would make sense here?",
-                "What are the key risks to monitor?",
+        Builds a candidate pool from keyword signals in `response_text`
+        (entry/timing, watch/caution, exit/trim, thesis, macro, risk,
+        sector/comparison, portfolio-level — a response can match several),
+        falling back to a generic pool when nothing matches. Recently shown
+        suggestions for this thread are filtered out first so the same two
+        lines don't repeat turn after turn; the filter resets once the pool
+        is exhausted rather than starving the thread of suggestions.
+        """
+        text_upper = response_text.upper()
+        candidates = []
+
+        # Entry/timing signals
+        if any(w in text_upper for w in ("ENTRY", "ENTER", "BUY", "ADD", "POSITION SIZE", "SIZING")):
+            candidates += [
+                "What position size would make sense given current conviction?",
+                "What would you set as the thesis-breaker trigger for this entry?",
+                "How does this fit within the overall portfolio concentration?",
             ]
-        if "WATCH" in upper:
-            return [
-                "What would trigger an entry from here?",
-                "How long would you give this setup to develop?",
+
+        # Caution/watch signals
+        if any(w in text_upper for w in ("WATCH", "WAIT", "MONITOR", "PATIENCE", "TOO EARLY")):
+            candidates += [
+                "What specific signal would trigger moving from watch to entry?",
+                "What is the downside scenario if the setup fails?",
+                "How long would you give this setup before reassessing?",
             ]
-        if "EXIT" in upper or "REDUCE" in upper:
-            return [
-                "What would make you change this view?",
-                "How does this affect overall portfolio balance?",
+
+        # Exit/trim signals
+        if any(w in text_upper for w in ("TRIM", "EXIT", "REDUCE", "SELL", "TAKE PROFIT")):
+            candidates += [
+                "What would change your view and make you hold instead?",
+                "Would you redeploy proceeds into something else or raise cash?",
+                "How does trimming affect overall portfolio balance?",
             ]
-        if "MACRO" in thread_type_upper or "TOPIC" in thread_type_upper:
-            return [
-                "How does this affect my current positions?",
-                "Which holdings are most exposed to this?",
+
+        # Thesis/fundamental discussion
+        if any(w in text_upper for w in ("THESIS", "ROIC", "REVENUE", "MARGIN", "EARNINGS", "FUNDAMENTAL")):
+            candidates += [
+                "How does this compare to the original thesis when you entered?",
+                "Which thesis-breaker are you most focused on right now?",
+                "What would a bull case vs bear case look like from here?",
             ]
-        return [
-            "What else would you like to explore?",
-            "Any specific risks you want to dig into?",
-        ][:2]
+
+        # Macro/regime discussion
+        if any(w in text_upper for w in ("MACRO", "REGIME", "RATES", "FED", "INFLATION", "DOLLAR", "CYCLE")):
+            candidates += [
+                "How does this macro view affect your highest-conviction positions?",
+                "Which positions are most exposed if this regime persists 6 months?",
+                "Does this change your cash allocation or hedge positioning?",
+            ]
+
+        # Risk/concern signals
+        if any(w in text_upper for w in ("RISK", "CONCERN", "HEADWIND", "PRESSURE", "WEAK", "DECLINING")):
+            candidates += [
+                "Is this a temporary headwind or a structural shift?",
+                "At what point does this become a thesis-breaker vs. noise?",
+                "How are peers in the same sector holding up?",
+            ]
+
+        # Sector/comparison discussion
+        if any(w in text_upper for w in ("SECTOR", "PEER", "COMPETITOR", "RELATIVE", "VERSUS", "COMPARE")):
+            candidates += [
+                "Which name in this sector has the best risk/reward right now?",
+                "Is the sector weakness stock-specific or broad?",
+                "How does correlation with other positions affect sizing?",
+            ]
+
+        # Portfolio-level discussion
+        if any(w in text_upper for w in ("PORTFOLIO", "CONCENTRATION", "ALLOCATION", "BALANCE", "DIVERSIF")):
+            candidates += [
+                "Which position has the weakest thesis relative to its current size?",
+                "Where would you add risk if you had fresh capital today?",
+                "What is the single biggest risk across the whole book right now?",
+            ]
+
+        if not candidates:
+            candidates = [
+                "What is the single most important thing to monitor this week?",
+                "What would make you most confident to increase the position?",
+                "How does today's price action change the near-term view?",
+                "What does the options market imply about near-term expectations?",
+                "Is there a catalyst in the next 30 days worth positioning around?",
+            ]
+
+        # Avoid repeating suggestions shown in recent turns for this thread;
+        # reset if filtering would leave too few to choose from.
+        recent = self._suggestion_history.get(thread_id, [])
+        fresh = [s for s in candidates if s not in recent]
+        if len(fresh) < 2:
+            fresh = candidates
+
+        selected = random.sample(fresh, min(2, len(fresh)))
+
+        self._suggestion_history[thread_id] = (recent + selected)[-6:]
+        return selected
 
     def sanitize_headline(self, text: str, max_length: int = 200) -> str:
         """

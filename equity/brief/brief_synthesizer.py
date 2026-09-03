@@ -134,6 +134,13 @@ PORTFOLIO IMPLICATIONS (2-3 bullets max): Direct, material implications for curr
 
 SUGGESTIONS (1-2 bullets max): The most plausible actionable suggestion given this data and regime. Name the ticker and action if relevant. If nothing is clearly actionable, say so.
 
+IMPORTANT constraints for SUGGESTIONS:
+- For existing positions already showing significant unrealized gains (>20%), do NOT suggest adding. Suggest hold/trim assessment instead.
+- For positions at 52W or multi-year highs, flag the entry risk explicitly rather than suggesting addition.
+- Only suggest adding to a position if it is in the dislocation zone (down 10-50% from highs) AND RSI is confirming a turn.
+- Suggestions should be specific but acknowledge uncertainty — avoid language like "add on this session" which implies high confidence.
+- If a suggestion conflicts with the four-question framework (e.g. suggesting adding to something not in the dislocation zone), flag the conflict rather than making the suggestion.
+
 Be direct and specific. Avoid generic observations. If a signal is ambiguous, say so.
 Under 200 words total."""
 
@@ -174,6 +181,13 @@ OVERALL ASSESSMENT (2-3 sentences): The single most important thing to know this
 TOP 3 PORTFOLIO IMPLICATIONS (3 bullets max): The most material cross-section implications for current positions. Prioritize by urgency and magnitude. Name the ticker.
 
 TODAY'S FOCUS (1-2 bullets): If you had to focus on one position decision and one thing to monitor today — what are they? Be specific.
+
+IMPORTANT constraints for the position decision in TODAY'S FOCUS:
+- For existing positions already showing significant unrealized gains (>20%), do NOT suggest adding. Suggest hold/trim assessment instead.
+- For positions at 52W or multi-year highs, flag the entry risk explicitly rather than suggesting addition.
+- Only suggest adding to a position if it is in the dislocation zone (down 10-50% from highs) AND RSI is confirming a turn.
+- Be specific but acknowledge uncertainty — avoid language like "add on this session" which implies high confidence.
+- If the decision conflicts with the four-question framework (e.g. suggesting adding to something not in the dislocation zone), flag the conflict rather than making the suggestion.
 
 RISK TO WATCH (1 sentence): The single biggest risk to the current portfolio surfaced by this morning's data.
 
