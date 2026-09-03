@@ -15,6 +15,7 @@ from functools import partial
 
 import yfinance as yf
 from dotenv import load_dotenv
+from telegram import Update
 from telegram.error import BadRequest
 
 load_dotenv()
@@ -79,6 +80,18 @@ from equity.telegram.formatters import (
     send_safe,
 )
 from equity.telegram.threads import ThreadManager
+
+
+async def reply(update: Update, context, text: str,
+                 reply_markup=None, parse_mode: str = 'Markdown') -> None:
+    '''
+    Sends a reply regardless of whether the update came from a command or callback query.
+    Uses update.effective_message which works for both.
+    Falls back to send_safe for Markdown error handling.
+    '''
+    chat_id = update.effective_chat.id
+    await send_safe(context.bot, chat_id, text, reply_markup=reply_markup)
+
 
 POSITIONS = positions_module.POSITIONS
 WATCHLIST = positions_module.WATCHLIST
@@ -163,7 +176,7 @@ def authorized_only(func):
 def require_write_access(func):
     async def wrapper(update, context):
         if READONLY_MODE:
-            await update.message.reply_text(
+            await reply(update, context,
                 "🔒 Bot is in read-only mode. "
                 "SSH to VPS and set BOT_READONLY=false to enable writes."
             )
@@ -187,7 +200,7 @@ def require_email_auth(operation_fn):
             operation = operation_fn(update, context)
             sent = auth_manager.send_email_code(user_id, operation)
             if not sent:
-                await update.message.reply_text(
+                await reply(update, context,
                     "⚠️ Failed to send auth email. "
                     "Check BOT_EMAIL settings. Operation cancelled."
                 )
@@ -197,7 +210,7 @@ def require_email_auth(operation_fn):
                 "operation": operation,
             }
             context.user_data["pending_command_args"] = context.args
-            await update.message.reply_text(
+            await reply(update, context,
                 f"🔐 *Authorization required*\n"
                 f"Operation: {operation}\n\n"
                 f"A 6-digit code has been sent to your email.\n"
@@ -298,7 +311,7 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
 
 @authorized_only
 async def start(update, context):
-    await update.message.reply_text(
+    await reply(update, context,
         "👋 Portfolio Advisor online. I help you research, discuss, and track "
         "your equity positions and watchlist. Use /help to see everything I can do.",
         reply_markup=make_main_menu(),
@@ -331,7 +344,7 @@ async def send_help(update, context):
         "/confirm — Approve pending change\n"
         "/cancel — Cancel pending change/auth\n"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=make_main_menu())
+    await reply(update, context, text, parse_mode="Markdown", reply_markup=make_main_menu())
 
 
 @authorized_only
@@ -403,7 +416,7 @@ async def send_watchlist(update, context):
         except Exception as exc:
             logger.warning("send_watchlist: price fetch failed for %s: %s", ticker, exc)
             lines.append(f"{ticker:<6} price unavailable  ({cfg.get('tier', '')})")
-    await update.message.reply_text(
+    await reply(update, context,
         "\n".join(lines), reply_markup=make_discuss_menu(POSITIONS, WATCHLIST)
     )
 
@@ -411,7 +424,7 @@ async def send_watchlist(update, context):
 @authorized_only
 async def send_threads(update, context):
     threads = thread_manager.list_threads()
-    await update.message.reply_text(
+    await reply(update, context,
         format_thread_list(threads), reply_markup=make_thread_list_keyboard(threads)
     )
 
@@ -419,7 +432,7 @@ async def send_threads(update, context):
 @authorized_only
 async def send_discuss(update, context):
     if not context.args:
-        await update.message.reply_text(
+        await reply(update, context,
             "Choose a ticker:", reply_markup=make_discuss_menu(POSITIONS, WATCHLIST)
         )
         return
@@ -440,7 +453,7 @@ async def send_portfolio_review(update, context):
 async def send_switch(update, context):
     if not context.args:
         threads = thread_manager.list_threads()
-        await update.message.reply_text(
+        await reply(update, context,
             "Choose a thread:", reply_markup=make_thread_list_keyboard(threads)
         )
         return
@@ -448,7 +461,7 @@ async def send_switch(update, context):
     thread_manager.set_active_thread(TELEGRAM_USER_ID, thread_id)
     info = thread_manager.get_thread_info(thread_id)
     subject = info["subject"] if info else thread_id
-    await update.message.reply_text(
+    await reply(update, context,
         f"✓ Switched to {thread_id}. Reply to continue.",
         reply_markup=make_ticker_actions(subject),
     )
@@ -457,7 +470,7 @@ async def send_switch(update, context):
 @authorized_only
 async def send_done(update, context):
     thread_manager.clear_active_thread(TELEGRAM_USER_ID)
-    await update.message.reply_text(
+    await reply(update, context,
         "✓ Thread paused. Resume anytime with /discuss TICKER",
         reply_markup=make_main_menu(),
     )
@@ -477,7 +490,7 @@ async def send_audit(update, context):
             recent_ops = "".join(f.readlines()[-5:])
     except FileNotFoundError:
         recent_ops = "No operations logged yet."
-    await update.message.reply_text(
+    await reply(update, context,
         f"📋 *Recent config changes:*\n```\n{result.stdout or 'None'}\n```\n"
         f"📋 *Recent write operations:*\n```\n{recent_ops}\n```",
         parse_mode="Markdown"
@@ -512,18 +525,18 @@ def _execute_pending_change(change: dict) -> str:
 async def send_confirm(update, context):
     change = thread_manager.get_latest_pending_change()
     if change is None:
-        await update.message.reply_text("No pending change to confirm (or it has expired).")
+        await reply(update, context, "No pending change to confirm (or it has expired).")
         return
     result = _execute_pending_change(change)
     thread_manager.clear_pending_change(change["id"])
-    await update.message.reply_text(result)
+    await reply(update, context, result)
 
 
 @authorized_only
 async def send_cancel(update, context):
     auth_manager.cancel_pending_auth(TELEGRAM_USER_ID)
     thread_manager.clear_latest_pending_change()
-    await update.message.reply_text("❌ Cancelled.", reply_markup=make_main_menu())
+    await reply(update, context, "❌ Cancelled.", reply_markup=make_main_menu())
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +747,7 @@ async def handle_message(update, context):
 
     # Rate limit
     if not check_rate_limit(user_id):
-        await update.message.reply_text(
+        await reply(update, context,
             "⏱ Too many messages. Wait a moment and try again."
         )
         return
@@ -743,13 +756,13 @@ async def handle_message(update, context):
     if auth_manager.is_awaiting_auth(user_id):
         if message_text.startswith("/cancel"):
             auth_manager.cancel_pending_auth(user_id)
-            await update.message.reply_text(
+            await reply(update, context,
                 "❌ Authorization cancelled.", reply_markup=make_main_menu()
             )
             return
         success, payload = auth_manager.verify_email_code(user_id, message_text)
         if success:
-            await update.message.reply_text("✓ Authorized.")
+            await reply(update, context, "✓ Authorized.")
             pending = context.user_data.pop("awaiting_email_auth", {})
             func_name = pending.get("func_name")
             context.args = context.user_data.pop("pending_command_args", [])
@@ -761,7 +774,7 @@ async def handle_message(update, context):
             elif func_name and func_name in COMMAND_REGISTRY:
                 await COMMAND_REGISTRY[func_name](update, context)
         else:
-            await update.message.reply_text(
+            await reply(update, context,
                 "❌ Invalid or expired code. Try again or /cancel to abort."
             )
         return
@@ -773,11 +786,11 @@ async def handle_message(update, context):
             context.user_data.pop("pending_remove_ticker")
             config_manager.remove_from_watchlist(expected, "Removed via Telegram")
             security_logger.warning(f"WRITE_OP | remove_watchlist | ticker={expected}")
-            await update.message.reply_text(
+            await reply(update, context,
                 f"✓ {expected} removed from watchlist.", reply_markup=make_main_menu()
             )
         else:
-            await update.message.reply_text(
+            await reply(update, context,
                 f"Type *{expected}* exactly to confirm removal, or /cancel to abort.",
                 parse_mode="Markdown",
             )
@@ -792,11 +805,11 @@ async def handle_message(update, context):
                 expected, {"stop_thesis": True}, "Thesis flagged broken via Telegram"
             )
             security_logger.warning(f"WRITE_OP | stop_thesis | ticker={expected}")
-            await update.message.reply_text(
+            await reply(update, context,
                 f"🚨 {expected} thesis flagged as broken.", reply_markup=make_main_menu()
             )
         else:
-            await update.message.reply_text(
+            await reply(update, context,
                 f'Type "CONFIRM {expected}" exactly to confirm, or /cancel to abort.'
             )
         return
@@ -810,14 +823,14 @@ async def handle_message(update, context):
     # Priority 3: active conversation thread
     active_thread = thread_manager.get_active_thread(user_id)
     if not active_thread:
-        await update.message.reply_text(
+        await reply(update, context,
             "No active discussion. Choose one:",
             reply_markup=make_discuss_menu(POSITIONS, WATCHLIST),
         )
         return
 
     if not check_claude_rate_limit():
-        await update.message.reply_text(
+        await reply(update, context,
             "⚠️ Claude call limit reached for this hour. "
             "Data commands (/portfolio, /screener) still work."
         )
@@ -873,13 +886,13 @@ async def handle_unknown_command(update, context):
     cmd = update.message.text.lstrip("/").split()[0].lower()
     matches = difflib.get_close_matches(cmd, KNOWN_COMMANDS, n=1, cutoff=0.6)
     if matches:
-        await update.message.reply_text(
+        await reply(update, context,
             f"Did you mean */{matches[0]}*? "
             f"Try again or /help for all commands.",
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
+        await reply(update, context,
             "Unknown command.", reply_markup=make_main_menu()
         )
 
