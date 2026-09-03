@@ -4,11 +4,18 @@ Pulls current price action for every name in
 `equity.config.positions.POSITIONS`, plus a lightweight check on
 `WATCHLIST` names not yet in a position.
 
-No P&L or position sizing here — those depend on entry price and share
-count, which come from IBKR (Module 4, not yet connected; see
-`get_ibkr_positions()` below and the `equity.config.positions` module
-docstring). Every `POSITIONS` ticker renders with live price action and
-"Size: pending IBKR" until that connection lands.
+Size, cost basis, and market value come from `equity.config.positions` —
+`POSITIONS`/`WATCHLIST` there are already merged with
+`config/positions_override.json` at import time (see
+`positions._apply_overrides()`), so every ticker's config dict here
+(whether reached via `POSITIONS.items()`/`WATCHLIST.items()` or
+`positions_config.get_position()`) carries the IBKR-imported `avg_cost`,
+`size_pct`, and `market_value` fields when available. A ticker only in
+the override file (no thesis entry in `positions.py`) still shows up here
+because the override merge adds it to `POSITIONS`/`WATCHLIST` directly —
+there is no separate override lookup needed in this module. Tickers with
+no override data yet (`size_pct` still `None`) render "Size: pending
+IBKR".
 
 Price data comes from `yf.Ticker(ticker).history(period='5d')` rather than
 `.info` or a batched `yf.download()` — this module runs on a handful of
@@ -68,18 +75,16 @@ def _fetch_price(ticker: str) -> tuple[float, float] | None:
     return float(close.iloc[-1]), float(close.iloc[-2])
 
 
-def get_ibkr_positions() -> dict:
-    """Stub for live IBKR position sizes (Module 4 — not yet connected).
+def _build_entry(ticker: str, config: dict) -> dict | None:
+    """Build one ticker's price-action entry, or None if price data couldn't be fetched.
 
-    Returns an empty dict for now. Once wired up this should return
-    {ticker: size_pct} for every held position; callers treat a ticker
-    missing from this dict as "size pending IBKR" rather than an error.
+    `config` is expected to already be the merged dict for `ticker` — i.e.
+    a value from `positions_config.POSITIONS`/`WATCHLIST` (or
+    `positions_config.get_position(ticker)`), which folds in
+    `positions_override.json` fields (`avg_cost`, `size_pct`,
+    `market_value`) at import time. This function doesn't re-read the
+    override file itself.
     """
-    return {}
-
-
-def _build_entry(ticker: str, config: dict, ibkr_positions: dict) -> dict | None:
-    """Build one ticker's price-action entry, or None if price data couldn't be fetched."""
     prices = _fetch_price(ticker)
     if prices is None:
         return None
@@ -92,7 +97,9 @@ def _build_entry(ticker: str, config: dict, ibkr_positions: dict) -> dict | None
         "price_current": price_current,
         "change_1d_pct": change_1d_pct,
         "change_1d_abs": change_1d_abs,
-        "size_pct": ibkr_positions.get(ticker),
+        "avg_cost": config.get("avg_cost"),
+        "size_pct": config.get("size_pct"),
+        "market_value": config.get("market_value"),
         "move_flag": _move_flag(change_1d_pct),
         "thesis_status": "THESIS_BREAKING" if config.get("stop_thesis") else "OK",
         "tier": config.get("tier", ""),
@@ -108,12 +115,11 @@ def run_portfolio_monitor() -> dict:
     names are not visited here; `format_portfolio_monitor()` fetches them
     separately for the watchlist section.
     """
-    ibkr_positions = get_ibkr_positions()
     result_positions = {}
     alerts = []
 
     for ticker, config in positions_config.POSITIONS.items():
-        entry = _build_entry(ticker, config, ibkr_positions)
+        entry = _build_entry(ticker, config)
         if entry is None:
             alerts.append(f"{ticker}  No price data available")
             continue
@@ -144,11 +150,21 @@ def _tier_label(tier: str) -> str:
 
 
 def _format_position_line(ticker: str, entry: dict) -> str:
-    size = entry["size_pct"]
-    size_str = f"{size:.1f}%" if size is not None else "pending IBKR"
+    avg_cost = entry["avg_cost"]
+    size_pct = entry["size_pct"]
+    price_current = entry["price_current"]
+
+    if avg_cost and avg_cost > 0 and price_current:
+        unrealized_pct = (price_current / avg_cost - 1) * 100
+        size_str = f"{size_pct:.1f}% | Cost ${avg_cost:.2f} | P&L {unrealized_pct:+.1f}%"
+    elif size_pct is not None:
+        size_str = f"{size_pct:.1f}%"
+    else:
+        size_str = "Size: pending IBKR"
+
     return (
-        f"{ticker:<5} {entry['change_1d_pct']:+.1f}%  ${entry['price_current']:.0f} | "
-        f"Size: {size_str} | {_tier_label(entry['tier'])}"
+        f"{ticker:<5} {entry['change_1d_pct']:+.1f}%  ${price_current:.0f} | "
+        f"{size_str} | {_tier_label(entry['tier'])}"
     )
 
 
@@ -185,7 +201,7 @@ def format_portfolio_monitor(monitor_data: dict) -> str:
         lines.append("(empty)")
     else:
         for ticker, config in watchlist.items():
-            entry = _build_entry(ticker, config, {})
+            entry = _build_entry(ticker, config)
             if entry is None:
                 lines.append(f"{ticker:<5} No price data available")
             else:

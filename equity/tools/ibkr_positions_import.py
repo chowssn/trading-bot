@@ -5,8 +5,10 @@ its column headers/values carry stray non-breaking spaces. This script reads
 that raw export, drops non-equity rows (options, VIX/index derivatives,
 ForecastEx prediction-market contracts), and writes size/cost data into
 `positions_override.json` — merged onto existing theses where one already
-exists in `positions.py`, or as a blank-thesis watchlist template for
-tickers we don't have a thesis on yet.
+exists in `positions.py`, or as a blank-thesis POSITIONS template for
+tickers we don't have a thesis on yet. A ticker only stays under WATCHLIST
+if it already carries a real (non-import) thesis there in `positions.py`
+— e.g. APP.
 
 This is a stopgap until the full IBKR API (Module 4) is connected; run it
 manually after each CSV export. It only ever touches
@@ -147,8 +149,9 @@ def merge_into_override(imported: dict) -> tuple[dict, list[str], list[str]]:
 
     Tickers with a real thesis already in `positions.py` (POSITIONS or
     WATCHLIST) get only their size/cost fields updated — thesis fields are
-    left untouched. New tickers get the full blank-thesis template, filed
-    under WATCHLIST.
+    left untouched, and the ticker stays in whichever section already had
+    it. New tickers (no real thesis anywhere) are actual IBKR holdings, so
+    they get the full blank-thesis template filed under POSITIONS.
 
     Returns (override_json, preserved_tickers, added_tickers).
     """
@@ -174,7 +177,11 @@ def merge_into_override(imported: dict) -> tuple[dict, list[str], list[str]]:
             entry = numeric_only
             preserved.append(ticker)
         else:
-            section = "WATCHLIST"
+            # A ticker IBKR reports us as holding is an actual position, not
+            # a watchlist name — file it under POSITIONS unless it already
+            # has a real thesis parked in positions.py's WATCHLIST (handled
+            # above), e.g. APP.
+            section = "POSITIONS"
             entry = fields
             added.append(ticker)
 

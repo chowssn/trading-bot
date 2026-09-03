@@ -196,12 +196,10 @@ POSITIONS = {
         # screener's correlation gate (see market_config.CORRELATION_CATEGORIES).
         "peer_tickers": [],
     },
-}
-
-
-WATCHLIST = {
+    # APP moved from watchlist — executed position. Full data (avg_cost,
+    # shares, size_pct, market_value, tier) is in positions_override.json.
     "APP": {
-        "tier": "watchlist",
+        "tier": "high_conviction",
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -239,6 +237,9 @@ WATCHLIST = {
         "peer_tickers": [],
     },
 }
+
+
+WATCHLIST = {}
 
 
 def _load_override() -> dict:
