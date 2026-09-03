@@ -58,11 +58,14 @@ class Advisor:
             lines = ["--- Current Positions ---"]
             for ticker, cfg in positions_config.POSITIONS.items():
                 lines.append(
-                    f"{ticker} ({cfg.get('tier', '?')}): {cfg.get('thesis', '')[:200]}"
+                    f"Position: {ticker} ({cfg.get('tier','')}, {cfg.get('sector','')})\n"
+                    f"Thesis (written {cfg.get('last_reviewed', 'unknown')} — may not reflect current price):\n"
+                    f"  {cfg.get('thesis', '')[:150]}\n"
+                    f"Current thesis-breakers to monitor:\n"
+                    f"  {'; '.join(cfg.get('thesis_breakers', [])[:3])}\n"
+                    f"Note: Thesis language reflects conditions at time of writing.\n"
+                    f"Always verify current price, RSI, and momentum via live data before referencing price levels."
                 )
-                breakers = cfg.get("thesis_breakers", [])
-                if breakers:
-                    lines.append(f"  Breakers: {'; '.join(breakers)}")
             sections.append("\n".join(lines))
 
         if thread_subject:
@@ -89,6 +92,25 @@ class Advisor:
         regime = self.get_regime_context()
         if regime:
             sections.append(f"--- Current Regime ---\n{regime}")
+
+        try:
+            from equity.portfolio.monitor import run_portfolio_monitor
+
+            monitor_data = run_portfolio_monitor()
+            live_prices = []
+            for ticker, data in monitor_data.get("positions", {}).items():
+                price = data.get("price_current")
+                change_1d = data.get("change_1d_pct", 0)
+                if price:
+                    live_prices.append(f"{ticker}: ${price:.2f} ({change_1d:+.1f}% today)")
+            if live_prices:
+                sections.append(
+                    "--- LIVE POSITION PRICES (fetched now, not from thesis) ---\n"
+                    + "\n".join(live_prices)
+                    + "\nUse these prices — not thesis language — when discussing current levels."
+                )
+        except Exception as exc:
+            logger.warning("build_system_prompt: live price fetch failed: %s", exc)
 
         return "\n\n".join(sections)
 

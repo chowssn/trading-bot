@@ -249,6 +249,22 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
                 f"Please analyze {ticker} for my portfolio consideration. "
                 f"Context:\n{context_str}"
             )
+        elif thread_type == "topic" and ticker == "PORTFOLIO":
+            monitor_data = await run_in_executor(run_portfolio_monitor)
+            positions_snapshot = []
+            for pos_ticker, data in monitor_data.get("positions", {}).items():
+                price = data.get("price_current", "N/A")
+                change = data.get("change_1d_pct", 0)
+                flag = data.get("move_flag", "")
+                positions_snapshot.append(
+                    f"{pos_ticker}: ${price} ({change:+.1f}% today) {flag}"
+                )
+            live_context = "Current portfolio prices (live):\n" + "\n".join(positions_snapshot)
+            first_message = (
+                f"Portfolio review requested. Current regime: {advisor.get_regime_context()}\n\n"
+                f"{live_context}\n\n"
+                f"What aspect of the portfolio would you like to review?"
+            )
         else:
             regime = advisor.get_regime_context()
             first_message = (
