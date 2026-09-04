@@ -519,22 +519,6 @@
     }
   },
   "WATCHLIST": {
-    "ONON": {
-      "last_reviewed": "2026-09",
-      "macro_thesis": "ONON is sensitive to consumer discretionary sentiment, USD strength (international revenue translation), and risk appetite for high-multiple growth equities. A soft landing or Fed pivot environment is constructive \u2014 it relieves pressure on consumer spending and re-rates growth multiples. Inflationary pressure on freight and materials is a headwind to watch but has been easing. China reopening and stabilization supports Asia growth. The primary macro risk is a hard recession compressing premium footwear spend, though ONON's aspirational positioning gives it more resilience than mass-market peers. Dollar strength is a modest headwind given CHF-denominated cost base and global revenue mix.",
-      "sector": "Consumer Discretionary",
-      "target_exit_conditions": "Exit or significantly trim if: gross margins decline below 57% on a trailing basis, revenue growth decelerates below 20% YoY for two consecutive quarters without a credible re-acceleration catalyst, RSI reaches overbought territory above 75 and price has run 40%+ from entry without fundamental upgrade to justify, or any core thesis breaker is confirmed. Do not exit on price alone \u2014 thesis integrity is the primary governor.",
-      "thesis": "On Holding (ONON) is a premium athletic footwear and apparel brand with exceptional brand momentum, rapidly expanding distribution, and improving unit economics. ROIC is trending upward as the business scales, gross margins are expanding toward 60%+, and the brand maintains pricing power in a category (performance running and lifestyle) that is highly aspirational and sticky. The market has periodically repriced ONON aggressively on macro fears around consumer discretionary spending, China exposure, and valuation multiples \u2014 creating episodic entry windows. The core thesis is a durable growth compounder with a 5-10 year runway, temporarily trading at a discount to intrinsic growth value when sentiment resets. Brand velocity, Roger Federer equity stake alignment, DTC mix shift, and international expansion (particularly US and Asia) are structural tailwinds. Entry is attractive when RSI cools below 45 and 1Y returns compress to flat or negative, as the business fundamentals have not inflected down.",
-      "thesis_breakers": [
-        "Gross margin contraction sustained over 2+ consecutive quarters signaling loss of pricing power or supply chain structural issues",
-        "DTC mix stagnates or reverses, indicating brand pull is weakening and wholesale dependency reasserts margin drag",
-        "Meaningful market share loss in performance running to Hoka, Nike, or New Balance evidenced by declining sell-through and ASP erosion",
-        "China or Asia-Pacific growth disappoints for 2+ quarters, removing a key leg of the international expansion story",
-        "Roger Federer or other brand ambassador disassociation combined with brand sentiment deterioration in core demographic"
-      ],
-      "thesis_source": "ai_assisted",
-      "tier": "high_conviction"
-    },
     "SMFG": {
       "last_reviewed": "2026-09",
       "macro_thesis": "Japan is undergoing its most significant monetary regime shift in 30 years. The BOJ's gradual rate normalization is a structural tailwind for Japanese bank earnings that is still early innings. Inflation in Japan, while moderate, appears sticky enough to keep the BOJ on a tightening path. Global investors remain underweight Japanese financials relative to historical norms, and domestic institutional flows are rotating into value and dividend-paying equities under the Tokyo Stock Exchange's push for improved capital efficiency and ROE. A weaker yen environment has also boosted overseas earnings in yen terms. Meanwhile, global rate curves remaining elevated support SMFG's wholesale and treasury operations. The macro setup \u2014 reflation, rate normalization, governance reform pressure, and underweight positioning \u2014 is unusually aligned for a megabank re-rating.",
