@@ -14,10 +14,10 @@ approval — never on its own initiative. Every write function here:
 `equity.config.positions` merges that JSON over its literal `POSITIONS`/
 `WATCHLIST` dicts on import (see that module's `_load_override()`). This
 sidesteps parsing/rewriting the hand-authored Python source for the two
-operations that happen most often. A process that already imported
-`equity.config.positions` before the write won't see the change until it
-re-imports (e.g. the next scheduled run) — this module never mutates an
-already-loaded `positions` module in place.
+operations that happen most often. `save_thesis_update()`,
+`add_to_watchlist()`, and `remove_from_watchlist()` each call
+`positions.reload()` after writing, so an already-running process sees the
+change immediately — no restart or re-import needed.
 
 `remove_from_watchlist()` and `update_market_config()` are rarer and edit
 Python source directly, since there's no override layer for "field no
@@ -315,10 +315,12 @@ def save_thesis_update(ticker: str, updates: dict, reason: str) -> bool:
 
         append_changelog(f"positions.py: Updated {ticker} thesis — {reason}")
 
-        return _git_commit(
+        result = _git_commit(
             [_OVERRIDE_PATH, _CHANGELOG_PATH],
             f"config: update {ticker} thesis\n\n{reason}",
         )
+        positions.reload()
+        return result
     except Exception as exc:
         logger.error("save_thesis_update failed for %s: %s", ticker, exc)
         return False
@@ -344,10 +346,12 @@ def add_to_watchlist(ticker: str, position_dict: dict, reason: str) -> bool:
 
         append_changelog(f"positions.py: {ticker} added to watchlist — {reason}")
 
-        return _git_commit(
+        result = _git_commit(
             [_OVERRIDE_PATH, _CHANGELOG_PATH],
             f"config: add {ticker} to watchlist\n\n{reason}",
         )
+        positions.reload()
+        return result
     except Exception as exc:
         logger.error("add_to_watchlist failed for %s: %s", ticker, exc)
         return False
@@ -391,7 +395,9 @@ def remove_from_watchlist(ticker: str, reason: str) -> bool:
         append_changelog(f"positions.py: {ticker} removed from watchlist — {reason}")
         changed_paths.append(_CHANGELOG_PATH)
 
-        return _git_commit(changed_paths, f"config: remove {ticker} from watchlist\n\n{reason}")
+        result = _git_commit(changed_paths, f"config: remove {ticker} from watchlist\n\n{reason}")
+        positions.reload()
+        return result
     except Exception as exc:
         logger.error("remove_from_watchlist failed for %s: %s", ticker, exc)
         return False

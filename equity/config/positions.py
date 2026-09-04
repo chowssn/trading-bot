@@ -7,6 +7,7 @@ Thesis entries are AI-assisted drafts approved by the portfolio manager.
 See config/changelog.md for human-readable change history.
 """
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -241,6 +242,25 @@ POSITIONS = {
 
 WATCHLIST = {}
 
+# Hardcoded base state, captured before any override is applied. reload()
+# always rebuilds POSITIONS/WATCHLIST starting from these copies rather
+# than merging onto whatever the previous call produced, so a ticker
+# removed from positions_override.json actually disappears again instead
+# of lingering from an earlier merge. Deep-copied so nothing downstream
+# (a merge, or code that mutates a position dict in place) can reach back
+# and corrupt the base snapshot through a shared nested list/dict.
+_BASE_POSITIONS = copy.deepcopy(POSITIONS)
+_BASE_WATCHLIST = copy.deepcopy(WATCHLIST)
+
+# The live dicts. Other modules hold references to these same objects
+# (`from equity.config.positions import POSITIONS`, or
+# `positions_config.POSITIONS`) — _apply_overrides() below mutates them
+# in place via .clear()/.update() rather than rebinding the names, so
+# every existing reference sees a reload() without needing to re-import.
+# Deep-copied from base for the same reason as above.
+POSITIONS = copy.deepcopy(_BASE_POSITIONS)
+WATCHLIST = copy.deepcopy(_BASE_WATCHLIST)
+
 
 def _load_override() -> dict:
     """Load positions_override.json, tolerating a missing or malformed file.
@@ -261,7 +281,7 @@ def _load_override() -> dict:
     return {"POSITIONS": data.get("POSITIONS", {}), "WATCHLIST": data.get("WATCHLIST", {})}
 
 
-def _apply_overrides(base: dict, overrides: dict) -> dict:
+def _merge_overrides(base: dict, overrides: dict) -> dict:
     """Merge per-ticker field overrides on top of `base`; new tickers pass through as-is."""
     merged = dict(base)
     for ticker, fields in overrides.items():
@@ -269,16 +289,67 @@ def _apply_overrides(base: dict, overrides: dict) -> dict:
     return merged
 
 
-_override = _load_override()
-POSITIONS = _apply_overrides(POSITIONS, _override["POSITIONS"])
-WATCHLIST = _apply_overrides(WATCHLIST, _override["WATCHLIST"])
+def _apply_overrides() -> None:
+    """(Re)build POSITIONS and WATCHLIST from the hardcoded base dicts plus
+    whatever is currently on disk in positions_override.json.
+
+    Mutates the existing POSITIONS/WATCHLIST dict objects in place
+    (.clear() + .update()) rather than rebinding the module-level names.
+    Reassignment (`POSITIONS = new_dict`) would only repoint this module's
+    own name at a new object — every other module that already holds a
+    reference to the old dict (`from equity.config.positions import
+    POSITIONS`, or `positions_config.POSITIONS`) would keep seeing the
+    stale one. Mutating in place means every existing reference, anywhere
+    in the codebase, sees the update — no re-import required.
+
+    Safe to call any number of times — it always starts from
+    `_BASE_POSITIONS`/`_BASE_WATCHLIST` and re-reads the override file each
+    time, rather than merging onto the previous result, so this is
+    idempotent and a removed override actually takes effect.
+    """
+    override = _load_override()
+    merged_positions = _merge_overrides(_BASE_POSITIONS, override["POSITIONS"])
+    merged_watchlist = _merge_overrides(_BASE_WATCHLIST, override["WATCHLIST"])
+
+    POSITIONS.clear()
+    POSITIONS.update(merged_positions)
+    WATCHLIST.clear()
+    WATCHLIST.update(merged_watchlist)
+
+
+_apply_overrides()
+
+
+def reload() -> None:
+    """Re-read positions_override.json and rebuild POSITIONS/WATCHLIST.
+
+    Call after any write to positions_override.json to see the change
+    immediately, without restarting the bot. `config_manager.py`'s
+    `save_thesis_update()`, `add_to_watchlist()`, and
+    `remove_from_watchlist()` all call this after committing their write.
+
+    Also invalidates `advisor.py`'s cached portfolio-context string (used
+    in the Claude system prompt) so the next chat message reflects the
+    change instead of serving a snapshot that's stale for up to 15 more
+    minutes. Import is deferred to call time to avoid a circular import
+    (advisor.py imports this module at its own module scope) and wrapped
+    in try/except so a failure here never blocks the actual reload.
+    """
+    _apply_overrides()
+    try:
+        import equity.telegram.advisor as advisor_module
+        advisor_module._portfolio_context_cache["timestamp"] = 0
+    except Exception:
+        pass
 
 
 def get_all_tickers() -> list[str]:
+    reload()
     return list(POSITIONS.keys()) + list(WATCHLIST.keys())
 
 
 def get_position(ticker: str) -> dict | None:
+    reload()
     return POSITIONS.get(ticker) or WATCHLIST.get(ticker)
 
 
