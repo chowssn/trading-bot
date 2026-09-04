@@ -3,7 +3,9 @@
 `fetch_sector_data()` is one batched `yf.download()` over
 `market_config.BENCHMARK_TICKERS` + every `positions.POSITIONS` ticker
 (mirrors `equity.brief.market_snapshot`'s batching approach), cached 1
-hour to `equity/data/cache/sector_monitor.json`. The benchmark tickers
+hour to `equity/data/cache/sector_monitor.json` — a cache written on a
+prior calendar date is always treated as stale regardless of CACHE_HOURS,
+so an 11pm write never serves yesterday's prices the next morning. The benchmark tickers
 ride along in that same batch per the spec this module was built from,
 but aren't consumed by anything in this module yet — `POSITION_SECTOR_MAP`
 import is kept for parity with `performance_tracker.py` and future
@@ -386,11 +388,14 @@ def _load_cache() -> dict | None:
         with open(_CACHE_PATH) as f:
             cache = json.load(f)
         fetched_at = datetime.fromisoformat(cache["fetched_at"])
+        cached_date = cache.get("date")
         payload = cache["data"]
     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
         logger.warning("sector_monitor.json cache unreadable, ignoring: %s", exc)
         return None
 
+    if cached_date != date.today().isoformat():
+        return None  # written on a prior trading day — force refresh regardless of CACHE_HOURS
     if (datetime.now() - fetched_at).total_seconds() > CACHE_HOURS * 3600:
         return None
     return payload
@@ -400,7 +405,10 @@ def _write_cache(data: dict) -> None:
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         with open(_CACHE_PATH, "w") as f:
-            json.dump({"fetched_at": datetime.now().isoformat(), "data": data}, f, indent=2)
+            json.dump(
+                {"fetched_at": datetime.now().isoformat(), "date": date.today().isoformat(), "data": data},
+                f, indent=2,
+            )
     except OSError as exc:
         logger.warning("Failed to write sector_monitor.json cache: %s", exc)
 

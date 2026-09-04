@@ -10,8 +10,10 @@ mapped sector ETF (`market_config.POSITION_SECTOR_MAP`).
 `fetch_benchmark_performance()` is one batched `yf.download()` call over
 `market_config.BENCHMARK_TICKERS` — mirrors `equity.brief.market_snapshot`'s
 batching approach — cached to `equity/data/cache/benchmark_performance.json`
-for `BENCHMARK_CACHE_HOURS` hours (fetched_at + payload, age-checked on
-read; same cache-file shape as `market_snapshot.py`'s `fed_funds.json`).
+for `BENCHMARK_CACHE_HOURS` hours (fetched_at + date + payload; a cache
+written on a prior calendar date is always treated as stale regardless of
+BENCHMARK_CACHE_HOURS, so an 11pm write never serves yesterday's prices
+the next morning).
 
 `fetch_position_relative_performance()` reuses that cached benchmark data
 for each position's sector ETF (every `POSITION_SECTOR_MAP` value is itself
@@ -207,11 +209,14 @@ def _load_benchmark_cache() -> dict | None:
         with open(_BENCHMARK_CACHE_PATH) as f:
             cache = json.load(f)
         fetched_at = datetime.fromisoformat(cache["fetched_at"])
+        cached_date = cache.get("date")
         payload = cache["data"]
     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
         logger.warning("benchmark_performance.json cache unreadable, ignoring: %s", exc)
         return None
 
+    if cached_date != date.today().isoformat():
+        return None  # written on a prior trading day — force refresh regardless of BENCHMARK_CACHE_HOURS
     if (datetime.now() - fetched_at).total_seconds() > BENCHMARK_CACHE_HOURS * 3600:
         return None
     return payload
@@ -221,7 +226,10 @@ def _write_benchmark_cache(data: dict) -> None:
     try:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         with open(_BENCHMARK_CACHE_PATH, "w") as f:
-            json.dump({"fetched_at": datetime.now().isoformat(), "data": data}, f, indent=2)
+            json.dump(
+                {"fetched_at": datetime.now().isoformat(), "date": date.today().isoformat(), "data": data},
+                f, indent=2,
+            )
     except OSError as exc:
         logger.warning("Failed to write benchmark_performance.json cache: %s", exc)
 
