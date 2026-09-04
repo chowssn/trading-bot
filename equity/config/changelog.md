@@ -11,3 +11,6 @@
 
 ## 2026-09-01
 - positions.py: ONON added to watchlist — Added via Telegram advisor
+
+## 2026-09-04
+- positions.py: ONON removed from watchlist — Removed via Telegram
