@@ -518,5 +518,22 @@
       "tier": "core"
     }
   },
-  "WATCHLIST": {}
+  "WATCHLIST": {
+    "SMFG": {
+      "last_reviewed": "2026-09",
+      "macro_thesis": "Japan is undergoing its most significant monetary regime shift in 30 years. The BOJ's gradual rate normalization is a structural tailwind for Japanese bank earnings that is still early innings. Inflation in Japan, while moderate, appears sticky enough to keep the BOJ on a tightening path. Global investors remain underweight Japanese financials relative to historical norms, and domestic institutional flows are rotating into value and dividend-paying equities under the Tokyo Stock Exchange's push for improved capital efficiency and ROE. A weaker yen environment has also boosted overseas earnings in yen terms. Meanwhile, global rate curves remaining elevated support SMFG's wholesale and treasury operations. The macro setup \u2014 reflation, rate normalization, governance reform pressure, and underweight positioning \u2014 is unusually aligned for a megabank re-rating.",
+      "sector": "Financials",
+      "target_exit_conditions": "Exit if BOJ pivots back to easing and forward NIM guidance deteriorates materially. Also exit if price-to-book re-rates above 1.3x without corresponding earnings growth, signaling sentiment overshoot rather than fundamental improvement. Trim on significant yen appreciation beyond 130 USD/JPY that structurally impairs the USD return thesis. Full exit if dividend growth stalls or buybacks are suspended indicating capital stress. Thesis is based on gradual re-rating and income compounding \u2014 not a momentum trade.",
+      "thesis": "SMFG (Sumitomo Mitsui Financial Group) is a structurally sound Japanese megabank benefiting from the Bank of Japan's historic policy normalization after decades of zero or negative interest rates. With ROIC improving materially as net interest margins expand, SMFG trades at roughly 0.8-1.0x book value \u2014 a discount to Western peers despite a cleaner balance sheet, rising dividends, and an aggressive share buyback program. The market has partially re-rated Japanese financials but sentiment remains cautious due to yen volatility and China exposure fears, creating a quality-at-discount entry for patient capital. Structural tailwinds include domestic loan repricing, growing wealth management revenue, and a strategic push into Asian emerging markets through subsidiaries like SMBC. The 1Y return has lagged broader global financials on yen-hedging friction and macro uncertainty \u2014 exactly the dislocation this framework targets.",
+      "thesis_breakers": [
+        "Bank of Japan reverses course and returns to ultra-loose policy, collapsing net interest margin expansion and the core earnings re-rating thesis",
+        "Severe credit deterioration in Japan's SME or real estate loan book driven by rate shock to over-leveraged domestic borrowers",
+        "Yen appreciates sharply and rapidly, compressing overseas earnings when translated back and reducing the USD-denominated return profile for foreign investors",
+        "Material contagion from a China financial stress event impacting SMBC's Asian loan book and cross-border exposure meaningfully",
+        "Governance regression or significant capital allocation failure such as a large dilutive acquisition at a poor price that destroys book value per share trajectory"
+      ],
+      "thesis_source": "ai_assisted",
+      "tier": "core"
+    }
+  }
 }
