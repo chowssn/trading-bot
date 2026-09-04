@@ -10,7 +10,6 @@ import os
 import subprocess
 import time
 from collections import defaultdict
-from datetime import datetime
 from functools import partial
 
 import yfinance as yf
@@ -43,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from equity.brief.brief_builder import build_morning_brief
+from equity.brief.brief_builder import build_morning_brief, get_last_brief_synthesis, save_brief_to_thread
 from equity.brief.market_snapshot import fetch_market_snapshot
 from equity.brief.performance_tracker import (
     fetch_benchmark_performance,
@@ -230,7 +229,7 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
     ticker = subject.upper()
     thread_id = f"{thread_type}_{ticker}"
     thread_info = thread_manager.get_thread_info(thread_id)
-    system_prompt = advisor.build_system_prompt(thread_subject=ticker)
+    system_prompt = advisor.build_system_prompt(thread_subject=ticker, current_thread_id=thread_id)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
@@ -368,6 +367,7 @@ async def send_brief(update, context):
     chat_id = update.effective_chat.id
     await context.bot.send_message(chat_id=chat_id, text="🌅 Building morning brief...")
     sections = await run_in_executor(build_morning_brief)
+    await run_in_executor(save_brief_to_thread, sections, thread_manager)
     for text, keyboard in sections:
         if text and text.strip():
             await send_safe(context.bot, chat_id, text, reply_markup=keyboard)
@@ -465,6 +465,29 @@ async def send_portfolio_review(update, context):
     await start_or_resume_discussion("PORTFOLIO", update, context, thread_type="topic")
 
 
+async def _send_switch_confirmation(update, context, thread_id: str, subject) -> None:
+    """Confirmation shown after switching to `thread_id`.
+
+    topic_BRIEF gets a special case: show the full brief synthesis
+    immediately (via send_in_parts, since it can run long) rather than the
+    generic "switched" message — so /switch topic_BRIEF doubles as a way
+    to review what the brief said without re-running it. Shared by
+    send_switch() (/switch command) and handle_callback()'s "switch_"
+    inline-button branch.
+    """
+    if thread_id == "topic_BRIEF":
+        last_brief = get_last_brief_synthesis(thread_manager)
+        text = (
+            last_brief[1] if last_brief else
+            "No morning brief has been generated yet. Run /brief to generate one."
+        )
+    else:
+        text = f"✓ Switched to {thread_id}. Reply to continue."
+    await send_in_parts(
+        context.bot, update.effective_chat.id, text, reply_markup=make_ticker_actions(subject)
+    )
+
+
 @authorized_only
 async def send_switch(update, context):
     if not context.args:
@@ -477,10 +500,7 @@ async def send_switch(update, context):
     thread_manager.set_active_thread(TELEGRAM_USER_ID, thread_id)
     info = thread_manager.get_thread_info(thread_id)
     subject = info["subject"] if info else thread_id
-    await reply(update, context,
-        f"✓ Switched to {thread_id}. Reply to continue.",
-        reply_markup=make_ticker_actions(subject),
-    )
+    await _send_switch_confirmation(update, context, thread_id, subject)
 
 
 @authorized_only
@@ -655,10 +675,7 @@ async def handle_callback(update, context):
         thread_manager.set_active_thread(TELEGRAM_USER_ID, thread_id)
         info = thread_manager.get_thread_info(thread_id)
         subject = info["subject"] if info else thread_id
-        await query.message.reply_text(
-            f"✓ Switched to {thread_id}. Reply to continue.",
-            reply_markup=make_ticker_actions(subject),
-        )
+        await _send_switch_confirmation(update, context, thread_id, subject)
     elif data.startswith("ticker_news_"):
         ticker = data[len("ticker_news_"):]
         triage = await run_in_executor(run_news_triage, [ticker])
@@ -686,7 +703,7 @@ async def handle_callback(update, context):
         await query.message.reply_text(f"🔄 Refreshing {ticker}...")
         context_str = await run_in_executor(advisor.get_ticker_context, ticker)
         active_thread = f"ticker_{ticker}"
-        system_prompt = advisor.build_system_prompt(thread_subject=ticker)
+        system_prompt = advisor.build_system_prompt(thread_subject=ticker, current_thread_id=active_thread)
         response = await run_in_executor(
             advisor.chat, active_thread, f"Context refresh for {ticker}:\n{context_str}",
             system_prompt, ticker,
@@ -726,7 +743,7 @@ async def handle_callback(update, context):
             if active_thread and check_claude_rate_limit():
                 thread_info = thread_manager.get_thread_info(active_thread)
                 subject = thread_info["subject"] if thread_info else None
-                system_prompt = advisor.build_system_prompt(thread_subject=subject)
+                system_prompt = advisor.build_system_prompt(thread_subject=subject, current_thread_id=active_thread)
                 await context.bot.send_chat_action(chat_id=chat_id, action="typing")
                 response = await run_in_executor(
                     advisor.chat, active_thread, suggestions[idx], system_prompt, subject
@@ -836,8 +853,25 @@ async def handle_message(update, context):
         await start_or_resume_discussion(message_text.strip().upper(), update, context)
         return
 
-    # Priority 3: active conversation thread
     active_thread = thread_manager.get_active_thread(user_id)
+
+    # Priority 2d: brief-related keyword outside the BRIEF thread, when no
+    # brief has EVER been run — nudge toward /brief rather than letting
+    # Claude answer with zero brief context. A brief from a prior day is NOT
+    # gated here: the advisor's cross-thread context (get_recent_briefs(),
+    # recency-weighted) already surfaces it and can say e.g. "the most
+    # recent brief I have is from yesterday" naturally.
+    if active_thread != "topic_BRIEF":
+        text_lower = message_text.lower()
+        if any(kw in text_lower for kw in ("brief", "morning", "synthesis", "snapshot")):
+            last_brief = get_last_brief_synthesis(thread_manager)
+            if not last_brief:
+                await reply(update, context,
+                    "No morning brief has been generated yet. Run /brief to generate one."
+                )
+                return
+
+    # Priority 3: active conversation thread
     if not active_thread:
         await reply(update, context,
             "No active discussion. Choose one:",
@@ -855,7 +889,7 @@ async def handle_message(update, context):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     thread_info = thread_manager.get_thread_info(active_thread)
     subject = thread_info["subject"] if thread_info else None
-    system_prompt = advisor.build_system_prompt(thread_subject=subject)
+    system_prompt = advisor.build_system_prompt(thread_subject=subject, current_thread_id=active_thread)
     response = await run_in_executor(
         advisor.chat, active_thread, message_text, system_prompt, subject
     )
@@ -920,6 +954,7 @@ async def handle_unknown_command(update, context):
 async def scheduled_morning_brief(context):
     try:
         sections = await run_in_executor(build_morning_brief)
+        await run_in_executor(save_brief_to_thread, sections, thread_manager)
         for text, keyboard in sections:
             if text and text.strip():
                 await send_safe(context.bot, TELEGRAM_USER_ID, text, reply_markup=keyboard)

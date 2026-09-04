@@ -33,7 +33,7 @@ work.
 
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from telegram import InlineKeyboardMarkup
@@ -211,6 +211,120 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     sections.append((f"Generated {ts}\nReply /discuss TICKER for a deep dive.", make_main_menu()))
 
     return sections
+
+
+def save_brief_to_thread(sections: list[tuple[str, "InlineKeyboardMarkup | None"]], thread_manager) -> None:
+    """Persist the brief's synthesis sections to a persistent `topic_BRIEF` thread.
+
+    This is what lets `Advisor._get_cross_thread_context()` (see
+    equity.telegram.advisor) surface the morning brief in every
+    conversation — ticker, macro, portfolio, general — not just a
+    `/discuss` about the brief itself. Only the 💡-prefixed per-section
+    syntheses and the final 🎯 full-brief synthesis are saved; the raw
+    data sections (screener output, eco calendar, etc.) are already
+    available live elsewhere and would just bloat this thread's history.
+
+    Content always starts with "Morning Brief — <date>" — the advisor
+    relies on that exact prefix to find the actual brief save even if the
+    BRIEF thread has since been chatted in directly (it's switchable via
+    /switch topic_BRIEF).
+    """
+    thread_id = "topic_BRIEF"
+    thread_manager.get_or_create_thread(thread_id, "topic", "BRIEF")
+
+    synthesis_lines = [f"Morning Brief — {datetime.now().strftime('%Y-%m-%d')}", ""]
+    for text, _ in sections:
+        if text and ("💡" in text or "🎯" in text):
+            synthesis_lines.append(text.strip())
+            synthesis_lines.append("")
+
+    consolidated = "\n".join(synthesis_lines).strip()
+    thread_manager.add_message(thread_id, "assistant", consolidated)
+
+    # The advisor caches _get_cross_thread_context() for
+    # _CROSS_THREAD_CONTEXT_TTL_SECONDS (see equity.telegram.advisor) so it
+    # isn't re-querying SQLite on every chat message. That's fine for the
+    # scheduled run, but a manually-triggered /brief should be visible to
+    # the advisor immediately rather than up to that TTL later — clear the
+    # cache here so the next chat message picks up the fresh brief. Local
+    # import: advisor.py imports this module (locally, inside a function)
+    # to avoid a module-level circular import, so this side stays local too.
+    try:
+        import equity.telegram.advisor as advisor_module
+
+        advisor_module._cross_thread_context_cache["text"].clear()
+        advisor_module._cross_thread_context_cache["timestamp"].clear()
+    except Exception:
+        logger.debug("save_brief_to_thread: could not invalidate advisor cross-thread cache", exc_info=True)
+
+
+def _iter_saved_briefs(thread_manager, limit: int = 60):
+    """Yield `(date_str, content)` for every brief saved via
+    `save_brief_to_thread()`, most recent first.
+
+    Searches backwards through the `topic_BRIEF` thread for messages
+    starting with "Morning Brief — " rather than trusting message order/role
+    outright — the thread is switchable (`/switch topic_BRIEF`), so if it's
+    ever been chatted in directly, some messages are ordinary replies rather
+    than brief saves. `limit` bounds how far back to look; a brief runs at
+    most a couple of times a day (scheduled + manual /brief reruns), so 60
+    messages comfortably covers several weeks of history.
+
+    Shared by `get_last_brief_synthesis()` and `get_recent_briefs()`.
+    """
+    thread_id = "topic_BRIEF"
+    if not thread_manager.get_thread_info(thread_id):
+        return
+
+    messages = thread_manager.get_messages_for_api(thread_id, recent_verbatim=limit)
+    for m in reversed(messages):
+        content = m.get("content", "")
+        if m.get("role") == "assistant" and content.startswith("Morning Brief — "):
+            date_str = content.splitlines()[0].removeprefix("Morning Brief — ").strip()
+            yield date_str, content
+
+
+def get_last_brief_synthesis(thread_manager) -> tuple[str, str] | None:
+    """Return `(date_str, consolidated_text)` for the most recent brief saved
+    via `save_brief_to_thread()`, or `None` if the brief has never been run
+    (regardless of how long ago — callers that care about staleness compare
+    `date_str` to today themselves).
+
+    Shared by `equity.telegram.advisor.Advisor._get_cross_thread_context()`
+    and `equity.telegram.bot`'s BRIEF thread view.
+    """
+    for date_str, content in _iter_saved_briefs(thread_manager, limit=30):
+        return date_str, content
+    return None
+
+
+def get_recent_briefs(thread_manager, days_back: int = 7) -> list[tuple[str, str]]:
+    """Return `(date_str, content)` for each of the last `days_back` days
+    that has a saved brief, most recent first — unlike
+    `get_last_brief_synthesis()`, which stops at the single latest one.
+
+    Used by `equity.telegram.advisor.Advisor` to build a recency-weighted
+    brief history (full text for today/yesterday, condensed for older days)
+    so a conversation still has brief context on a day the brief hasn't run
+    yet, without silently treating a week-old brief as current. A day with
+    more than one save (e.g. /brief run manually after the scheduled run
+    already fired) contributes only its most recent save.
+    """
+    cutoff = date.today() - timedelta(days=days_back)
+    seen_dates: set[str] = set()
+    results = []
+    for date_str, content in _iter_saved_briefs(thread_manager):
+        if date_str in seen_dates:
+            continue
+        try:
+            brief_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if brief_date < cutoff:
+            break
+        seen_dates.add(date_str)
+        results.append((date_str, content))
+    return results
 
 
 def get_regime_adjusted_screener_params() -> dict:

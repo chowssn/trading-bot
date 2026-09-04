@@ -11,8 +11,6 @@ import logging
 import random
 import re
 import time
-from datetime import datetime
-from pathlib import Path
 
 import anthropic
 import pandas as pd
@@ -37,13 +35,16 @@ MODEL = "claude-sonnet-4-6"
 _PORTFOLIO_CONTEXT_TTL_SECONDS = 900  # 15 minutes
 _portfolio_context_cache: dict = {"text": None, "timestamp": 0.0}
 
-# Same idea for _get_recent_brief_synthesis() — the morning brief doesn't
-# change during the day, so there's no reason to re-glob/re-read the briefs
-# directory on every chat message.
-_BRIEF_SYNTHESIS_TTL_SECONDS = 3600  # 1 hour
-_brief_synthesis_cache: dict = {"text": None, "timestamp": 0.0}
+# Same idea for _get_cross_thread_context() — it queries SQLite (thread
+# list + brief thread messages) but threads don't change that frequently
+# mid-conversation. Keyed by current_thread_id since "other active
+# threads" differs depending on who's asking.
+_CROSS_THREAD_CONTEXT_TTL_SECONDS = 300  # 5 minutes
+_cross_thread_context_cache: dict = {"text": {}, "timestamp": {}}
 
-_BRIEFS_DIR = Path(__file__).resolve().parents[1] / "data" / "briefs"
+# Thread ID `brief_builder.save_brief_to_thread()` writes the morning
+# brief's synthesis sections to — must match the literal there.
+_BRIEF_THREAD_ID = "topic_BRIEF"
 
 _FRAMEWORK = """--- Investment Framework ---
 Liquidity-first, macro-aware, quality-at-discount strategy.
@@ -77,7 +78,10 @@ class Advisor:
     # ------------------------------------------------------------------
 
     def build_system_prompt(
-        self, thread_subject: str | None = None, include_positions: bool = True
+        self,
+        thread_subject: str | None = None,
+        include_positions: bool = True,
+        current_thread_id: str | None = None,
     ) -> str:
         sections = [_FRAMEWORK]
 
@@ -126,9 +130,9 @@ class Advisor:
             logger.warning("build_system_prompt: portfolio context failed: %s", exc)
             sections.append("--- PORTFOLIO DATA UNAVAILABLE ---")
 
-        brief_synthesis = self._get_recent_brief_synthesis()
-        if brief_synthesis:
-            sections.append(brief_synthesis)
+        cross_thread_ctx = self._get_cross_thread_context(current_thread_id=current_thread_id)
+        if cross_thread_ctx:
+            sections.append(cross_thread_ctx)
 
         return "\n\n".join(sections)
 
@@ -246,60 +250,94 @@ class Advisor:
 
         return "\n".join(lines)
 
-    def _get_recent_brief_synthesis(self) -> str:
-        """Cached wrapper around `_get_recent_brief_synthesis_uncached()`."""
+    def _get_cross_thread_context(self, current_thread_id: str | None = None) -> str:
+        """Cached wrapper around `_get_cross_thread_context_uncached()`."""
+        cache_key = current_thread_id or "none"
         now = time.time()
-        cached_text = _brief_synthesis_cache["text"]
-        if cached_text is not None and now - _brief_synthesis_cache["timestamp"] < _BRIEF_SYNTHESIS_TTL_SECONDS:
+        cached_text = _cross_thread_context_cache["text"].get(cache_key)
+        cached_ts = _cross_thread_context_cache["timestamp"].get(cache_key, 0)
+        if cached_text is not None and now - cached_ts < _CROSS_THREAD_CONTEXT_TTL_SECONDS:
             return cached_text
 
-        result = self._get_recent_brief_synthesis_uncached()
-        _brief_synthesis_cache["text"] = result
-        _brief_synthesis_cache["timestamp"] = now
+        result = self._get_cross_thread_context_uncached(current_thread_id)
+        _cross_thread_context_cache["text"][cache_key] = result
+        _cross_thread_context_cache["timestamp"][cache_key] = now
         return result
 
-    def _get_recent_brief_synthesis_uncached(self) -> str:
-        """Load the MORNING SYNTHESIS section from the most recent saved brief.
+    def _get_cross_thread_context_uncached(self, current_thread_id: str | None = None) -> str:
+        """Build cross-thread context: recency-weighted brief history + a peek at other active threads.
 
-        `brief_builder.py` only writes `brief_<date>.txt` when run standalone
-        (there's no cron wired up in this repo yet), so a file for today
-        often won't exist — this falls back to the most recent brief on disk
-        rather than requiring an exact date match, and labels the date it's
-        from so Claude doesn't mistake a stale synthesis for this morning's.
-        Returns "" if no brief file exists or the section can't be found.
+        Gives every conversation — ticker, macro, portfolio, general —
+        awareness of the morning brief and what's been discussed elsewhere,
+        so Claude doesn't contradict a conclusion already reached in
+        another thread. `current_thread_id` (the actual thread id, e.g.
+        "ticker_APP" — not just the subject) is excluded from "other
+        threads" so a thread never cites itself as cross-reference.
         """
-        try:
-            candidates = sorted(_BRIEFS_DIR.glob("brief_*.txt"), reverse=True)
-        except OSError as exc:
-            logger.warning("_get_recent_brief_synthesis: could not list %s: %s", _BRIEFS_DIR, exc)
-            return ""
-        if not candidates:
-            return ""
+        lines = []
 
-        brief_path = candidates[0]
-        brief_date = brief_path.stem.removeprefix("brief_")
+        # brief_builder.get_recent_briefs() does the "search backwards past
+        # any chat replies for the actual brief saves" logic once, shared
+        # with bot.py's brief-freshness check and its BRIEF thread view
+        # (/switch topic_BRIEF). Recency-weighted rather than "today's brief
+        # only" so a conversation still has brief context on a day the
+        # brief hasn't run yet — the advisor can say "the most recent brief
+        # I have is from yesterday" instead of having nothing at all.
+        from datetime import datetime
 
-        try:
-            content = brief_path.read_text()
-        except OSError as exc:
-            logger.warning("_get_recent_brief_synthesis: could not read %s: %s", brief_path, exc)
-            return ""
+        from equity.brief.brief_builder import get_recent_briefs
 
-        # brief_builder.py wraps the header itself in a "════" banner
-        # (i.e. the section looks like "🎯 MORNING SYNTHESIS\n════...\n<body>"),
-        # so we skip past that closing divider and capture the body,
-        # stopping at the "Generated HH:MM / Reply /discuss TICKER" footer
-        # it appends right after this section, or end of string.
-        match = re.search(
-            r"🎯 MORNING SYNTHESIS\s*\n═+\s*\n(.*?)(?=\nGenerated |\Z)", content, re.DOTALL
-        )
-        if not match:
-            return ""
+        recent_briefs = get_recent_briefs(self.thread_manager, days_back=7)
+        if recent_briefs:
+            today = datetime.now().date()
+            lines.append("--- MORNING BRIEF HISTORY (most recent first) ---")
+            for date_str, content in recent_briefs:
+                brief_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                days_ago = (today - brief_date).days
 
-        synthesis = match.group(1).strip()[:1500]  # cap at 1500 chars
-        today = datetime.now().strftime("%Y-%m-%d")
-        label = "this morning" if brief_date == today else f"{brief_date} — not today, may be stale"
-        return f"--- MORNING BRIEF SYNTHESIS ({label}) ---\n{synthesis}\n"
+                if days_ago <= 0:
+                    label, max_chars = "TODAY", 2000
+                elif days_ago == 1:
+                    label, max_chars = "YESTERDAY", 2000
+                elif days_ago <= 3:
+                    label, max_chars = f"{days_ago} DAYS AGO", 500
+                else:
+                    label, max_chars = f"{days_ago} DAYS AGO (summary only)", 150
+
+                lines.append(f"\n[{label} — {date_str}]")
+                lines.append(content[:max_chars])
+                if len(content) > max_chars:
+                    lines.append("...(truncated)")
+            lines.append("")
+
+        all_threads = self.thread_manager.list_threads()
+        other_threads = [
+            t
+            for t in all_threads
+            if t["thread_id"] != current_thread_id
+            and t["thread_id"] != _BRIEF_THREAD_ID
+            and t.get("message_count", 0) > 0
+        ]
+
+        if other_threads:
+            lines.append("--- RECENT ACTIVITY IN OTHER THREADS ---")
+            lines.append("(For cross-reference — use these to avoid contradicting prior discussions)")
+            lines.append("")
+
+            for thread in other_threads[:5]:  # cap to keep the prompt bounded
+                thread_id = thread["thread_id"]
+                subject = thread.get("subject", thread_id)
+                last_active = thread.get("last_active", "unknown")
+                msg_count = thread.get("message_count", 0)
+
+                recent_msgs = self.thread_manager.get_messages_for_api(thread_id, recent_verbatim=2)
+                if recent_msgs:
+                    last_msg = recent_msgs[-1].get("content", "")[:300]
+                    lines.append(f"Thread: {subject} ({msg_count} messages, last active {last_active})")
+                    lines.append(f"Last discussed: {last_msg}...")
+                    lines.append("")
+
+        return "\n".join(lines) if lines else ""
 
     # ------------------------------------------------------------------
     # Ticker / regime context
