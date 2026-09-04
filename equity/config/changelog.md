@@ -15,3 +15,4 @@
 ## 2026-09-04
 - positions.py: ONON removed from watchlist — Removed via Telegram
 - positions.py: SMFG added to watchlist — Added via Telegram advisor
+- positions.py: ONON added to watchlist — Added via Telegram advisor
