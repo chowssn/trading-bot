@@ -326,6 +326,30 @@ def save_thesis_update(ticker: str, updates: dict, reason: str) -> bool:
         return False
 
 
+def update_position_tier(ticker: str, tier_v2: str, style: str,
+                          classification_status: str, reason: str) -> bool:
+    """Update tier_v2/style/classification_status for a position and commit.
+
+    Writes through `save_thesis_update()` (positions_override.json merge
+    layer), so this shares its git-commit + changelog + reload behavior.
+    Called after an advisor discussion leads to reclassification under the
+    POSITION_TIERS framework (see market_config.py). Returns True on
+    success, False (logged) on any failure.
+    """
+    ticker = ticker.upper()
+    updates = {
+        "tier_v2": tier_v2,
+        "style": style,
+        "classification_status": classification_status,
+    }
+    result = save_thesis_update(ticker, updates, reason)
+    if result:
+        append_changelog(
+            f"{ticker} reclassified to {tier_v2} ({style}) — {reason}"
+        )
+    return result
+
+
 def add_to_watchlist(ticker: str, position_dict: dict, reason: str) -> bool:
     """Add a new ticker to WATCHLIST via positions_override.json and commit.
 

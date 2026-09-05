@@ -159,6 +159,31 @@ POSITION_SECTOR_MAP = {
     'PGR':  'XLF',    # financials ETF
     'UMAC': 'XLI',    # industrials ETF
     'APP':  'XLC',    # communication services ETF
+    'ABT': 'XLV',    # healthcare ETF
+    'ADP': 'XLK',    # tech ETF
+    'AMD': 'XLK',    # tech ETF
+    'AMZN': 'XLY',    # consumer discretionary ETF
+    'ANET': 'XLK',    # tech ETF
+    'BSX': 'XLV',    # healthcare ETF
+    'BYDDY': 'XLY',    # consumer discretionary ETF
+    'CAT': 'XLI',    # industrials ETF
+    'CTAS': 'XLI',    # industrials ETF
+    'FCX': 'XLB',    # materials ETF
+    'GOOGL': 'XLC',    # communication services ETF
+    'HLI': 'XLF',    # financials ETF
+    'JKHY': 'XLK',    # tech ETF
+    'META': 'XLC',    # communication services ETF
+    'MRK': 'XLV',    # healthcare ETF
+    'NUE': 'XLB',    # materials ETF
+    'NVDA': 'XLK',    # tech ETF
+    'PLTR': 'XLK',    # tech ETF
+    'PWR': 'XLI',    # industrials ETF
+    'QBTS': 'XLK',    # tech ETF
+    'RDDT': 'XLC',    # communication services ETF
+    'TSLA': 'XLY',    # consumer discretionary ETF
+    'TSM': 'XLK',    # tech ETF
+    'VRT': 'XLI',    # industrials ETF
+    'ZTS': 'XLV',    # healthcare ETF
 }
 
 # SLV/GLD ratio — risk-on indicator
@@ -354,3 +379,72 @@ VOLUME_UP_DOWN_RATIO_MIN = 1.1       # buying pressure: up-day volume / down-day
 # ============================================================
 RETURN_3M_SHARP_DROP = -15.0         # flag as recent sharp drop if 3M return < this
 RETURN_3M_GRADUAL_GRIND = -5.0       # flag as slow grind if 1Y bad but 3M only slightly negative
+
+# ============================================================
+# POSITION TIER FRAMEWORK
+# Developed: 2026-09
+# Reformulation rule: thesis development may suggest reclassification — no position is locked
+# ============================================================
+
+POSITION_TIERS = {
+    'core_compounder': {
+        'label': 'Core — Compounder',
+        'behavior': 'Buy dips, thesis-based exits, let run',
+        'max_size_pct': 6.0,
+        'min_size_pct': 4.0,
+        'description': 'High-quality compounding businesses held for multi-year thesis delivery',
+        'exit_rule': 'Thesis broken only — not price target',
+    },
+    'core_macro': {
+        'label': 'Core — Macro/Structural',
+        'behavior': 'Hold through volatility, defined thesis-breakers',
+        'max_size_pct': 5.0,
+        'min_size_pct': 3.0,
+        'description': 'Positions driven by macro or structural thesis — regime-dependent',
+        'exit_rule': 'Thesis-breaker triggered or regime shift',
+    },
+    'tactical': {
+        'label': 'Tactical — Range Trade',
+        'behavior': 'Active management, defined levels',
+        'max_size_pct': 5.0,
+        'min_size_pct': 2.0,
+        'description': 'Range-bound or mean-reversion trades with defined entry/exit levels',
+        'exit_rule': 'Price target or defined level breach',
+    },
+    'speculative_high': {
+        'label': 'Speculative — High Conviction',
+        'behavior': 'Sized for asymmetric upside',
+        'max_size_pct': 3.0,
+        'min_size_pct': 1.0,
+        'description': 'High-conviction speculative positions with asymmetric payoff potential',
+        'exit_rule': 'Thesis broken or target reached',
+    },
+    'speculative_exploratory': {
+        'label': 'Speculative — Exploratory',
+        'behavior': 'Small, documented, learning position',
+        'max_size_pct': 1.5,
+        'min_size_pct': 0.5,
+        'description': 'Small exploratory positions to build knowledge before sizing up',
+        'exit_rule': 'Discretionary — thesis development or stop-loss',
+    },
+}
+
+# Secondary classification dimension
+POSITION_STYLES = {
+    'growth':    'Growth — earnings/revenue expansion primary driver',
+    'value':     'Value — multiple expansion or mean reversion primary driver',
+    'defensive': 'Defensive — capital preservation, low correlation to risk assets',
+    'macro':     'Macro — regime/thematic driver dominates fundamentals',
+    'commodity': 'Commodity — physical asset price is primary driver',
+}
+
+# Classification status for tracking thesis completion
+CLASSIFICATION_STATUS = {
+    'complete':   '✅ Classified + thesis documented',
+    'needs_thesis': '✅ Classified, thesis needed',
+    'tentative':  '⚠️ Classification tentative, thesis needed',
+    'unclassified': '🔴 Unclassified, no thesis',
+}
+
+# Position sizing alerts — flag when position is outside tier bounds
+POSITION_SIZE_ALERT_ENABLED = True

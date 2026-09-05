@@ -2,6 +2,7 @@
   "POSITIONS": {
     "ABT": {
       "avg_cost": 95.57,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 3548.63,
@@ -9,14 +10,18 @@
       "sector": "Healthcare",
       "shares": 32.123,
       "size_pct": 4.48,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "ADP": {
       "avg_cost": 195.29,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 283.52,
@@ -24,14 +29,18 @@
       "sector": "Information Technology",
       "shares": 1.0071,
       "size_pct": 0.36,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "AMD": {
       "avg_cost": 114.68,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 456.21,
@@ -39,14 +48,18 @@
       "sector": "Information Technology",
       "shares": 1.0,
       "size_pct": 0.58,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "AMZN": {
       "avg_cost": 209.58,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2808.85,
@@ -54,14 +67,18 @@
       "sector": "Consumer Cyclical",
       "shares": 11.0,
       "size_pct": 3.55,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "ANET": {
       "avg_cost": 134.42,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2602.6,
@@ -69,11 +86,14 @@
       "sector": "Information Technology",
       "shares": 14.0,
       "size_pct": 3.28,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "APP": {
       "avg_cost": 300.0,
@@ -84,6 +104,7 @@
     },
     "BSX": {
       "avg_cost": 57.46,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2911.2,
@@ -91,14 +112,18 @@
       "sector": "Healthcare",
       "shares": 60.0,
       "size_pct": 3.68,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "BYDDY": {
       "avg_cost": 10.54,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1690.99,
@@ -106,14 +131,18 @@
       "sector": "Consumer Cyclical",
       "shares": 155.2791,
       "size_pct": 2.14,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "CAT": {
       "avg_cost": 311.2,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2431.3,
@@ -121,11 +150,14 @@
       "sector": "Industrials",
       "shares": 3.0737,
       "size_pct": 3.07,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "CCJ": {
       "avg_cost": 87.05,
@@ -141,6 +173,7 @@
     },
     "CTAS": {
       "avg_cost": 167.27,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1587.24,
@@ -148,14 +181,18 @@
       "sector": "Industrials",
       "shares": 8.0127,
       "size_pct": 2.0,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "EWW": {
       "avg_cost": 59.84,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 321.25,
@@ -163,14 +200,18 @@
       "sector": "Emerging Markets",
       "shares": 4.2148,
       "size_pct": 0.41,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "FCX": {
       "avg_cost": 54.74,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2120.07,
@@ -178,14 +219,18 @@
       "sector": "Basic Materials",
       "shares": 28.6779,
       "size_pct": 2.68,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "GOOGL": {
       "avg_cost": 165.15,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 3744.95,
@@ -193,14 +238,18 @@
       "sector": "Communication Services",
       "shares": 11.0961,
       "size_pct": 4.73,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "HLI": {
       "avg_cost": 128.32,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1998.15,
@@ -208,14 +257,18 @@
       "sector": "Financials",
       "shares": 15.0,
       "size_pct": 2.52,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "JKHY": {
       "avg_cost": 123.25,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 334.06,
@@ -223,14 +276,18 @@
       "sector": "Information Technology",
       "shares": 2.0,
       "size_pct": 0.42,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "META": {
       "avg_cost": 533.21,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 596.0,
@@ -238,14 +295,18 @@
       "sector": "Communication Services",
       "shares": 1.0,
       "size_pct": 0.75,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "MRK": {
       "avg_cost": 79.66,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 319.43,
@@ -253,11 +314,14 @@
       "sector": "Healthcare",
       "shares": 2.1065,
       "size_pct": 0.4,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "MSFT": {
       "avg_cost": 373.43,
@@ -267,6 +331,7 @@
     },
     "NUE": {
       "avg_cost": 123.15,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 906.79,
@@ -274,14 +339,18 @@
       "sector": "Basic Materials",
       "shares": 3.436,
       "size_pct": 1.14,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "NVDA": {
       "avg_cost": 98.08,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1348.22,
@@ -289,11 +358,14 @@
       "sector": "Information Technology",
       "shares": 6.0167,
       "size_pct": 1.71,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "PGR": {
       "avg_cost": 207.55,
@@ -303,6 +375,7 @@
     },
     "PLTR": {
       "avg_cost": 125.52,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2553.6,
@@ -310,14 +383,18 @@
       "sector": "Information Technology",
       "shares": 15.0,
       "size_pct": 3.22,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "PPLT": {
       "avg_cost": 14.04,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 638.4,
@@ -325,14 +402,18 @@
       "sector": "Precious Metals",
       "shares": 40.0,
       "size_pct": 0.81,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "PWR": {
       "avg_cost": 239.4,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 612.67,
@@ -340,14 +421,18 @@
       "sector": "Industrials",
       "shares": 1.0011,
       "size_pct": 0.77,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "QBTS": {
       "avg_cost": 16.89,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1478.7,
@@ -355,14 +440,18 @@
       "sector": "Information Technology",
       "shares": 90.0,
       "size_pct": 1.87,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "QQQ": {
       "avg_cost": 450.76,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2.05,
@@ -370,14 +459,18 @@
       "sector": "Technology",
       "shares": 0.0029,
       "size_pct": 0.0,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "RDDT": {
       "avg_cost": 143.76,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 4555.61,
@@ -385,14 +478,18 @@
       "sector": "Communication Services",
       "shares": 29.0,
       "size_pct": 5.75,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "SKHY": {
       "avg_cost": 156.63,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1146.6,
@@ -400,14 +497,18 @@
       "sector": "Technology",
       "shares": 7.0,
       "size_pct": 1.45,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "SMH": {
       "avg_cost": 186.57,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 1675.15,
@@ -415,14 +516,18 @@
       "sector": "Semiconductors",
       "shares": 3.0593,
       "size_pct": 2.12,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "SPY": {
       "avg_cost": 512.22,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 12.15,
@@ -430,14 +535,18 @@
       "sector": "Broad Market",
       "shares": 0.0159,
       "size_pct": 0.02,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "TLT": {
       "avg_cost": 83.83,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 5963.78,
@@ -445,14 +554,18 @@
       "sector": "Government Bond",
       "shares": 72.7912,
       "size_pct": 7.53,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "TSLA": {
       "avg_cost": 318.96,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 4622.15,
@@ -460,14 +573,18 @@
       "sector": "Consumer Cyclical",
       "shares": 13.0,
       "size_pct": 5.84,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "TSM": {
       "avg_cost": 177.96,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 857.64,
@@ -475,11 +592,14 @@
       "sector": "Information Technology",
       "shares": 2.0701,
       "size_pct": 1.08,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "UMAC": {
       "avg_cost": 18.73,
@@ -489,6 +609,7 @@
     },
     "VRT": {
       "avg_cost": 119.42,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 265.07,
@@ -496,14 +617,18 @@
       "sector": "Industrials",
       "shares": 1.0347,
       "size_pct": 0.33,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     },
     "ZTS": {
       "avg_cost": 73.03,
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "",
       "market_value": 2919.02,
@@ -511,18 +636,24 @@
       "sector": "Healthcare",
       "shares": 38.0,
       "size_pct": 3.69,
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "",
       "thesis": "Imported from IBKR \u2014 update via /update TICKER",
       "thesis_breakers": [],
       "thesis_source": "ibkr_import",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     }
   },
   "WATCHLIST": {
     "CDNS": {
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "CDNS sits at the intersection of two durable macro thematics: AI infrastructure buildout and semiconductor sovereignty. Both drive sustained design activity regardless of near-term consumer chip cycles. Higher rates pressure the multiple but do not impair the business model \u2014 recurring subscription revenue is sticky through cycles. The primary macro risk is a hard landing that causes enterprise R&D budget freezes, but even in 2020 Cadence held revenue flat, demonstrating defensive characteristics. Dollar strength is a mild headwind given international revenue mix. Overall the macro setup is cautiously constructive \u2014 rate plateau or pivot removes the multiple headwind while AI chip complexity tailwinds remain intact.",
       "sector": "Technology",
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "Exit or significantly reduce if: (1) two consecutive quarters of organic ARR growth below 8% with guidance cuts, signaling real design activity slowdown not just conservatism; (2) Synopsys acquires a transformative AI-EDA platform that shifts competitive dynamics materially; (3) China revenue restrictions expand to cover substantially all semiconductor IP licensing; (4) Forward EV/FCF re-rates above 55x on euphoria without commensurate earnings acceleration, making risk-reward unfavorable. Do not exit on multiple compression alone if recurring revenue growth and ROIC remain intact.",
       "thesis": "Cadence Design Systems (CDNS) is a high-quality EDA and IP platform business with deep structural moats \u2014 switching costs are extraordinarily high as chip design workflows are deeply embedded in customer R&D pipelines, and ROIC consistently runs above 30%. Revenue is ~90% recurring via subscriptions, giving visibility most software businesses envy. The stock has de-rated meaningfully from peak multiples alongside broader software multiple compression and near-term hyperscaler capex uncertainty, creating a rare opportunity to own a best-in-class compounder at a relative discount. AI-driven chip complexity (custom silicon, advanced packaging, chiplets) is a secular tailwind that structurally expands Cadence's TAM \u2014 more complex chips require more EDA hours and IP licensing. The business also benefits from the Systems Design and Analysis segment growing faster than core EDA, diversifying revenue. At current levels, the market is pricing in stagnation that the underlying design activity pipeline does not support.",
       "thesis_breakers": [
@@ -533,12 +664,16 @@
         "Execution stumbles in the Systems Analysis segment (Clarity, Celsius, Optimality) that prevent diversification away from traditional EDA and disappoint growth expectations"
       ],
       "thesis_source": "ai_assisted",
-      "tier": "high_conviction"
+      "tier": "high_conviction",
+      "tier_v2": ""
     },
     "SMFG": {
+      "classification_status": "unclassified",
       "last_reviewed": "2026-09",
       "macro_thesis": "Japan is undergoing its most significant monetary regime shift in 30 years. The BOJ's gradual rate normalization is a structural tailwind for Japanese bank earnings that is still early innings. Inflation in Japan, while moderate, appears sticky enough to keep the BOJ on a tightening path. Global investors remain underweight Japanese financials relative to historical norms, and domestic institutional flows are rotating into value and dividend-paying equities under the Tokyo Stock Exchange's push for improved capital efficiency and ROE. A weaker yen environment has also boosted overseas earnings in yen terms. Meanwhile, global rate curves remaining elevated support SMFG's wholesale and treasury operations. The macro setup \u2014 reflation, rate normalization, governance reform pressure, and underweight positioning \u2014 is unusually aligned for a megabank re-rating.",
       "sector": "Financials",
+      "size_target_pct": null,
+      "style": "",
       "target_exit_conditions": "Exit if BOJ pivots back to easing and forward NIM guidance deteriorates materially. Also exit if price-to-book re-rates above 1.3x without corresponding earnings growth, signaling sentiment overshoot rather than fundamental improvement. Trim on significant yen appreciation beyond 130 USD/JPY that structurally impairs the USD return thesis. Full exit if dividend growth stalls or buybacks are suspended indicating capital stress. Thesis is based on gradual re-rating and income compounding \u2014 not a momentum trade.",
       "thesis": "SMFG (Sumitomo Mitsui Financial Group) is a structurally sound Japanese megabank benefiting from the Bank of Japan's historic policy normalization after decades of zero or negative interest rates. With ROIC improving materially as net interest margins expand, SMFG trades at roughly 0.8-1.0x book value \u2014 a discount to Western peers despite a cleaner balance sheet, rising dividends, and an aggressive share buyback program. The market has partially re-rated Japanese financials but sentiment remains cautious due to yen volatility and China exposure fears, creating a quality-at-discount entry for patient capital. Structural tailwinds include domestic loan repricing, growing wealth management revenue, and a strategic push into Asian emerging markets through subsidiaries like SMBC. The 1Y return has lagged broader global financials on yen-hedging friction and macro uncertainty \u2014 exactly the dislocation this framework targets.",
       "thesis_breakers": [
@@ -549,7 +684,8 @@
         "Governance regression or significant capital allocation failure such as a large dilutive acquisition at a poor price that destroys book value per share trajectory"
       ],
       "thesis_source": "ai_assisted",
-      "tier": "core"
+      "tier": "core",
+      "tier_v2": ""
     }
   }
 }

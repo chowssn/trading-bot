@@ -83,7 +83,7 @@ class Advisor:
         include_positions: bool = True,
         current_thread_id: str | None = None,
     ) -> str:
-        sections = [_FRAMEWORK]
+        sections = [_FRAMEWORK, self._get_framework_context()]
 
         if include_positions:
             lines = ["--- Current Positions ---"]
@@ -135,6 +135,25 @@ class Advisor:
             sections.append(cross_thread_ctx)
 
         return "\n\n".join(sections)
+
+    def _get_framework_context(self) -> str:
+        """POSITION_TIERS framework definition, always included in the system
+        prompt so sizing/hold/trim/add recommendations stay consistent with
+        the tiers tracked in market_config.py and positions_override.json.
+        """
+        from equity.config.market_config import POSITION_TIERS
+
+        lines = ["--- POSITION TIER FRAMEWORK ---"]
+        lines.append("Use this framework when making sizing, hold/trim/add recommendations:")
+        lines.append("")
+        for tier in POSITION_TIERS.values():
+            lines.append(f'{tier["label"]}:')
+            lines.append(f'  Behavior: {tier["behavior"]}')
+            lines.append(f'  Size: {tier["min_size_pct"]}-{tier["max_size_pct"]}%')
+            lines.append(f'  Exit: {tier["exit_rule"]}')
+            lines.append("")
+        lines.append("Reformulation rule: thesis development may suggest reclassification — no position is locked.")
+        return "\n".join(lines)
 
     def _build_full_portfolio_context(self) -> str:
         """Cached wrapper around `_build_full_portfolio_context_uncached()`.
@@ -682,7 +701,38 @@ class Advisor:
         self.thread_manager.add_message(thread_id, "assistant", text)
         self.thread_manager.auto_summarize_thread(thread_id, self.summarize_messages)
 
-        return text
+        return self._append_save_suggestion(text, thread_subject)
+
+    _CONCLUSION_SIGNALS = (
+        "in summary", "to summarize", "conclusion", "final view",
+        "recommendation:", "verdict:", "bottom line",
+        "thesis is", "would classify", "tier:", "core compounder",
+        "speculative", "tactical",
+    )
+
+    def _append_save_suggestion(self, response_text: str, thread_subject: str | None) -> str:
+        """Append a save-conclusions nudge when a response reads like it reached a
+        conclusion, for a thread whose subject is an actual held/watchlisted ticker.
+
+        Only affects what's returned to the chat UI — the unmodified `response_text`
+        is what was already persisted to thread history above, so this nudge never
+        pollutes future context or gets summarized into it.
+        """
+        if not thread_subject:
+            return response_text
+        ticker = thread_subject.upper()
+        if ticker not in positions_config.POSITIONS and ticker not in positions_config.WATCHLIST:
+            return response_text
+
+        response_lower = response_text.lower()
+        if not any(signal in response_lower for signal in self._CONCLUSION_SIGNALS):
+            return response_text
+
+        return response_text + (
+            f"\n\n---\n💾 *Ready to save these conclusions?*\n"
+            f"Tap [💾 Update Thesis] below or type `/save {ticker}` "
+            f"to draft a structured update from this discussion."
+        )
 
     def summarize_messages(self, messages: list[dict]) -> str:
         try:
@@ -743,22 +793,22 @@ class Advisor:
             logger.error("draft_thesis: failed for %s: %s", ticker, exc)
             return empty
 
-    def _parse_thesis_json(self, response_text: str) -> dict:
-        """Robustly extract thesis JSON from a Claude response.
+    def _extract_json_object(self, response_text: str) -> dict | None:
+        """Shared JSON-extraction core for Claude responses expected to be one JSON object.
 
         Tries multiple strategies in order:
         1. Direct json.loads() on the full response
         2. Extract JSON from a markdown code block (```json ... ```)
         3. Extract content between the first { and the last }
-        4. Return a fallback dict on all failures
+        Returns None if none of that parses — callers decide what a failed
+        extraction means for their own field schema (a fallback dict here,
+        an empty dict there).
         """
-        # Strategy 1: direct parse
         try:
             return json.loads(response_text.strip())
         except json.JSONDecodeError:
             pass
 
-        # Strategy 2: extract from code block
         match = re.search(r"```(?:json)?\s*(.*?)\s*```", response_text, re.DOTALL)
         if match:
             try:
@@ -766,7 +816,6 @@ class Advisor:
             except json.JSONDecodeError:
                 pass
 
-        # Strategy 3: extract between first { and last }
         start = response_text.find("{")
         end = response_text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -775,7 +824,14 @@ class Advisor:
             except json.JSONDecodeError:
                 pass
 
-        # Strategy 4: fallback
+        return None
+
+    def _parse_thesis_json(self, response_text: str) -> dict:
+        """Robustly extract draft_thesis()'s JSON from a Claude response, or a fallback dict."""
+        parsed = self._extract_json_object(response_text)
+        if parsed is not None:
+            return parsed
+
         logger.error("_parse_thesis_json: all parse strategies failed: %r", response_text[:200])
         return {
             "thesis": "Draft failed — JSON parse error. Use /discuss TICKER to draft manually.",
@@ -785,6 +841,98 @@ class Advisor:
             "tier": "speculative",
             "sector": "",
         }
+
+    def draft_position_update(self, ticker: str, conversation_history: list[dict]) -> dict:
+        """Extract a structured position update from a ticker thread's conversation history.
+
+        Called from bot.py's propose_position_save() when the user asks to
+        save discussion conclusions (/save TICKER, or the [💾 Update Thesis]
+        button). Returns a dict ready for
+        config_manager.save_thesis_update()/update_position_tier():
+        {
+            'thesis': str, 'thesis_breakers': list[str], 'macro_thesis': str,
+            'target_exit_conditions': str, 'tier_v2': str, 'style': str,
+            'classification_status': str, 'size_target_pct': float | None,
+            'last_reviewed': str,  # YYYY-MM
+        }
+
+        Returns {} (never the JSON-parse-failure text used by
+        _parse_thesis_json's fallback) on any failure, or when the
+        conversation didn't reach a clear conclusion — callers treat an
+        empty dict as "nothing to save yet" rather than writing placeholder
+        text into the thesis.
+        """
+        from datetime import datetime
+
+        from equity.config.market_config import POSITION_STYLES, POSITION_TIERS
+
+        tier_options = ", ".join(POSITION_TIERS.keys())
+        style_options = ", ".join(POSITION_STYLES.keys())
+
+        convo_text = "\n".join(
+            f'{m["role"].upper()}: {m["content"][:500]}'
+            for m in conversation_history[-20:]  # last 20 exchanges
+        )
+
+        prompt = f'''Review this investment discussion about {ticker} and extract the conclusions reached into a structured position update.
+
+CONVERSATION:
+{convo_text}
+
+Extract and return ONLY valid JSON with these exact keys:
+{{
+    "thesis": "2-3 sentence thesis statement capturing the core investment case",
+    "thesis_breakers": ["specific event 1", "specific event 2", "specific event 3"],
+    "macro_thesis": "macro/structural conditions supporting the position",
+    "target_exit_conditions": "specific conditions that would trigger exit",
+    "tier_v2": "one of: {tier_options}",
+    "style": "one of: {style_options}",
+    "classification_status": "complete",
+    "size_target_pct": null or a float between 0.5 and 6.0,
+    "last_reviewed": "{datetime.now().strftime('%Y-%m')}"
+}}
+
+Rules:
+- thesis_breakers must be specific and observable — not vague like "fundamentals deteriorate"
+- tier_v2 must exactly match one of the valid options
+- If the conversation didn't reach a clear conclusion on a field, use null or empty string
+- Return ONLY the JSON, no other text'''
+
+        try:
+            response = self.client.messages.create(
+                model=MODEL,
+                max_tokens=800,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = next((b.text for b in response.content if b.type == "text"), "")
+            parsed = self._extract_json_object(text)
+        except Exception as exc:
+            logger.error("draft_position_update failed for %s: %s", ticker, exc)
+            return {}
+
+        if not parsed or not parsed.get("thesis"):
+            logger.warning("draft_position_update: no clear conclusion extracted for %s", ticker)
+            return {}
+
+        # Guard against Claude drifting off the option list — an invalid
+        # tier_v2/style is worse than an empty one downstream (monitor.py's
+        # POSITION_TIERS.get() would silently no-op, but config_manager
+        # would still happily write the bogus value to disk).
+        if parsed.get("tier_v2") not in POSITION_TIERS:
+            parsed["tier_v2"] = ""
+        if parsed.get("style") not in POSITION_STYLES:
+            parsed["style"] = ""
+
+        size_target = parsed.get("size_target_pct")
+        if size_target is not None:
+            try:
+                parsed["size_target_pct"] = float(size_target)
+            except (TypeError, ValueError):
+                parsed["size_target_pct"] = None
+
+        parsed.setdefault("classification_status", "complete")
+        parsed.setdefault("last_reviewed", datetime.now().strftime("%Y-%m"))
+        return parsed
 
     # ------------------------------------------------------------------
     # Follow-up suggestions (pattern-based, no API call)

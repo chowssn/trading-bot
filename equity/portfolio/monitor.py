@@ -31,6 +31,7 @@ from datetime import datetime
 import yfinance as yf
 
 from equity.config import positions as positions_config
+from equity.config.market_config import POSITION_SIZE_ALERT_ENABLED, POSITION_TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ def _build_entry(ticker: str, config: dict) -> dict | None:
         "move_flag": _move_flag(change_1d_pct),
         "thesis_status": "THESIS_BREAKING" if config.get("stop_thesis") else "OK",
         "tier": config.get("tier", ""),
+        "tier_v2": config.get("tier_v2", ""),
         "sector": config.get("sector", ""),
     }
 
@@ -149,10 +151,31 @@ def _tier_label(tier: str) -> str:
     return _TIER_DISPLAY.get(tier, tier.replace("_", " ").title())
 
 
+def _size_alert_flag(size_pct: float | None, tier_config: dict) -> str:
+    """Flag when `size_pct` falls outside tier_config's min/max bounds, or '' if in bounds."""
+    max_size = tier_config.get("max_size_pct", 0)
+    min_size = tier_config.get("min_size_pct", 0)
+    if not (POSITION_SIZE_ALERT_ENABLED and size_pct and max_size):
+        return ""
+    if size_pct > max_size:
+        return f" ⚠️ oversized (>{max_size}% target)"
+    if min_size and size_pct < min_size:
+        return f" ⚠️ undersized (<{min_size}% target)"
+    return ""
+
+
 def _format_position_line(ticker: str, entry: dict) -> str:
     avg_cost = entry["avg_cost"]
     size_pct = entry["size_pct"]
     price_current = entry["price_current"]
+
+    # tier_v2 (POSITION_TIERS) supersedes the legacy `tier` string for
+    # display/sizing when a position has been classified under the new
+    # framework; positions not yet reclassified (tier_v2 unset/unknown)
+    # fall back to the old tier label with no size bounds to check.
+    tier_config = POSITION_TIERS.get(entry.get("tier_v2", ""), {})
+    tier_label = tier_config.get("label") or _tier_label(entry["tier"])
+    size_flag = _size_alert_flag(size_pct, tier_config)
 
     if avg_cost and avg_cost > 0 and price_current:
         unrealized_pct = (price_current / avg_cost - 1) * 100
@@ -164,7 +187,7 @@ def _format_position_line(ticker: str, entry: dict) -> str:
 
     return (
         f"{ticker:<5} {entry['change_1d_pct']:+.1f}%  ${price_current:.0f} | "
-        f"{size_str} | {_tier_label(entry['tier'])}"
+        f"{size_str} | {tier_label}{size_flag}"
     )
 
 

@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 from collections import defaultdict
+from datetime import datetime
 from functools import partial
 
 import yfinance as yf
@@ -167,6 +168,22 @@ def authorized_only(func):
     async def wrapper(update, context):
         if update.effective_user.id != TELEGRAM_USER_ID:
             return  # silently ignore unauthorized users
+        message_text = update.message.text if update.message and update.message.text else ""
+        # Every command (including read-only ones) carries this decorator, so
+        # it's the one choke point that sees every /command before dispatch —
+        # handle_message() never does, since its filter excludes commands.
+        # /cancel must stay exempt: it's how a pending auth actually gets
+        # resolved, and it isn't itself guarded by require_email_auth.
+        if (
+            message_text.startswith("/")
+            and not message_text.startswith("/cancel")
+            and auth_manager.is_awaiting_auth(update.effective_user.id)
+        ):
+            await reply(update, context,
+                "⚠️ You have a pending authorization. Type the 6-digit code to complete it,\n"
+                "or /cancel to abort before starting a new command."
+            )
+            return
         return await func(update, context)
     wrapper.__name__ = func.__name__
     return wrapper
@@ -321,6 +338,100 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
 
 
 # ---------------------------------------------------------------------------
+# propose_position_save — advisor-drafted thesis/tier update
+# ---------------------------------------------------------------------------
+
+async def propose_position_save(update, context, ticker: str) -> None:
+    """Drafts a structured position update from a ticker thread's discussion
+    and proposes it for confirmation.
+
+    Reachable from /save TICKER, /update TICKER (existing), and the
+    [💾 Update Thesis] ticker-actions button — all funnel through here so
+    they share one draft-then-confirm flow. Confirmation is the same email
+    2FA code used for every other write in this bot (see
+    `context.user_data["pending_auth_action"]` / handle_message's
+    'position_update' branch) rather than a separate inline button — a
+    second, unwired confirm/cancel button here would just be a dead end,
+    since the actual write only happens once the emailed code is entered.
+    """
+    if READONLY_MODE:
+        await reply(update, context,
+            "🔒 Bot is in read-only mode. "
+            "SSH to VPS and set BOT_READONLY=false to enable writes."
+        )
+        return
+
+    ticker = ticker.upper()
+    chat_id = update.effective_chat.id
+    thread_id = f"ticker_{ticker}"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📋 Drafting {ticker} position update from our discussion..."
+    )
+
+    history = thread_manager.get_messages_for_api(thread_id, recent_verbatim=30)
+    if not history:
+        await reply(update, context,
+            f"No discussion found for {ticker}. "
+            f"Start one with /discuss {ticker} first."
+        )
+        return
+
+    update_dict = await run_in_executor(
+        advisor.draft_position_update, ticker, history
+    )
+
+    if not update_dict or not update_dict.get("thesis"):
+        await reply(update, context,
+            f"Could not extract clear conclusions from the {ticker} discussion. "
+            f"Continue the discussion and try /save {ticker} again when conclusions are clearer."
+        )
+        return
+
+    from equity.config.market_config import POSITION_TIERS
+    tier_key = update_dict.get("tier_v2", "")
+    tier_label = POSITION_TIERS.get(tier_key, {}).get("label", tier_key or "unclassified")
+    breakers = update_dict.get("thesis_breakers") or []
+
+    review_text = (
+        f"📋 *Proposed update for {ticker}*\n\n"
+        f"*Thesis:*\n{update_dict.get('thesis', '')}\n\n"
+        f"*Thesis-breakers:*\n" +
+        "\n".join(f"• {b}" for b in breakers) +
+        f"\n\n*Macro thesis:*\n{update_dict.get('macro_thesis', '')}\n\n"
+        f"*Exit conditions:*\n{update_dict.get('target_exit_conditions', '')}\n\n"
+        f"*Tier:* {tier_label}\n"
+        f"*Style:* {update_dict.get('style', '') or 'unspecified'}\n"
+        f"*Size target:* {update_dict.get('size_target_pct') or 'not specified'}%\n\n"
+        f"Review carefully. Email authorization required to save."
+    )
+
+    context.user_data["pending_auth_action"] = {
+        "action": "position_update",
+        "ticker": ticker,
+        "updates": update_dict,
+    }
+
+    sent = auth_manager.send_email_code(
+        update.effective_user.id,
+        f"Update {ticker} thesis and classification"
+    )
+    if not sent:
+        context.user_data.pop("pending_auth_action", None)
+        await reply(update, context,
+            "⚠️ Failed to send auth email. Check BOT_EMAIL settings."
+        )
+        return
+
+    await send_safe(context.bot, chat_id, review_text)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="📧 Authorization code sent to your email. Enter it to confirm, or /cancel to abort."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Read-only handlers
 # ---------------------------------------------------------------------------
 
@@ -344,6 +455,7 @@ async def send_help(update, context):
         "/news — News triage for all positions\n"
         "/watchlist — Watchlist with live prices\n"
         "/threads — List discussion threads\n"
+        "/framework — Position tier framework and classification status\n"
         "/audit — Recent config changes and operations\n\n"
         "*Discussion*\n"
         "/discuss TICKER — Discuss a ticker\n"
@@ -355,6 +467,7 @@ async def send_help(update, context):
         "/add TICKER — Add to watchlist\n"
         "/remove TICKER — Remove from watchlist\n"
         "/update TICKER [field] — Update thesis\n"
+        "/save TICKER — Save discussion conclusions as a position update\n"
         "/set FIELD VALUE — Update market config\n"
         "/confirm — Approve pending change\n"
         "/cancel — Cancel pending change/auth\n"
@@ -435,6 +548,34 @@ async def send_watchlist(update, context):
     await reply(update, context,
         "\n".join(lines), reply_markup=make_discuss_menu(POSITIONS, WATCHLIST)
     )
+
+
+@authorized_only
+async def send_framework(update, context):
+    """Shows the current tier framework and classification status of all positions."""
+    from equity.config.market_config import CLASSIFICATION_STATUS, POSITION_TIERS
+
+    lines = ["📋 *POSITION FRAMEWORK*", ""]
+
+    lines.append("*TIERS*")
+    for tier in POSITION_TIERS.values():
+        lines.append(f'*{tier["label"]}* ({tier["min_size_pct"]}-{tier["max_size_pct"]}%)')
+        lines.append(f'  {tier["behavior"]}')
+        lines.append("")
+
+    lines.append("*CLASSIFICATION STATUS*")
+    status_groups: dict[str, list[str]] = {}
+    for ticker, pos in {**POSITIONS, **WATCHLIST}.items():
+        status = pos.get("classification_status", "unclassified")
+        status_groups.setdefault(status, []).append(ticker)
+
+    for status_key, label in CLASSIFICATION_STATUS.items():
+        tickers = status_groups.get(status_key, [])
+        if tickers:
+            lines.append(f'{label}: {", ".join(sorted(tickers))}')
+
+    await send_in_parts(context.bot, update.effective_chat.id,
+                         "\n".join(lines), reply_markup=make_main_menu())
 
 
 @authorized_only
@@ -618,6 +759,26 @@ async def send_set(update, context):
     await config_commands.handle_set_config(update, context, thread_manager, auth_manager)
 
 
+@authorized_only
+async def send_save(update, context):
+    """/save TICKER — draft a position update from that ticker's discussion thread.
+
+    Unlike /add, /remove, /update, /set, this doesn't go through
+    @require_email_auth: propose_position_save() sends the auth email
+    itself, after drafting, so the emailed review shows exactly what's
+    about to be saved rather than a generic "operation" description sent
+    before any content exists.
+    """
+    if not context.args:
+        await reply(update, context,
+            "Usage: /save TICKER\nExample: /save MSFT\n\n"
+            "Drafts a position update from your current discussion thread."
+        )
+        return
+    ticker = context.args[0].upper()
+    await propose_position_save(update, context, ticker)
+
+
 # ---------------------------------------------------------------------------
 # Callback query handler
 # ---------------------------------------------------------------------------
@@ -709,6 +870,9 @@ async def handle_callback(update, context):
             system_prompt, ticker,
         )
         await send_in_parts(context.bot, chat_id, response, reply_markup=make_ticker_actions(ticker))
+    elif data.startswith("ticker_update_thesis_"):
+        ticker = data[len("ticker_update_thesis_"):]
+        await propose_position_save(update, context, ticker)
     elif data.startswith("ticker_add_watchlist_"):
         ticker = data[len("ticker_add_watchlist_"):]
         context.args = [ticker]
@@ -803,6 +967,36 @@ async def handle_message(update, context):
             if action.get("action") == "add_watchlist":
                 await config_commands.execute_add_watchlist(
                     action["ticker"], update, context, advisor, thread_manager
+                )
+            elif action.get("action") == "position_update":
+                ticker = action["ticker"]
+                updates = action["updates"]
+                from equity.config.config_manager import save_thesis_update, update_position_tier
+
+                thesis_fields = {k: v for k, v in updates.items()
+                                  if k in ("thesis", "thesis_breakers", "macro_thesis",
+                                           "target_exit_conditions", "last_reviewed")}
+                if thesis_fields:
+                    save_thesis_update(ticker, thesis_fields,
+                                        f'Updated from Telegram discussion {datetime.now().strftime("%Y-%m-%d")}')
+
+                if updates.get("tier_v2"):
+                    update_position_tier(
+                        ticker,
+                        tier_v2=updates["tier_v2"],
+                        style=updates.get("style", ""),
+                        classification_status=updates.get("classification_status", "complete"),
+                        reason=f'Classified from Telegram discussion {datetime.now().strftime("%Y-%m-%d")}'
+                    )
+
+                security_logger.warning(f"WRITE_OP | position_update | ticker={ticker}")
+
+                await reply(update, context,
+                    f"✓ *{ticker} updated successfully.*\n\n"
+                    f"Thesis, tier, and classification saved.\n"
+                    f"Changes committed to git.\n\n"
+                    f"Use /discuss {ticker} to continue refining.",
+                    reply_markup=make_ticker_actions(ticker)
                 )
             elif func_name and func_name in COMMAND_REGISTRY:
                 await COMMAND_REGISTRY[func_name](update, context)
@@ -924,7 +1118,7 @@ async def handle_message(update, context):
 KNOWN_COMMANDS = [
     "discuss", "macro", "portfolio", "portfolio_review",
     "screener", "news", "brief", "watchlist", "threads",
-    "switch", "add", "remove", "update", "set",
+    "switch", "add", "remove", "update", "set", "save", "framework",
     "confirm", "cancel", "done", "audit", "logout",
     "start", "help"
 ]
@@ -990,6 +1184,8 @@ async def post_init(application):
         BotCommand("confirm", "Approve pending change"),
         BotCommand("cancel", "Cancel pending change"),
         BotCommand("done", "Pause current thread"),
+        BotCommand("save", "Save discussion conclusions: /save MSFT"),
+        BotCommand("framework", "Position tier framework and classification status"),
         BotCommand("audit", "Recent config changes and operations"),
         BotCommand("help", "All commands with examples"),
     ])
@@ -1050,6 +1246,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("portfolio_review", send_portfolio_review))
     app.add_handler(CommandHandler("switch", send_switch))
     app.add_handler(CommandHandler("done", send_done))
+    app.add_handler(CommandHandler("save", send_save))
+    app.add_handler(CommandHandler("framework", send_framework))
     app.add_handler(CommandHandler("audit", send_audit))
     app.add_handler(CommandHandler("add", send_add))
     app.add_handler(CommandHandler("remove", send_remove))

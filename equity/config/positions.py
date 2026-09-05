@@ -20,6 +20,10 @@ _OVERRIDE_PATH = Path(__file__).with_name("positions_override.json")
 POSITIONS = {
     "CCJ": {
         "tier": "core",
+        "tier_v2": "core_macro",
+        "style": "macro",
+        "classification_status": "complete",
+        "size_target_pct": 4.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -56,6 +60,10 @@ POSITIONS = {
     },
     "CEG": {
         "tier": "core",
+        "tier_v2": "core_macro",
+        "style": "macro",
+        "classification_status": "complete",
+        "size_target_pct": 4.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -89,6 +97,10 @@ POSITIONS = {
     },
     "MSFT": {
         "tier": "core",
+        "tier_v2": "core_compounder",
+        "style": "growth",
+        "classification_status": "needs_thesis",
+        "size_target_pct": 5.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -126,6 +138,10 @@ POSITIONS = {
     },
     "UMAC": {
         "tier": "speculative",
+        "tier_v2": "speculative_high",
+        "style": "macro",
+        "classification_status": "complete",
+        "size_target_pct": 2.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -163,6 +179,10 @@ POSITIONS = {
     },
     "PGR": {
         "tier": "core",
+        "tier_v2": "core_compounder",
+        "style": "defensive",
+        "classification_status": "needs_thesis",
+        "size_target_pct": 5.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
@@ -201,6 +221,10 @@ POSITIONS = {
     # shares, size_pct, market_value, tier) is in positions_override.json.
     "APP": {
         "tier": "high_conviction",
+        "tier_v2": "core_compounder",
+        "style": "growth",
+        "classification_status": "complete",
+        "size_target_pct": 5.0,
         "thesis_source": "ai_assisted",
         "last_reviewed": "2026-08",
 
