@@ -59,11 +59,19 @@ def format_morning_brief_header() -> str:
 
 
 def _run_section(name: str, fetch_fn, format_fn) -> str:
-    """Fetch + format one brief section; never raises — returns an error placeholder instead."""
+    """Fetch + format one brief section; never raises — returns an error placeholder instead.
+
+    Logs how long the section took (or how long it ran before failing) to
+    brief.log, so slow or broken sections are visible without re-running
+    the whole brief — see equity/config/logging_config.py.
+    """
+    start = time.time()
     try:
-        return format_fn(fetch_fn())
+        result = format_fn(fetch_fn())
+        logger.info("Brief section [%s] completed in %.1fs", name, time.time() - start)
+        return result
     except Exception as exc:
-        logger.exception("Morning brief section '%s' failed", name)
+        logger.error("Brief section [%s] FAILED after %.1fs: %s", name, time.time() - start, exc, exc_info=True)
         return f"⚠️ {name} unavailable: {exc}"
 
 
@@ -106,11 +114,13 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     sections.append((format_morning_brief_header(), None))
 
     # Market snapshot
+    _t0 = time.time()
     try:
         snapshot = market_snapshot.fetch_market_snapshot()
         snap_text = market_snapshot.format_market_snapshot(snapshot)
+        logger.info("Brief section [Market snapshot] completed in %.1fs", time.time() - _t0)
     except Exception as exc:
-        logger.exception("Morning brief section 'Market snapshot' failed")
+        logger.error("Brief section [Market snapshot] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
         snapshot = {}
         snap_text = f"⚠️ Market snapshot unavailable: {exc}"
     regime_flags = snapshot.get("regime_flags", [])
@@ -124,11 +134,13 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     all_text_for_synthesis.append(cal_text)
 
     # Portfolio monitor
+    _t0 = time.time()
     try:
         monitor_data = monitor.run_portfolio_monitor()
         mon_text = monitor.format_portfolio_monitor(monitor_data)
+        logger.info("Brief section [Portfolio monitor] completed in %.1fs", time.time() - _t0)
     except Exception as exc:
-        logger.exception("Morning brief section 'Portfolio monitor' failed")
+        logger.error("Brief section [Portfolio monitor] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
         monitor_data = {}
         mon_text = f"⚠️ Portfolio monitor unavailable: {exc}"
     alert_tickers = [
@@ -156,11 +168,13 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     all_text_for_synthesis.append(sector_text)
 
     # News triage
+    _t0 = time.time()
     try:
         triage = news_triage.run_news_triage(positions.get_all_tickers())
         triage_text = news_triage.format_news_triage(triage)
+        logger.info("Brief section [News triage] completed in %.1fs", time.time() - _t0)
     except Exception as exc:
-        logger.exception("Morning brief section 'News triage' failed")
+        logger.error("Brief section [News triage] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
         triage = {}
         triage_text = f"⚠️ News triage unavailable: {exc}"
     thesis_alert_tickers = [t for t, d in triage.items() if d.get("has_thesis_alert")]
@@ -181,12 +195,14 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     all_text_for_synthesis.append(triage_text)
 
     # Screener
+    _t0 = time.time()
     try:
         df = screener.run_screener()
         screener_text = screener.format_screener_output(df)
         screener_tickers = df["ticker"].tolist() if df is not None and len(df) > 0 else []
+        logger.info("Brief section [Screener] completed in %.1fs", time.time() - _t0)
     except Exception as exc:
-        logger.exception("Morning brief section 'Screener' failed")
+        logger.error("Brief section [Screener] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
         screener_text = f"⚠️ Screener unavailable: {exc}"
         screener_tickers = []
     screen_kb = make_tickers_keyboard(screener_tickers[:6]) if screener_tickers else None

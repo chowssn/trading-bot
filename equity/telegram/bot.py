@@ -37,10 +37,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 READONLY_MODE = os.getenv("BOT_READONLY", "false").lower() == "true"
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
 logger = logging.getLogger(__name__)
 
 from equity.brief.brief_builder import build_morning_brief, get_last_brief_synthesis, save_brief_to_thread
@@ -104,10 +100,9 @@ advisor = Advisor(api_key=os.getenv("ANTHROPIC_API_KEY"), thread_manager=thread_
 # Security logging
 # ---------------------------------------------------------------------------
 
+# Handler is attached by setup_logging() (equity/config/logging_config.py),
+# which routes the "security" logger to equity/data/logs/security.log.
 security_logger = logging.getLogger("security")
-os.makedirs("equity/data", exist_ok=True)
-_sh = logging.FileHandler("equity/data/security.log")
-security_logger.addHandler(_sh)
 security_logger.setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
@@ -663,7 +658,7 @@ async def send_audit(update, context):
         capture_output=True, text=True, cwd=os.getcwd()
     )
     try:
-        with open("equity/data/security.log") as f:
+        with open("equity/data/logs/security.log") as f:
             recent_ops = "".join(f.readlines()[-5:])
     except FileNotFoundError:
         recent_ops = "No operations logged yet."
@@ -672,6 +667,54 @@ async def send_audit(update, context):
         f"📋 *Recent write operations:*\n```\n{recent_ops}\n```",
         parse_mode="Markdown"
     )
+
+
+@authorized_only
+async def send_logs(update, context):
+    """
+    Shows recent errors and activity summary from log files.
+    Usage: /logs          — last 20 errors from errors.log
+           /logs brief    — last 20 lines from brief.log
+           /logs advisor  — last 20 lines from advisor.log
+           /logs screener — last 20 lines from screener.log
+           /logs security — last 20 lines from security.log
+    """
+    from pathlib import Path
+
+    log_dir = Path("equity/data/logs")
+    arg = context.args[0].lower() if context.args else "errors"
+
+    file_map = {
+        "errors": "errors.log",
+        "brief": "brief.log",
+        "advisor": "advisor.log",
+        "screener": "screener.log",
+        "security": "security.log",
+        "app": "app.log",
+    }
+
+    filename = file_map.get(arg, "errors.log")
+    log_path = log_dir / filename
+
+    if not log_path.exists():
+        await reply(update, context, f"No {filename} found yet.")
+        return
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        last_lines = lines[-20:]
+        content = "".join(last_lines)
+        if not content.strip():
+            await reply(update, context, f"{filename}: no recent entries.")
+            return
+        await send_safe(
+            context.bot,
+            update.effective_chat.id,
+            f"📋 *{filename}* (last {len(last_lines)} lines)\n```\n{content}\n```"
+        )
+    except Exception as e:
+        await reply(update, context, f"Error reading {filename}: {e}")
 
 
 def _execute_pending_change(change: dict) -> str:
@@ -1119,7 +1162,7 @@ KNOWN_COMMANDS = [
     "discuss", "macro", "portfolio", "portfolio_review",
     "screener", "news", "brief", "watchlist", "threads",
     "switch", "add", "remove", "update", "set", "save", "framework",
-    "confirm", "cancel", "done", "audit", "logout",
+    "confirm", "cancel", "done", "audit", "logs", "logout",
     "start", "help"
 ]
 
@@ -1187,6 +1230,7 @@ async def post_init(application):
         BotCommand("save", "Save discussion conclusions: /save MSFT"),
         BotCommand("framework", "Position tier framework and classification status"),
         BotCommand("audit", "Recent config changes and operations"),
+        BotCommand("logs", "View logs: /logs errors | brief | advisor | screener"),
         BotCommand("help", "All commands with examples"),
     ])
     await application.bot.send_message(
@@ -1197,6 +1241,9 @@ async def post_init(application):
 
 
 if __name__ == "__main__":
+    from equity.config.logging_config import setup_logging
+    setup_logging()
+
     import subprocess
     import sys
 
@@ -1249,6 +1296,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("save", send_save))
     app.add_handler(CommandHandler("framework", send_framework))
     app.add_handler(CommandHandler("audit", send_audit))
+    app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("add", send_add))
     app.add_handler(CommandHandler("remove", send_remove))
     app.add_handler(CommandHandler("update", send_update))
