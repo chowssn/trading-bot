@@ -17,3 +17,6 @@
 - positions.py: SMFG added to watchlist — Added via Telegram advisor
 - positions.py: ONON added to watchlist — Added via Telegram advisor
 - positions.py: ONON removed from watchlist — Removed via Telegram
+
+## 2026-09-05
+- positions.py: CDNS added to watchlist — Added via Telegram advisor

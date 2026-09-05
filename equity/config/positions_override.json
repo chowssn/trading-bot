@@ -519,6 +519,22 @@
     }
   },
   "WATCHLIST": {
+    "CDNS": {
+      "last_reviewed": "2026-09",
+      "macro_thesis": "CDNS sits at the intersection of two durable macro thematics: AI infrastructure buildout and semiconductor sovereignty. Both drive sustained design activity regardless of near-term consumer chip cycles. Higher rates pressure the multiple but do not impair the business model \u2014 recurring subscription revenue is sticky through cycles. The primary macro risk is a hard landing that causes enterprise R&D budget freezes, but even in 2020 Cadence held revenue flat, demonstrating defensive characteristics. Dollar strength is a mild headwind given international revenue mix. Overall the macro setup is cautiously constructive \u2014 rate plateau or pivot removes the multiple headwind while AI chip complexity tailwinds remain intact.",
+      "sector": "Technology",
+      "target_exit_conditions": "Exit or significantly reduce if: (1) two consecutive quarters of organic ARR growth below 8% with guidance cuts, signaling real design activity slowdown not just conservatism; (2) Synopsys acquires a transformative AI-EDA platform that shifts competitive dynamics materially; (3) China revenue restrictions expand to cover substantially all semiconductor IP licensing; (4) Forward EV/FCF re-rates above 55x on euphoria without commensurate earnings acceleration, making risk-reward unfavorable. Do not exit on multiple compression alone if recurring revenue growth and ROIC remain intact.",
+      "thesis": "Cadence Design Systems (CDNS) is a high-quality EDA and IP platform business with deep structural moats \u2014 switching costs are extraordinarily high as chip design workflows are deeply embedded in customer R&D pipelines, and ROIC consistently runs above 30%. Revenue is ~90% recurring via subscriptions, giving visibility most software businesses envy. The stock has de-rated meaningfully from peak multiples alongside broader software multiple compression and near-term hyperscaler capex uncertainty, creating a rare opportunity to own a best-in-class compounder at a relative discount. AI-driven chip complexity (custom silicon, advanced packaging, chiplets) is a secular tailwind that structurally expands Cadence's TAM \u2014 more complex chips require more EDA hours and IP licensing. The business also benefits from the Systems Design and Analysis segment growing faster than core EDA, diversifying revenue. At current levels, the market is pricing in stagnation that the underlying design activity pipeline does not support.",
+      "thesis_breakers": [
+        "A sustained slowdown in semiconductor R&D spending, particularly if hyperscalers pull back custom silicon programs or fabless customers cut design starts materially",
+        "Loss of competitive position to Synopsys or emerging players in AI-assisted EDA, or a successful challenge to the Cadence-Synopsys duopoly that compresses pricing power",
+        "Regulatory or geopolitical escalation that meaningfully restricts Cadence from serving Chinese customers, which represent a non-trivial revenue contribution",
+        "Multiple re-compression continuing into a higher-for-longer rate environment that keeps growth software valuations suppressed even as fundamentals hold",
+        "Execution stumbles in the Systems Analysis segment (Clarity, Celsius, Optimality) that prevent diversification away from traditional EDA and disappoint growth expectations"
+      ],
+      "thesis_source": "ai_assisted",
+      "tier": "high_conviction"
+    },
     "SMFG": {
       "last_reviewed": "2026-09",
       "macro_thesis": "Japan is undergoing its most significant monetary regime shift in 30 years. The BOJ's gradual rate normalization is a structural tailwind for Japanese bank earnings that is still early innings. Inflation in Japan, while moderate, appears sticky enough to keep the BOJ on a tightening path. Global investors remain underweight Japanese financials relative to historical norms, and domestic institutional flows are rotating into value and dividend-paying equities under the Tokyo Stock Exchange's push for improved capital efficiency and ROE. A weaker yen environment has also boosted overseas earnings in yen terms. Meanwhile, global rate curves remaining elevated support SMFG's wholesale and treasury operations. The macro setup \u2014 reflation, rate normalization, governance reform pressure, and underweight positioning \u2014 is unusually aligned for a megabank re-rating.",
