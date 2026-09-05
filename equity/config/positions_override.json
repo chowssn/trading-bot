@@ -387,7 +387,7 @@
     },
     "PLTR": {
       "avg_cost": 125.52,
-      "classification_status": "unclassified",
+      "classification_status": "complete",
       "last_reviewed": "2026-09",
       "macro_thesis": "Dollar weakness regime and US defense spending prioritization support both government contract flow and international expansion. AI infrastructure buildout as a secular theme provides commercial tailwinds. Geopolitical complexity increasing demand for data intelligence platforms across allied governments.",
       "market_value": 2553.6,
@@ -396,7 +396,7 @@
       "shares": 15.0,
       "size_pct": 3.22,
       "size_target_pct": null,
-      "style": "",
+      "style": "growth",
       "target_exit_conditions": "Exit if forward P/E expands above 100x without corresponding acceleration in revenue growth, if government revenue declines for two consecutive quarters, or if thesis breakers are triggered. Trim opportunistically on spikes toward prior 52W high of $207.",
       "thesis": "Palantir is a government-AI platform with a structural moat built on deeply embedded classified data infrastructure across US defense and intelligence agencies, creating switching costs no competitor can replicate. The business is transitioning from capital-intensive infrastructure builder to high-ROIC commercial compounder, with the government base providing durable high-margin revenue that funds commercial expansion. The AIP platform represents a credible second growth vector, but the position must be sized to reflect valuation risk at 75x forward P/E rather than treated as a traditional compounder.",
       "thesis_breakers": [
@@ -406,7 +406,7 @@
       ],
       "thesis_source": "ibkr_import",
       "tier": "core",
-      "tier_v2": ""
+      "tier_v2": "speculative_high"
     },
     "PPLT": {
       "avg_cost": 14.04,
