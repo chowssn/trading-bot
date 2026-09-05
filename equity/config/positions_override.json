@@ -579,7 +579,7 @@
       "avg_cost": 318.96,
       "classification_status": "unclassified",
       "last_reviewed": "2026-09",
-      "macro_thesis": "",
+      "macro_thesis": "Grid modernization and renewable energy intermittency create structural, policy-supported demand for utility-scale energy storage; autonomy regulation is gradually liberalizing in key markets; EV penetration curve still early in most geographies outside China.",
       "market_value": 4622.15,
       "peer_tickers": [],
       "sector": "Consumer Cyclical",
@@ -587,9 +587,13 @@
       "size_pct": 5.84,
       "size_target_pct": null,
       "style": "",
-      "target_exit_conditions": "",
-      "thesis": "Imported from IBKR \u2014 update via /update TICKER",
-      "thesis_breakers": [],
+      "target_exit_conditions": "Trim at $420-450 zone; full reassessment if $320-330 approached with thesis-breaker confirmation; exit if any thesis-breaker event is confirmed",
+      "thesis": "TSLA is held as a high-volatility barbell position within a speculative sleeve, with two core legs: Megapack energy storage is structurally undervalued, high-margin, and growing faster than consensus as grid modernization and renewable intermittency create durable demand independent of the auto business. Autonomy optionality via vision-based FSD carries superior unit economics versus LIDAR-dependent competitors, with robotaxi and licensing upside unpriced at current levels.",
+      "thesis_breakers": [
+        "Megapack order growth decelerates materially or margins compress below 20% for two consecutive quarters",
+        "FSD regulatory approval is denied or significantly delayed in a major market (US, EU, or China)",
+        "A credible LIDAR-based competitor (Waymo, Cruise) achieves commercial scale robotaxi deployment at lower cost per mile than Tesla's vision-based system"
+      ],
       "thesis_source": "ibkr_import",
       "tier": "core",
       "tier_v2": ""
