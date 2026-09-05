@@ -325,18 +325,21 @@
     },
     "MSFT": {
       "avg_cost": 373.43,
+      "classification_status": "complete",
       "last_reviewed": "2026-09",
       "macro_thesis": "TECH_OUTPERFORM regime supports multiple expansion for quality large-cap tech; self-funding capex model differentiates MSFT from rate-sensitive peers in a RATES_RISING environment; $678B contracted backlog insulates near-term revenue from macro softness",
       "market_value": 3501.59,
       "shares": 7.0189,
       "size_pct": 4.42,
+      "style": "growth",
       "target_exit_conditions": "Tactical trim if RATES_RISING regime shows imminent multiple compression transmission; trim to discovery size if any thesis breaker trips; full reassessment if two or more breakers trip simultaneously",
       "thesis": "MSFT is an elite quality compounder with a durable multi-layer moat across Azure cloud infrastructure, OpenAI partnership, and Copilot enterprise productivity. The core bet is on Azure winning enterprise AI workloads at scale, monetized through OpenAI revenue share and Copilot adoption, self-funded from operating cash flow with AAA balance sheet strength. Reasonable valuation at 21.2x forward P/E with $678B contracted backlog provides forward revenue visibility in a TECH_OUTPERFORM regime.",
       "thesis_breakers": [
         "Azure quarterly revenue growth decelerates below 20% YoY for two consecutive quarters",
         "Copilot enterprise seat adoption stalls or enterprise renewal rates decline materially",
         "AI capex spend exceeds free cash flow generation, forcing debt financing or dividend cuts"
-      ]
+      ],
+      "tier_v2": "core_compounder"
     },
     "NUE": {
       "avg_cost": 123.15,
