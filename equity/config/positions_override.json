@@ -558,7 +558,7 @@
     },
     "TLT": {
       "avg_cost": 83.83,
-      "classification_status": "unclassified",
+      "classification_status": "complete",
       "last_reviewed": "2026-09",
       "macro_thesis": "Fed is at or near peak rates with eventual cut cycle expected to compress long-end yields; recession risk or hard landing scenario would trigger sharp rally in long-duration Treasuries; current commodity bid and inflation risk create near-term headwind but do not invalidate the medium-term mean reversion case",
       "market_value": 5963.78,
@@ -567,7 +567,7 @@
       "shares": 72.7912,
       "size_pct": 7.53,
       "size_target_pct": null,
-      "style": "",
+      "style": "defensive",
       "target_exit_conditions": "Trim above $85 or when 10-year Treasury yield reaches 4.25\u20134.50%; full exit if thesis breakers materialize or position no longer serves hedge function relative to rest of portfolio",
       "thesis": "TLT is held as the conservative anchor of a barbell within the IBKR account, serving three simultaneous functions: asymmetric capital appreciation in a hard landing or risk-off event, mean reversion upside as the Fed eventually cuts and long-end yields normalize, and a current income floor while the thesis plays out. Size is intentionally modest given the broader account has significant fixed income exposure elsewhere.",
       "thesis_breakers": [
@@ -577,7 +577,7 @@
       ],
       "thesis_source": "ibkr_import",
       "tier": "core",
-      "tier_v2": ""
+      "tier_v2": "core_macro"
     },
     "TSLA": {
       "avg_cost": 318.96,
