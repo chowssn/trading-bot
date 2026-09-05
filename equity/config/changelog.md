@@ -25,3 +25,5 @@
 - MSFT reclassified to core_compounder (growth) — Classified from Telegram discussion 2026-09-05
 - positions.py: Updated TSLA thesis — Updated from Telegram discussion 2026-09-05
 - positions.py: Updated TSLA thesis — Classified from Telegram discussion 2026-09-05
+- TSLA reclassified to speculative_high (growth) — Classified from Telegram discussion 2026-09-05
+- positions.py: Updated TLT thesis — Updated from Telegram discussion 2026-09-05
