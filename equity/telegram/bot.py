@@ -37,6 +37,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 READONLY_MODE = os.getenv("BOT_READONLY", "false").lower() == "true"
 
+_BOT_START_TIME = time.time()  # for /status uptime
+
 logger = logging.getLogger(__name__)
 
 from equity.brief.brief_builder import build_morning_brief, get_last_brief_synthesis, save_brief_to_thread
@@ -51,7 +53,7 @@ from equity.brief.performance_tracker import (
 from equity.brief.sector_monitor import fetch_sector_data, format_sector_section
 from equity.config import config_manager
 from equity.config import positions as positions_module
-from equity.config.market_config import NEWS_HEADLINE_PAGE_SIZE
+from equity.config.market_config import LARGE_MOVE_THRESHOLD_PCT, NEWS_HEADLINE_PAGE_SIZE
 from equity.portfolio.monitor import format_portfolio_monitor, run_portfolio_monitor
 from equity.portfolio.news_triage import format_news_triage, run_news_triage
 from equity.screener.quality_scorer import score_ticker
@@ -72,6 +74,7 @@ from equity.telegram.formatters import (
     make_suggestions_keyboard,
     make_thread_list_keyboard,
     make_ticker_actions,
+    make_tickers_keyboard,
     send_in_parts,
     send_safe,
 )
@@ -717,6 +720,119 @@ async def send_logs(update, context):
         await reply(update, context, f"Error reading {filename}: {e}")
 
 
+@authorized_only
+async def send_status(update, context):
+    """
+    Shows system health: uptime, last brief, Claude call budget, advisor.db
+    size, positions loaded, data source connectivity, and today's error
+    count.
+    /status
+    """
+    from pathlib import Path
+
+    lines = ["🖥️ *SYSTEM STATUS*", ""]
+
+    # Uptime
+    uptime_seconds = time.time() - _BOT_START_TIME
+    hours = int(uptime_seconds // 3600)
+    minutes = int((uptime_seconds % 3600) // 60)
+    lines.append(f"⏱ Uptime: {hours}h {minutes}m")
+
+    # Last brief
+    briefs_dir = Path("equity/data/briefs")
+    brief_files = sorted(briefs_dir.glob("brief_*.txt")) if briefs_dir.exists() else []
+    if brief_files:
+        latest = brief_files[-1]
+        mtime = datetime.fromtimestamp(latest.stat().st_mtime)
+        age_hours = (datetime.now() - mtime).total_seconds() / 3600
+        age_str = f"{age_hours:.1f}h ago" if age_hours < 24 else f"{age_hours / 24:.1f}d ago"
+        lines.append(f"📊 Last brief: {mtime.strftime('%Y-%m-%d %H:%M')} ({age_str})")
+    else:
+        lines.append("📊 Last brief: never run")
+
+    # Claude API usage — _claude_call_times only ever holds the trailing
+    # hour (check_claude_rate_limit prunes it against that same window),
+    # so report against the hourly limit it's actually tracking.
+    lines.append(f"🤖 Claude calls (last hour): {len(_claude_call_times)}/{MAX_CLAUDE_CALLS_PER_HOUR}")
+
+    # advisor.db size
+    db_path = Path("equity/data/advisor.db")
+    if db_path.exists():
+        db_mb = db_path.stat().st_size / 1024 / 1024
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            thread_count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+            conn.close()
+            lines.append(f"💾 advisor.db: {db_mb:.1f}MB | {thread_count} threads | {msg_count} messages")
+        except Exception:
+            lines.append(f"💾 advisor.db: {db_mb:.1f}MB")
+    else:
+        lines.append("💾 advisor.db: not found")
+
+    # Positions loaded
+    lines.append(f"📋 Positions: {len(POSITIONS)} held | {len(WATCHLIST)} watchlist")
+
+    # Data source health checks
+    lines.append("")
+    lines.append("📡 *Data Sources*")
+
+    try:
+        test = yf.Ticker("SPY").history(period="1d")
+        yf_status = "✓" if len(test) > 0 else "✗ empty response"
+    except Exception as e:
+        yf_status = f"✗ {str(e)[:50]}"
+    lines.append(f"  yfinance: {yf_status}")
+
+    try:
+        fred_key = os.getenv("FRED_API_KEY", "")
+        if not fred_key:
+            fred_status = "✗ FRED_API_KEY not set"
+        else:
+            from fredapi import Fred
+            Fred(api_key=fred_key).get_series("DFF", limit=1)
+            fred_status = "✓"
+    except Exception as e:
+        fred_status = f"✗ {str(e)[:50]}"
+    lines.append(f"  FRED: {fred_status}")
+
+    try:
+        import requests
+
+        from equity.config.settings import FMP_API_KEY
+        r = requests.get(
+            "https://financialmodelingprep.com/stable/quote",
+            params={"symbol": "AAPL", "apikey": FMP_API_KEY},
+            timeout=5,
+        )
+        fmp_status = "✓" if r.status_code == 200 else f"✗ HTTP {r.status_code}"
+    except Exception as e:
+        fmp_status = f"✗ {str(e)[:50]}"
+    lines.append(f"  FMP: {fmp_status}")
+
+    anthropic_status = "✓ (key present)" if os.getenv("ANTHROPIC_API_KEY") else "✗ ANTHROPIC_API_KEY not set"
+    lines.append(f"  Anthropic: {anthropic_status}")
+
+    lines.append("  IBKR: ✗ not connected (Module 4 pending)")
+
+    # Recent errors
+    lines.append("")
+    log_path = Path("equity/data/logs/errors.log")
+    if log_path.exists():
+        with open(log_path, encoding="utf-8") as f:
+            error_lines = f.readlines()
+        today_errors = [l for l in error_lines if datetime.now().strftime("%Y-%m-%d") in l]
+        lines.append(f"⚠️ Errors today: {len(today_errors)} — /logs errors for details")
+    else:
+        lines.append("⚠️ Error log: not yet created")
+
+    await send_in_parts(
+        context.bot, update.effective_chat.id,
+        "\n".join(lines), reply_markup=make_main_menu()
+    )
+
+
 def _execute_pending_change(change: dict) -> str:
     """Shared execution logic for a confirmed pending change. Returns a result message."""
     change_type = change["change_type"]
@@ -1162,7 +1278,7 @@ KNOWN_COMMANDS = [
     "discuss", "macro", "portfolio", "portfolio_review",
     "screener", "news", "brief", "watchlist", "threads",
     "switch", "add", "remove", "update", "set", "save", "framework",
-    "confirm", "cancel", "done", "audit", "logs", "logout",
+    "confirm", "cancel", "done", "audit", "logs", "status", "logout",
     "start", "help"
 ]
 
@@ -1204,6 +1320,198 @@ async def scheduled_morning_brief(context):
 
 
 # ---------------------------------------------------------------------------
+# Global error handler
+# ---------------------------------------------------------------------------
+
+async def handle_error(update, context) -> None:
+    """
+    Global error handler — catches any exception left unhandled by an
+    individual command/callback handler (registered via
+    app.add_error_handler in __main__, so it isn't itself an
+    add_handler target and doesn't need @authorized_only).
+    Logs the full traceback to errors.log and notifies TELEGRAM_USER_ID
+    with a short summary.
+    """
+    error = context.error
+    logger.error("Unhandled exception in handler", exc_info=error)
+
+    update_info = ""
+    if isinstance(update, Update) and update.effective_message and update.effective_message.text:
+        update_info = f"Command: {update.effective_message.text[:100]}\n"
+
+    message = (
+        f"⚠️ *Bot Error*\n\n"
+        f"{update_info}"
+        f"Error: `{type(error).__name__}: {str(error)[:200]}`\n\n"
+        f"Check `/logs errors` for full traceback."
+    )
+
+    try:
+        await send_safe(context.bot, TELEGRAM_USER_ID, message)
+    except Exception:
+        # If notification itself fails, at least it's in the log.
+        logger.error("Failed to send error notification to Telegram")
+
+
+# ---------------------------------------------------------------------------
+# Intraday price/news alerts
+# ---------------------------------------------------------------------------
+
+_alerted_today: dict[str, bool] = {}  # {alert_key: True}; reset when the date rolls over
+
+
+def _get_market_hours_now() -> bool:
+    """True if the current time is within US market hours (9:30am-4:00pm ET, Mon-Fri)."""
+    import pytz
+
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    if now_et.weekday() >= 5:  # Saturday/Sunday
+        return False
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
+
+async def intraday_alert_job(context) -> None:
+    """
+    Runs every 30 minutes during market hours (see __main__ job_queue
+    setup). Checks all positions for a large price move
+    (>LARGE_MOVE_THRESHOLD_PCT in either direction) or thesis-breaker news,
+    and alerts TELEGRAM_USER_ID with a [💬 Discuss] button. Deduplicates:
+    at most one alert per ticker per alert type per day.
+    """
+    if not _get_market_hours_now():
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    # Reset daily alert tracking once the date rolls over.
+    if _alerted_today.get("_date") != today:
+        _alerted_today.clear()
+        _alerted_today["_date"] = today
+
+    alerts = []
+    tickers = list(POSITIONS.keys())
+
+    # Price alerts
+    try:
+        price_data = yf.download(
+            tickers, period="2d", interval="1d",
+            auto_adjust=True, progress=False,
+        )["Close"]
+        if len(tickers) == 1:
+            price_data = price_data.to_frame(name=tickers[0])
+
+        for ticker in tickers:
+            if ticker not in price_data.columns:
+                continue
+            closes = price_data[ticker].dropna()
+            if len(closes) < 2:
+                continue
+
+            prev_close = closes.iloc[-2]
+            curr_price = closes.iloc[-1]
+            change_pct = (curr_price / prev_close - 1) * 100
+
+            alert_key = f"{ticker}_price_{today}"
+            if abs(change_pct) >= LARGE_MOVE_THRESHOLD_PCT and alert_key not in _alerted_today:
+                direction = "🚀" if change_pct > 0 else "🔴"
+                alerts.append({
+                    "ticker": ticker,
+                    "type": "price",
+                    "message": f"{direction} *{ticker}* {change_pct:+.1f}% (${curr_price:.2f})",
+                    "key": alert_key,
+                })
+    except Exception as e:
+        logger.warning(f"intraday_alert_job: price check failed: {e}")
+
+    # Thesis-breaker news alerts (run for all positions)
+    try:
+        triage = await run_in_executor(run_news_triage, tickers)
+        for ticker, tdata in triage.items():
+            if tdata.get("has_thesis_alert"):
+                alert_key = f"{ticker}_news_{today}"
+                if alert_key not in _alerted_today:
+                    matched = tdata.get("thesis_alerts", [])
+                    alerts.append({
+                        "ticker": ticker,
+                        "type": "news",
+                        "message": (
+                            f"⚠️ *{ticker}* thesis alert\n"
+                            f"Matched: {matched[0][:80] if matched else 'unknown'}"
+                        ),
+                        "key": alert_key,
+                    })
+    except Exception as e:
+        logger.warning(f"intraday_alert_job: news check failed: {e}")
+
+    # Send alerts
+    for alert in alerts:
+        ticker = alert["ticker"]
+        kb = make_tickers_keyboard([ticker], label="💬 Discuss")
+        try:
+            await send_safe(context.bot, TELEGRAM_USER_ID,
+                             f"🔔 *INTRADAY ALERT*\n\n{alert['message']}", reply_markup=kb)
+            _alerted_today[alert["key"]] = True
+            logger.info(f"intraday_alert_job: sent {alert['type']} alert for {ticker}")
+        except Exception as e:
+            logger.error(f"intraday_alert_job: failed to send alert for {ticker}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# advisor.db backup
+# ---------------------------------------------------------------------------
+
+async def backup_advisor_db(context) -> None:
+    """
+    Daily backup of advisor.db (see __main__ job_queue setup — runs at
+    2:00 AM UTC). Keeps the last 7 daily backups. Silent on success;
+    notifies TELEGRAM_USER_ID only on failure.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path("equity/data/advisor.db")
+    backup_dir = Path("equity/data/backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    if not db_path.exists():
+        logger.warning("backup_advisor_db: advisor.db not found, skipping")
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    backup_path = backup_dir / f"advisor_{today}.db"
+
+    try:
+        # SQLite's own backup API for a safe hot backup — no corruption
+        # risk even while the bot is actively writing to advisor.db.
+        source = sqlite3.connect(db_path)
+        dest = sqlite3.connect(backup_path)
+        source.backup(dest)
+        source.close()
+        dest.close()
+
+        backup_mb = backup_path.stat().st_size / 1024 / 1024
+        logger.info(f"backup_advisor_db: backed up to {backup_path.name} ({backup_mb:.1f}MB)")
+
+        # Prune old backups — keep last 7.
+        backups = sorted(backup_dir.glob("advisor_*.db"))
+        for old_backup in backups[:-7]:
+            old_backup.unlink()
+            logger.info(f"backup_advisor_db: pruned {old_backup.name}")
+
+    except Exception as e:
+        logger.error(f"backup_advisor_db: FAILED: {e}")
+        try:
+            await send_safe(
+                context.bot, TELEGRAM_USER_ID,
+                f"⚠️ *advisor.db backup failed*\n{str(e)[:200]}\n\nCheck `/logs errors`"
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # post_init and __main__
 # ---------------------------------------------------------------------------
 
@@ -1231,6 +1539,7 @@ async def post_init(application):
         BotCommand("framework", "Position tier framework and classification status"),
         BotCommand("audit", "Recent config changes and operations"),
         BotCommand("logs", "View logs: /logs errors | brief | advisor | screener"),
+        BotCommand("status", "System health and data source status"),
         BotCommand("help", "All commands with examples"),
     ])
     await application.bot.send_message(
@@ -1297,6 +1606,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("framework", send_framework))
     app.add_handler(CommandHandler("audit", send_audit))
     app.add_handler(CommandHandler("logs", send_logs))
+    app.add_handler(CommandHandler("status", send_status))
     app.add_handler(CommandHandler("add", send_add))
     app.add_handler(CommandHandler("remove", send_remove))
     app.add_handler(CommandHandler("update", send_update))
@@ -1310,10 +1620,26 @@ if __name__ == "__main__":
     ))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
 
+    # Global error handler — not an add_handler target, so it's exempt from
+    # security_check.py's "every add_handler'd function has @authorized_only"
+    # scan; registered last, after every command/message/callback handler.
+    app.add_error_handler(handle_error)
+
     app.job_queue.run_daily(
         scheduled_morning_brief,
         time=dt.time(12, 30, 0, tzinfo=pytz.utc),
         name="morning_brief"
+    )
+    app.job_queue.run_repeating(
+        intraday_alert_job,
+        interval=1800,   # every 30 minutes
+        first=60,        # first run 60 seconds after bot starts
+        name="intraday_alerts"
+    )
+    app.job_queue.run_daily(
+        backup_advisor_db,
+        time=dt.time(2, 0, 0, tzinfo=pytz.utc),
+        name="db_backup"
     )
 
     print("Portfolio Advisor bot started. Press Ctrl+C to stop.")

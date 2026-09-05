@@ -51,7 +51,6 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 
 from equity.brief.market_snapshot import compute_ma_flags, format_flag
 from equity.config import positions as positions_config
@@ -64,6 +63,7 @@ from equity.config.market_config import (
     SILVER_GOLD_RATIO_RISK_ON_THRESHOLD,
     SLV_SI_DIVERGENCE_ALERT_PCT,
 )
+from equity.data.yfinance_utils import yf_download
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def _download_batch(tickers: list[str], period: str) -> pd.DataFrame | None:
     if not tickers:
         return None
     try:
-        data = yf.download(
+        data = yf_download(
             tickers,
             period=period,
             auto_adjust=True,

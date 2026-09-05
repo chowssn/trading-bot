@@ -35,6 +35,7 @@ from equity.config.market_config import (
     RETURN_3M_SHARP_DROP,
     RSI_30D_THRESHOLD_BY_REGIME,
 )
+from equity.data.yfinance_utils import yf_download
 from equity.screener.timing_signal import classify_timing
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,7 @@ def _fetch_market_cap(ticker: str) -> tuple[float, bool]:
 
 def _process_batch(batch: list[str], rsi_threshold: float) -> list[dict]:
     try:
-        data = yf.download(
+        data = yf_download(
             batch,
             period=YF_DOWNLOAD_PERIOD,
             group_by="ticker",

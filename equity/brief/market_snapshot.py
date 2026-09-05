@@ -42,7 +42,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 from dotenv import load_dotenv
 from fredapi import Fred
 
@@ -67,6 +66,7 @@ from equity.config.market_config import (
     VIX_EXTREME,
     VIX_HIGH,
 )
+from equity.data.yfinance_utils import yf_download
 
 load_dotenv()
 
@@ -163,7 +163,7 @@ def format_flag(flags: list[str]) -> str:
 
 def _download_batch(tickers: list[str], period: str = "ytd") -> pd.DataFrame | None:
     try:
-        data = yf.download(
+        data = yf_download(
             tickers,
             period=period,
             auto_adjust=True,
