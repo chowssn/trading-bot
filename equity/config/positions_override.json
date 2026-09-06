@@ -571,7 +571,7 @@
       "shares": 72.7912,
       "size_pct": 7.53,
       "size_target_pct": null,
-      "style": "defensive",
+      "style": "macro",
       "target_exit_conditions": "Trim above $85 or when 10Y yield reaches 4.25\u20134.50%; aggressive trim if Fed pivots hawkish with explicit higher-for-longer guidance; full exit if any yield thesis-breaker level is decisively breached",
       "thesis": "TLT is held as the conservative anchor of an intra-account barbell serving three simultaneous functions: asymmetric capital appreciation in a hard landing or risk-off event, mean reversion upside as the Fed eventually cuts and long-end yields normalize, and a current income floor while the thesis plays out. Size is intentionally modest given the broad macro uncertainty, with tactical add levels defined below current price.",
       "thesis_breakers": [
