@@ -564,7 +564,7 @@
       "avg_cost": 83.83,
       "classification_status": "complete",
       "last_reviewed": "2026-09",
-      "macro_thesis": "Fed rate cut cycle expected to compress long-end yields from current elevated levels; hard landing or recession scenario would trigger sharp rally in long-duration Treasuries; current hold range of $82-$85 reflects consolidation while macro regime resolves between soft landing and harder slowdown.",
+      "macro_thesis": "Long-end yields remain elevated relative to historical norms and the Fed is expected to cut rates over the medium term as growth slows. Commodity bid and sticky inflation create near-term headwinds, but a hard landing or risk-off event would compress long-end yields sharply, generating asymmetric appreciation. Current macro regime warrants tightening the tactical add trigger to $81.00\u2013$81.25 rather than mechanically acting at first tick below $82.",
       "market_value": 5963.78,
       "peer_tickers": [],
       "sector": "Government Bond",
@@ -572,12 +572,14 @@
       "size_pct": 7.53,
       "size_target_pct": null,
       "style": "defensive",
-      "target_exit_conditions": "Trim above $85 or when 10-year yield reaches 4.25-4.50%; full exit if thesis breakers triggered; tactical add only on dip to $81.00-$81.25 rather than mechanically at first tick below $82",
-      "thesis": "TLT is held as the conservative anchor of a barbell within the IBKR account, serving three simultaneous functions: asymmetric recession hedge providing capital appreciation in risk-off scenarios, mean reversion play on long-end rates compressing as the Fed eventually cuts, and an income floor generating yield while the thesis develops. Size is modest relative to net worth but meaningful within the account, sized to hedge rather than to compound.",
+      "target_exit_conditions": "Trim above $85 or when 10Y yield reaches 4.25\u20134.50%; aggressive trim if Fed pivots hawkish with explicit higher-for-longer guidance; full exit if any yield thesis-breaker level is decisively breached",
+      "thesis": "TLT is held as the conservative anchor of an intra-account barbell serving three simultaneous functions: asymmetric capital appreciation in a hard landing or risk-off event, mean reversion upside as the Fed eventually cuts and long-end yields normalize, and a current income floor while the thesis plays out. Size is intentionally modest given the broad macro uncertainty, with tactical add levels defined below current price.",
       "thesis_breakers": [
-        "10-year Treasury yield breaks decisively above 5.25% on re-accelerating inflation data",
-        "Fed pivots to explicit yield curve control or abandons rate cut cycle entirely",
-        "TLT breaks and holds below $81.00 with no corresponding deterioration in risk assets (would signal structural selling unrelated to recession hedge thesis)"
+        "TLT breaks and holds below $81.00 for 3+ consecutive sessions",
+        "10Y Treasury yield breaks decisively above 5.50%",
+        "20Y Treasury yield breaks above 6.25%",
+        "30Y Treasury yield breaks above 6.50%",
+        "Fed pivots hawkish with explicit higher-for-longer guidance"
       ],
       "thesis_source": "ibkr_import",
       "tier": "core",
