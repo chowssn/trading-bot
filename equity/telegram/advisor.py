@@ -130,6 +130,28 @@ class Advisor:
             logger.warning("build_system_prompt: portfolio context failed: %s", exc)
             sections.append("--- PORTFOLIO DATA UNAVAILABLE ---")
 
+        try:
+            from equity.data.monitoring import load_monitoring
+
+            monitoring = load_monitoring()
+            if monitoring:
+                mon_lines = [
+                    "--- ACTIVE MONITORING LIST ---",
+                    "These items are being tracked across brief sessions:",
+                ]
+                for item in monitoring[:10]:  # cap at 10 for prompt size
+                    age = item.get("age_days", 0)
+                    mon_lines.append(
+                        f'  [{item["ticker"]}] {item["item"]} '
+                        f'(priority: {item.get("priority", "medium")}, age: {age}d)'
+                    )
+                mon_lines.append("")
+                mon_lines.append("When user discusses a monitored ticker, check in on these items.")
+                mon_lines.append("If a condition has resolved, note it. If it has worsened, escalate.")
+                sections.append("\n".join(mon_lines))
+        except Exception as exc:
+            logger.warning("build_system_prompt: monitoring list failed: %s", exc)
+
         cross_thread_ctx = self._get_cross_thread_context(current_thread_id=current_thread_id)
         if cross_thread_ctx:
             sections.append(cross_thread_ctx)
@@ -701,7 +723,8 @@ class Advisor:
         self.thread_manager.add_message(thread_id, "assistant", text)
         self.thread_manager.auto_summarize_thread(thread_id, self.summarize_messages)
 
-        return self._append_save_suggestion(text, thread_subject)
+        text = self._append_save_suggestion(text, thread_subject)
+        return self._append_monitoring_note(text, thread_subject)
 
     _CONCLUSION_SIGNALS = (
         "in summary", "to summarize", "conclusion", "final view",
@@ -732,6 +755,41 @@ class Advisor:
             f"\n\n---\n💾 *Ready to save these conclusions?*\n"
             f"Tap [💾 Update Thesis] below or type `/save {ticker}` "
             f"to draft a structured update from this discussion."
+        )
+
+    _MONITORING_RESOLUTION_SIGNALS = (
+        "thesis intact", "resolved", "no longer a concern",
+        "dismiss", "no action needed", "noise", "cleared",
+    )
+
+    def _append_monitoring_note(self, response_text: str, thread_subject: str | None) -> str:
+        """Append a monitoring-list reminder when a response reads like it
+        resolves an active monitoring item for this thread's ticker.
+
+        Same non-polluting pattern as `_append_save_suggestion()` above:
+        only the text returned to the chat UI is touched — the response
+        already persisted to thread history is unaffected, so this note
+        never gets summarized into future context.
+        """
+        if not thread_subject:
+            return response_text
+
+        from equity.data.monitoring import get_monitoring_for_ticker
+
+        active_items = get_monitoring_for_ticker(thread_subject)
+        if not active_items:
+            return response_text
+
+        response_lower = response_text.lower()
+        if not any(sig in response_lower for sig in self._MONITORING_RESOLUTION_SIGNALS):
+            return response_text
+
+        ticker = thread_subject.upper()
+        items_summary = "; ".join(i["item"][:50] for i in active_items[:2])
+        return response_text + (
+            f"\n\n---\n📋 *Monitoring note:* You have {len(active_items)} active "
+            f"monitoring item(s) for {ticker}: _{items_summary}_\n"
+            f"If these are resolved, use `/dismiss {ticker}` to clear them."
         )
 
     def summarize_messages(self, messages: list[dict]) -> str:

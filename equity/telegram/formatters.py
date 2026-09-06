@@ -1,8 +1,11 @@
 """Message formatting and inline keyboard builders for the Telegram advisor bot."""
 
 import asyncio
+import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -10,48 +13,111 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 # ---------------------------------------------------------------------------
 
 def split_message(text: str, max_length: int = 4000) -> list[str]:
+    """
+    Splits text into chunks under max_length characters.
+    Splits at double newlines (paragraph breaks) first,
+    then at single newlines, then hard-cuts as last resort.
+    Never returns empty strings.
+    """
+    if not text:
+        return []
     if len(text) <= max_length:
         return [text]
 
     parts = []
-    remaining = text
-    while len(remaining) > max_length:
-        # Prefer a paragraph boundary, then a line boundary, within the window.
-        window = remaining[:max_length]
-        split_at = window.rfind("\n\n")
-        if split_at == -1:
-            split_at = window.rfind("\n")
-        if split_at == -1:
-            split_at = max_length
-        parts.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip("\n")
-    if remaining:
-        parts.append(remaining)
-    return parts
+    current = ""
+
+    # Try splitting at paragraph boundaries first.
+    for para in text.split("\n\n"):
+        if len(current) + len(para) + 2 <= max_length:
+            current = f"{current}\n\n{para}" if current else para
+            continue
+
+        if current:
+            parts.append(current.strip())
+            current = ""
+
+        if len(para) <= max_length:
+            current = para
+            continue
+
+        # Paragraph itself is too long — split at single newlines.
+        for line in para.split("\n"):
+            if len(current) + len(line) + 1 <= max_length:
+                current = f"{current}\n{line}" if current else line
+                continue
+
+            if current:
+                parts.append(current.strip())
+                current = ""
+
+            if len(line) <= max_length:
+                current = line
+                continue
+
+            # Line itself is too long — hard cut.
+            for j in range(0, len(line), max_length):
+                parts.append(line[j:j + max_length])
+            current = ""
+
+    if current:
+        parts.append(current.strip())
+
+    return [p for p in parts if p]
 
 
 async def send_safe(bot, chat_id: int, text: str,
                     reply_markup=None) -> None:
-    '''
-    Sends message, trying Markdown first.
-    Falls back to plain text if Markdown parsing fails.
-    '''
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    except Exception:
-        # Strip any Markdown and send as plain text
-        clean = text.replace('*', '').replace('_', '').replace('`', '')
-        await bot.send_message(
-            chat_id=chat_id,
-            text=clean,
-            reply_markup=reply_markup,
-            parse_mode=None
-        )
+    """
+    Sends text safely, handling both Markdown parse errors and
+    messages exceeding Telegram's 4096 character limit.
+    Splits long messages at paragraph boundaries before sending.
+    Only attaches reply_markup to the last part.
+    """
+    if not text or not text.strip():
+        return
+
+    parts = split_message(text, max_length=4000)
+
+    for i, part in enumerate(parts):
+        kb = reply_markup if i == len(parts) - 1 else None
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=part,
+                reply_markup=kb,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            # Strip any Markdown and retry as plain text.
+            clean = (
+                part.replace("*", "").replace("_", "")
+                .replace("`", "").replace("[", "").replace("]", "")
+            )
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=clean,
+                    reply_markup=kb,
+                    parse_mode=None,
+                )
+            except Exception:
+                # Last resort — truncate. Parts are already <= max_length,
+                # so this only fires for non-length errors (bad chat_id,
+                # network, etc.); log so a silent failure stays visible.
+                logger.warning(
+                    "send_safe: plain-text send also failed for chat %s, truncating part %d/%d",
+                    chat_id, i + 1, len(parts),
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=clean[:4000],
+                    reply_markup=kb,
+                    parse_mode=None,
+                )
+
+        if len(parts) > 1 and i < len(parts) - 1:
+            await asyncio.sleep(0.3)
 
 
 async def send_in_parts(

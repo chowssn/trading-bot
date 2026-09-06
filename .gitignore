@@ -17,3 +17,4 @@ equity/data/advisor.db
 equity/data/ibkr/
 equity/data/logs/
 equity/data/backups/
+equity/data/monitoring.json

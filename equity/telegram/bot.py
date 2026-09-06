@@ -454,7 +454,8 @@ async def send_help(update, context):
         "/watchlist — Watchlist with live prices\n"
         "/threads — List discussion threads\n"
         "/framework — Position tier framework and classification status\n"
-        "/audit — Recent config changes and operations\n\n"
+        "/audit — Recent config changes and operations\n"
+        "/monitoring [TICKER] — Active monitoring items, carried forward across briefs\n\n"
         "*Discussion*\n"
         "/discuss TICKER — Discuss a ticker\n"
         "/macro — Macro and regime discussion\n"
@@ -466,6 +467,7 @@ async def send_help(update, context):
         "/remove TICKER — Remove from watchlist\n"
         "/update TICKER [field] — Update thesis\n"
         "/save TICKER — Save discussion conclusions as a position update\n"
+        "/dismiss TICKER — Dismiss monitoring item(s) for a ticker\n"
         "/set FIELD VALUE — Update market config\n"
         "/confirm — Approve pending change\n"
         "/cancel — Cancel pending change/auth\n"
@@ -574,6 +576,88 @@ async def send_framework(update, context):
 
     await send_in_parts(context.bot, update.effective_chat.id,
                          "\n".join(lines), reply_markup=make_main_menu())
+
+
+@authorized_only
+async def send_monitoring(update, context):
+    """
+    /monitoring — shows all active monitoring items across the portfolio.
+    /monitoring TICKER — shows items for a specific ticker.
+
+    Each item gets inline [💬 Discuss] / [✕ Dismiss] buttons so an item can
+    be cleared straight from the list — see the "dismiss_item_" branch in
+    handle_callback() — without typing /dismiss TICKER and picking through
+    a selection menu.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    from equity.data.monitoring import load_monitoring
+
+    ticker_filter = context.args[0].upper() if context.args else None
+    items = load_monitoring()
+
+    if ticker_filter:
+        items = [i for i in items if i.get("ticker") == ticker_filter]
+
+    if not items:
+        msg = f'No active monitoring items{f" for {ticker_filter}" if ticker_filter else ""}.'
+        await reply(update, context, msg, reply_markup=make_main_menu())
+        return
+
+    # Sort by priority then age (oldest first within a priority tier).
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    items.sort(key=lambda x: (priority_order.get(x.get("priority"), 1), -x.get("age_days", 0)))
+
+    priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+    lines = ["📋 *ACTIVE MONITORING*", ""]
+    item_buttons = []
+    for item in items:
+        emoji = priority_emoji.get(item.get("priority"), "⚪")
+        age = item.get("age_days", 0)
+        age_str = "today" if age == 0 else f"{age}d ago"
+        lines.append(f'{emoji} *{item["ticker"]}* ({age_str})\n  {item["item"]}')
+        lines.append("")
+        item_buttons.append([
+            InlineKeyboardButton(f'💬 {item["ticker"]}', callback_data=f'discuss_{item["ticker"]}'),
+            InlineKeyboardButton("✕ Dismiss", callback_data=f'dismiss_item_{item["id"]}'),
+        ])
+    item_buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
+
+    await send_in_parts(context.bot, update.effective_chat.id,
+                         "\n".join(lines), reply_markup=InlineKeyboardMarkup(item_buttons))
+
+
+async def _send_dismiss_selection(update, context, ticker: str, items: list[dict]) -> None:
+    """Inline keyboard listing each monitoring item for `ticker`, so the user
+    can tap the specific one to dismiss rather than clearing all of them.
+    Offers [Dismiss All] and [Cancel] too. Called only from `send_dismiss()`
+    when more than one item is active for the ticker — not itself a
+    registered handler, so it needs no @authorized_only of its own.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+    lines = [f"📋 *{ticker} — Select item to dismiss:*", ""]
+    buttons = []
+
+    for item in items:
+        emoji = priority_emoji.get(item.get("priority", "medium"), "⚪")
+        age = item.get("age_days", 0)
+        age_str = "today" if age == 0 else f"{age}d ago"
+        short_text = item["item"][:60] + ("..." if len(item["item"]) > 60 else "")
+        lines.append(f"{emoji} {short_text} ({age_str})")
+        buttons.append([InlineKeyboardButton(
+            f"{emoji} {short_text[:50]}", callback_data=f'dismiss_item_{item["id"]}'
+        )])
+
+    buttons.append([
+        InlineKeyboardButton(f"🗑 Dismiss All ({len(items)})", callback_data=f"dismiss_all_{ticker}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cmd_main_menu"),
+    ])
+
+    await send_safe(context.bot, update.effective_chat.id,
+                     "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
 @authorized_only
@@ -918,6 +1002,52 @@ async def send_set(update, context):
     await config_commands.handle_set_config(update, context, thread_manager, auth_manager)
 
 
+@require_email_auth(lambda u, c: f'Dismiss monitoring item for {c.args[0] if c.args else "?"}')
+@authorized_only
+@register_command
+async def send_dismiss(update, context):
+    """
+    /dismiss TICKER — if exactly one monitoring item is active for the
+    ticker, dismisses it directly. If multiple are active, shows a
+    selection keyboard so the user can choose which one (or dismiss all).
+    Requires email 2FA since it modifies persistent state.
+
+    Carries @register_command (like send_add/remove/update/set) because it
+    goes through @require_email_auth: after the emailed code is verified,
+    handle_message() re-dispatches via COMMAND_REGISTRY[func_name] — without
+    this decorator the post-auth call would silently no-op.
+    """
+    from equity.data.monitoring import dismiss_monitoring_item, load_monitoring
+
+    if not context.args:
+        await reply(update, context,
+            "Usage: /dismiss TICKER\nExample: /dismiss TSLA\n\n"
+            "Shows active monitoring items for that ticker to dismiss."
+        )
+        return
+
+    ticker = context.args[0].upper()
+    items = [i for i in load_monitoring() if i.get("ticker", "").upper() == ticker]
+
+    if not items:
+        await reply(update, context,
+            f"No active monitoring items for {ticker}.",
+            reply_markup=make_main_menu()
+        )
+        return
+
+    if len(items) == 1:
+        item = items[0]
+        dismiss_monitoring_item(item["id"], reason="Dismissed via /dismiss command")
+        await reply(update, context,
+            f'✓ Dismissed monitoring item for {ticker}:\n_{item["item"]}_',
+            reply_markup=make_main_menu()
+        )
+        return
+
+    await _send_dismiss_selection(update, context, ticker, items)
+
+
 @authorized_only
 async def send_save(update, context):
     """/save TICKER — draft a position update from that ticker's discussion thread.
@@ -1040,6 +1170,35 @@ async def handle_callback(update, context):
         ticker = data[len("ticker_flag_risk_"):]
         context.args = [ticker, "stop_thesis"]
         await send_update(update, context)
+    elif data.startswith("dismiss_item_"):
+        item_id = data[len("dismiss_item_"):]
+        from equity.data.monitoring import dismiss_monitoring_item, load_monitoring
+        # load_monitoring() only returns active items — look the text up
+        # before dismissing, since a dismissed item wouldn't be found after.
+        item_text = next(
+            (i.get("item", item_id) for i in load_monitoring() if i.get("id") == item_id),
+            item_id
+        )
+        success = dismiss_monitoring_item(item_id, reason="Dismissed via selection menu")
+        if success:
+            await query.message.reply_text(
+                f"✓ Dismissed:\n_{item_text[:100]}_",
+                parse_mode="Markdown",
+                reply_markup=make_main_menu()
+            )
+        else:
+            await query.message.reply_text(
+                "Item not found or already dismissed.",
+                reply_markup=make_main_menu()
+            )
+    elif data.startswith("dismiss_all_"):
+        ticker = data[len("dismiss_all_"):]
+        from equity.data.monitoring import dismiss_monitoring
+        count = dismiss_monitoring(ticker, reason="Dismiss all via selection menu")
+        await query.message.reply_text(
+            f"✓ Dismissed all {count} monitoring item(s) for {ticker}.",
+            reply_markup=make_main_menu()
+        )
     elif data.startswith("confirm_"):
         await config_commands.handle_confirm_callback(query, context, thread_manager)
     elif data.startswith("cancel_"):
@@ -1279,7 +1438,7 @@ KNOWN_COMMANDS = [
     "screener", "news", "brief", "watchlist", "threads",
     "switch", "add", "remove", "update", "set", "save", "framework",
     "confirm", "cancel", "done", "audit", "logs", "status", "logout",
-    "start", "help"
+    "start", "help", "monitoring", "dismiss"
 ]
 
 
@@ -1536,6 +1695,8 @@ async def post_init(application):
         BotCommand("cancel", "Cancel pending change"),
         BotCommand("done", "Pause current thread"),
         BotCommand("save", "Save discussion conclusions: /save MSFT"),
+        BotCommand("monitoring", "View active monitoring items: /monitoring or /monitoring TSLA"),
+        BotCommand("dismiss", "Dismiss monitoring: /dismiss TSLA"),
         BotCommand("framework", "Position tier framework and classification status"),
         BotCommand("audit", "Recent config changes and operations"),
         BotCommand("logs", "View logs: /logs errors | brief | advisor | screener"),
@@ -1603,6 +1764,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("switch", send_switch))
     app.add_handler(CommandHandler("done", send_done))
     app.add_handler(CommandHandler("save", send_save))
+    app.add_handler(CommandHandler("monitoring", send_monitoring))
+    app.add_handler(CommandHandler("dismiss", send_dismiss))
     app.add_handler(CommandHandler("framework", send_framework))
     app.add_handler(CommandHandler("audit", send_audit))
     app.add_handler(CommandHandler("logs", send_logs))

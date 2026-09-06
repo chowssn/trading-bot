@@ -39,9 +39,15 @@ from pathlib import Path
 from telegram import InlineKeyboardMarkup
 
 from equity.brief import earnings_monitor, eco_calendar, market_snapshot, performance_tracker, sector_monitor
-from equity.brief.brief_synthesizer import synthesize_full_brief, synthesize_section
+from equity.brief.brief_synthesizer import (
+    _parse_and_persist_monitoring,
+    synthesize_full_brief,
+    synthesize_performance,
+    synthesize_section,
+)
 from equity.config import positions, settings
 from equity.config.market_config import REGIME_SCREENER_ADJUSTMENTS
+from equity.data.monitoring import load_monitoring
 from equity.portfolio import monitor, news_triage
 from equity.screener import screener
 from equity.telegram.formatters import make_article_keyboard, make_main_menu, make_news_actions, make_tickers_keyboard
@@ -150,10 +156,38 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     sections.append((mon_text, mon_kb))
     all_text_for_synthesis.append(mon_text)
 
-    # Performance
+    # Performance — dedicated synthesizer (synthesize_performance(), richer
+    # prompt than synthesize_section()) with the persistent monitoring list
+    # and cross-section context folded in. Cross-section context is limited
+    # to what's already been computed at this point in the build order —
+    # market snapshot and portfolio monitor; news triage runs later (see
+    # module docstring), so it isn't available here.
     perf_text = _run_section("Performance tracker", _fetch_performance_data, lambda data: performance_tracker.format_performance_section(*data))
     sections.append((perf_text, None))
-    sections.append((f"💡 *Performance*\n{_run_synthesis('performance', perf_text, regime_flags)}", None))
+
+    monitoring_items = load_monitoring()
+    cross_ctx_parts = [f"MARKET SNAPSHOT SUMMARY:\n{snap_text[:500]}"]
+    if mon_text:
+        cross_ctx_parts.append(f"PORTFOLIO MONITOR:\n{mon_text[:500]}")
+    cross_ctx = "\n\n".join(cross_ctx_parts)
+
+    try:
+        perf_synthesis = synthesize_performance(
+            section_data=perf_text,
+            regime_flags=regime_flags,
+            monitoring_items=monitoring_items,
+            cross_thread_context=cross_ctx,
+        )
+    except Exception as exc:
+        logger.exception("Performance synthesis failed")
+        perf_synthesis = f"[Performance synthesis unavailable: {exc}]"
+
+    # Persist any new monitoring items the synthesis surfaced — never raises
+    # (see _parse_and_persist_monitoring()'s own docstring), so this can't
+    # take down the rest of the brief.
+    _parse_and_persist_monitoring(perf_synthesis)
+
+    sections.append((f"💡 *Performance*\n{perf_synthesis}", None))
     all_text_for_synthesis.append(perf_text)
 
     # Earnings
