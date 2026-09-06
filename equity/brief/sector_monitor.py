@@ -16,21 +16,26 @@ rather than taking down the whole fetch:
 
 - `compute_correlation_matrix()` / `find_concentration_flags()` — pairwise
   60-day-return correlation across `positions.POSITIONS` tickers only
-  (never benchmarks). Only the *flags* (>0.70 concentrated, <-0.30 hedge)
-  are returned for the brief — the full N×N matrix is deliberately not
-  part of this module's output; see the module's `/discuss PORTFOLIO`
-  note in `format_sector_section()`.
+  (never benchmarks). `fetch_sector_data()` stores the full matrix too
+  (as a plain `{ticker: {ticker: corr}}` dict, so it survives the JSON
+  cache — see that function), but `format_sector_section()` still doesn't
+  render the raw N×N table: `_format_correlation_clusters()` and
+  `_format_top_hedges()` reduce it to concentration clusters (≥3 members,
+  greedy-clustered on `CORRELATION_CONCENTRATION_THRESHOLD`) and the top 5
+  natural hedges, pointing to `/discuss PORTFOLIO` for the full matrix.
 - `compute_sector_concentration()` — count-of-positions breakdown by each
-  position's `sector` field (not dollar-weighted — position sizes aren't
-  available until IBKR/Module 4 is connected, same caveat as
-  `equity.portfolio.monitor`).
+  position's `sector` field. No longer used by `format_sector_section()`,
+  which now shows sector exposure weighted by `size_pct` instead (see
+  `_format_sector_exposure()`) now that positions carry real IBKR-imported
+  sizes; kept computing/returned in `fetch_sector_data()`'s result in case
+  a future caller wants the count-based view.
 - `fetch_etf_flows_stub()` — IBKR stub, same shape/pattern as
   `equity.portfolio.monitor.get_ibkr_positions()`.
 - `fetch_options_activity()` — front-month options chain per position
   ticker: ATM-average implied vol as an "iv30" proxy (there's no separate
   30-day-constant-maturity fetch here), put/call volume ratio, and a
-  `skew_signal` (`PUT_HEAVY`/`CALL_HEAVY`/`NORMAL`) describing whether that
-  ratio is unusual enough to trust.
+  `signal` (see `classify_options()`) describing whether that combination
+  of IV and P/C is unusual enough to trust.
 
   "Front-month" here means the nearest *standard monthly* (3rd-Friday)
   expiration (`_select_front_month()`), not simply the closest date —
@@ -42,24 +47,32 @@ rather than taking down the whole fetch:
   it — the original rule flagged a chain as unusual if *any single strike*
   had volume > 2x its open interest, and with dozens of strikes on a chain
   a lone thin far-OTM strike (volume=1, open interest=0) is enough to trip
-  that. `skew_signal` replaces it with a whole-chain approach instead of a
-  single-strike one: `_classify_skew()` only trusts `put_call_ratio` once
-  the *entire* chain clears two liquidity gates — total volume (calls +
-  puts) exceeding `MIN_TOTAL_VOLUME` contracts (filters out illiquid names
-  like UMAC, where a handful of contracts can swing the ratio to an
-  extreme), and total volume exceeding `VOLUME_OI_RATIO`x total open
-  interest (filters out a chain that's merely being priced/quoted rather
-  than actively traded). A name that fails either gate reports `NORMAL`
-  regardless of how extreme its `put_call_ratio` looks — see
-  `_format_options_line()`'s CEG case, where a 1.6 P/C ratio still renders
-  as `NORMAL` because the chain's volume doesn't clear the gates.
+  that. Two whole-chain liquidity gates (`_clears_liquidity_gates()`)
+  replace it instead of a single-strike check: `put_call_ratio` is only
+  fed into `classify_options()` once the *entire* chain clears total
+  volume (calls + puts) exceeding `MIN_TOTAL_VOLUME` contracts (filters
+  out illiquid names like UMAC, where a handful of contracts can swing the
+  ratio to an extreme), and total volume exceeding `VOLUME_OI_RATIO`x
+  total open interest (filters out a chain that's merely being
+  priced/quoted rather than actively traded). A name that fails either
+  gate is classified on IV alone (`put_call_ratio` passed to
+  `classify_options()` as `None`) regardless of how extreme its raw ratio
+  looks — e.g. CEG's 1.6 P/C ratio contributes nothing to its `signal`
+  because the chain's volume doesn't clear the gates.
 
-"Newly crossed 0.70 threshold" highlights compare this run's concentrated
-pairs against whatever the *last* run recorded, persisted in
-`equity/data/cache/concentration_history.json` — there's no scheduled
-weekly cadence enforced anywhere in this codebase yet, so this is really
-"since the last time this ran," not a strict calendar week. Documented as
-such in `_build_highlights()` rather than overclaiming "vs last week."
+  `classify_options()` itself (see `market_config.OPTIONS_*` for the
+  thresholds) is a straight IV30/P-C lookup with no state of its own —
+  the liquidity gating above is entirely the caller's (`fetch_options_activity()`'s)
+  responsibility, so the function stays a pure, independently testable
+  classifier.
+
+`newly_crossed_pairs` (pairs whose correlation crossed 0.70 since the
+*last* run, tracked via `equity/data/cache/concentration_history.json` —
+there's no scheduled weekly cadence enforced anywhere in this codebase
+yet, so this is really "since the last time this ran," not a strict
+calendar week) is still computed and returned by `fetch_sector_data()`
+but not currently surfaced by `format_sector_section()`; the cluster view
+above supersedes it as the brief's concentration signal.
 """
 
 import json
@@ -75,8 +88,13 @@ from equity.config.market_config import (  # noqa: F401 — BENCHMARK_TICKERS/PO
     BENCHMARK_TICKERS,
     CORRELATION_CONCENTRATION_THRESHOLD,
     CORRELATION_HEDGE_THRESHOLD,
+    OPTIONS_IV_ELEVATED,
+    OPTIONS_IV_EXTREME,
+    OPTIONS_PC_CALL_HEAVY,
+    OPTIONS_PC_EXTREME_PUT,
+    OPTIONS_PC_PUT_HEAVY,
     POSITION_SECTOR_MAP,
-    SECTOR_CONCENTRATION_MAX_PCT,
+    SECTOR_WEIGHT_CONCENTRATION_PCT,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,19 +113,22 @@ _CONCENTRATION_HISTORY_PATH = _CACHE_DIR / "concentration_history.json"
 # which is the stricter threshold promoted to HIGHLIGHTS.
 SECTOR_CONCENTRATION_FLAG_PCT = 30.0
 
-# Options-activity display thresholds — local to this module, not sourced
-# from market_config (mirrors equity.portfolio.monitor's local
-# LARGE_MOVE_PCT/MOVE_PCT convention).
-ELEVATED_IV30_PCT = 50.0
-
-# skew_signal gates (see module docstring / _classify_skew()): a chain's
-# put/call ratio is only trusted once the whole chain — not a single
-# strike — clears both a minimum absolute volume and a minimum volume
-# relative to open interest.
+# Liquidity gates feeding classify_options() (see module docstring /
+# _clears_liquidity_gates()): a chain's put/call ratio is only trusted
+# once the whole chain — not a single strike — clears both a minimum
+# absolute volume and a minimum volume relative to open interest. The
+# actual IV/P-C classification thresholds live in market_config
+# (OPTIONS_IV_ELEVATED etc.) since they're shared, decision-relevant
+# thresholds, not a display-only convention.
 MIN_TOTAL_VOLUME = 5000
 VOLUME_OI_RATIO = 1.5
-PUT_HEAVY_PCR = 1.5
-CALL_HEAVY_PCR = 0.4
+
+# Correlation-cluster display threshold — local to this module (see
+# _format_correlation_clusters()): a cluster whose average intra-cluster
+# correlation exceeds this is labeled HIGH risk rather than MODERATE.
+# Distinct from CORRELATION_CONCENTRATION_THRESHOLD (0.70), which decides
+# cluster *membership* itself.
+CLUSTER_HIGH_RISK_CORR = 0.80
 
 
 # ---------------------------------------------------------------------------
@@ -300,38 +321,61 @@ def _chain_totals(calls: pd.DataFrame, puts: pd.DataFrame) -> tuple[float, float
     return total_volume, total_oi
 
 
-def _classify_skew(total_volume: float, total_oi: float, put_call_ratio: float | None) -> str:
-    """'PUT_HEAVY' / 'CALL_HEAVY' / 'NORMAL' — see module docstring for the two liquidity gates.
-
-    `put_call_ratio` is only trusted as a skew signal once the whole chain
-    clears both: total volume > MIN_TOTAL_VOLUME contracts, and total
-    volume > VOLUME_OI_RATIOx total open interest. Either gate failing
-    (or no ratio to begin with) means 'NORMAL', regardless of how extreme
-    the ratio looks — a thin chain can produce an extreme ratio from a
-    handful of contracts that means nothing.
+def _clears_liquidity_gates(total_volume: float, total_oi: float) -> bool:
+    """True once a chain's whole-chain volume clears both gates (see module docstring):
+    total volume > MIN_TOTAL_VOLUME contracts, and total volume >
+    VOLUME_OI_RATIOx total open interest. A chain that fails either gate
+    is too thin to trust its put/call ratio — a handful of contracts can
+    swing it to an extreme that means nothing.
     """
-    if put_call_ratio is None:
-        return "NORMAL"
-    if total_volume <= MIN_TOTAL_VOLUME or total_volume <= VOLUME_OI_RATIO * total_oi:
-        return "NORMAL"
-    if put_call_ratio > PUT_HEAVY_PCR:
-        return "PUT_HEAVY"
-    if put_call_ratio < CALL_HEAVY_PCR:
-        return "CALL_HEAVY"
-    return "NORMAL"
+    return total_volume > MIN_TOTAL_VOLUME and total_volume > VOLUME_OI_RATIO * total_oi
+
+
+def classify_options(iv30: float | None, pc_ratio: float | None) -> str:
+    """Classifies options positioning based on IV30 and put/call volume ratio.
+
+    Returns one of: NO_DATA, NORMAL, IV_ELEVATED, IV_EXTREME, PUT_HEAVY,
+    EXTREME_PUT, CALL_HEAVY, or a ' + '-joined combination of an IV signal
+    and a P/C signal (e.g. 'IV_ELEVATED + PUT_HEAVY').
+
+    Pure lookup against market_config.OPTIONS_* thresholds — no liquidity
+    gating of its own. Callers computing `pc_ratio` from a real options
+    chain (fetch_options_activity()) must pass None instead of a raw ratio
+    once `_clears_liquidity_gates()` says the chain is too thin to trust.
+    """
+    if iv30 is None and pc_ratio is None:
+        return "NO_DATA"
+
+    signals = []
+
+    if iv30 is not None:
+        if iv30 > OPTIONS_IV_EXTREME:
+            signals.append("IV_EXTREME")
+        elif iv30 > OPTIONS_IV_ELEVATED:
+            signals.append("IV_ELEVATED")
+
+    if pc_ratio is not None:
+        if pc_ratio > OPTIONS_PC_EXTREME_PUT:
+            signals.append("EXTREME_PUT")
+        elif pc_ratio > OPTIONS_PC_PUT_HEAVY:
+            signals.append("PUT_HEAVY")
+        elif pc_ratio < OPTIONS_PC_CALL_HEAVY:
+            signals.append("CALL_HEAVY")
+
+    return " + ".join(signals) if signals else "NORMAL"
 
 
 def fetch_options_activity(tickers: list[str]) -> dict:
-    """Front-month options snapshot per ticker: {iv30, put_call_ratio, skew_signal}.
+    """Front-month options snapshot per ticker: {iv30, put_call_ratio, signal}.
 
     Never raises: a ticker with no options chain, or any fetch failure,
-    still gets an entry (iv30/put_call_ratio None, skew_signal 'NORMAL')
+    still gets an entry (iv30/put_call_ratio None, signal 'NO_DATA')
     rather than being dropped from the result.
     """
     result: dict[str, dict] = {}
 
     for ticker in tickers:
-        entry = {"iv30": None, "put_call_ratio": None, "skew_signal": "NORMAL"}
+        entry = {"iv30": None, "put_call_ratio": None, "signal": "NO_DATA"}
 
         try:
             t = yf.Ticker(ticker)
@@ -370,7 +414,8 @@ def fetch_options_activity(tickers: list[str]) -> dict:
             entry["put_call_ratio"] = put_volume / call_volume if put_volume is not None else None
 
         total_volume, total_oi = _chain_totals(calls, puts)
-        entry["skew_signal"] = _classify_skew(total_volume, total_oi, entry["put_call_ratio"])
+        gated_pc_ratio = entry["put_call_ratio"] if _clears_liquidity_gates(total_volume, total_oi) else None
+        entry["signal"] = classify_options(entry["iv30"], gated_pc_ratio)
 
         result[ticker] = entry
 
@@ -447,6 +492,7 @@ def fetch_sector_data() -> dict:
         correlation_flags = find_concentration_flags(corr_matrix)
     else:
         data_warnings.append("Fewer than 2 positions with price history — correlation matrix skipped")
+        corr_matrix = None
         correlation_flags = []
 
     current_pairs = [
@@ -465,6 +511,11 @@ def fetch_sector_data() -> dict:
 
     result = {
         "correlation_flags": correlation_flags,
+        # Nested {ticker: {ticker: corr}} rather than the DataFrame itself —
+        # this dict round-trips through the JSON cache (_write_cache() below
+        # / _load_cache()), unlike a DataFrame. format_sector_section()
+        # rebuilds a DataFrame from it with pd.DataFrame(...) before use.
+        "correlation_matrix": corr_matrix.to_dict() if corr_matrix is not None else None,
         "newly_crossed_pairs": newly_crossed_pairs,
         "sector_concentration": sector_concentration,
         "etf_flows": etf_flows,
@@ -480,119 +531,156 @@ def fetch_sector_data() -> dict:
 # Formatting
 # ---------------------------------------------------------------------------
 
-def _format_exposure_line(sector: str, tickers: list[str], flagged: bool) -> str:
-    count_word = "position" if len(tickers) == 1 else "positions"
-    marker = " ⚠️" if flagged else ""
-    return f"  {sector}: {', '.join(tickers)} — {len(tickers)} {count_word}{marker}"
+def _format_sector_exposure(sector_data: dict) -> str:
+    """Aggregates POSITIONS by sector and shows portfolio weight % (not position count).
+
+    Uses each position's `size_pct` — already IBKR-import-merged onto
+    `positions_config.POSITIONS` by `positions.py`'s override mechanism,
+    so there's no need to re-read positions_override.json here. `sector_data`
+    isn't actually needed for this (weights come straight from POSITIONS)
+    but is accepted for a consistent signature with the other _format_*
+    helpers and in case a future caller wants to pass pre-aggregated data.
+    """
+    sector_weights: dict[str, float] = {}
+    sector_tickers: dict[str, list[str]] = {}
+
+    for ticker, pos in positions_config.POSITIONS.items():
+        sector = pos.get("sector") or "Unknown"
+        weight = pos.get("size_pct") or 0
+        sector_weights[sector] = sector_weights.get(sector, 0) + weight
+        sector_tickers.setdefault(sector, []).append(ticker)
+
+    if not sector_weights:
+        return "Sector Weights\n  No positions with sector/size data available."
+
+    sorted_sectors = sorted(sector_weights.items(), key=lambda kv: -kv[1])
+
+    lines = ["Sector Weights"]
+    for sector, weight in sorted_sectors:
+        tickers = sector_tickers.get(sector, [])
+        flag = " ⚠️ concentrated" if weight > SECTOR_WEIGHT_CONCENTRATION_PCT else ""
+        if len(tickers) <= 3:
+            ticker_str = f"  ({', '.join(tickers)})"
+        else:
+            ticker_str = f"  ({len(tickers)} positions)"
+        lines.append(f"  {sector:<28} {weight:>5.1f}%{flag}{ticker_str}")
+
+    return "\n".join(lines)
 
 
-def _format_correlation_line(flag: dict) -> str:
-    if flag["flag_type"] == "concentrated":
-        return f"  ⚠️ {flag['ticker1']} ↔ {flag['ticker2']}: {flag['correlation']:.2f} — concentrated risk"
-    return f"  ✓ {flag['ticker1']} ↔ {flag['ticker2']}: {flag['correlation']:.2f} — natural hedge"
+def _format_correlation_clusters(corr_matrix: pd.DataFrame, threshold: float = CORRELATION_CONCENTRATION_THRESHOLD) -> str:
+    """Identifies concentration clusters via simple greedy clustering.
+
+    A cluster is a group where every pair has |correlation| >= threshold.
+    Shows members and avg correlation. Only clusters with >= 3 members are
+    surfaced — the point is "these move as a block," which two names
+    already say via `_format_top_hedges()`'s inverse or don't need calling
+    out at all.
+    """
+    tickers = list(corr_matrix.columns)
+    visited = set()
+    clusters = []
+
+    for t in tickers:
+        if t in visited:
+            continue
+        cluster = [t]
+        for other in tickers:
+            if other == t or other in visited:
+                continue
+            if all(abs(corr_matrix.loc[m, other]) >= threshold for m in cluster):
+                cluster.append(other)
+        if len(cluster) >= 3:
+            pairs = [(a, b) for i, a in enumerate(cluster) for b in cluster[i + 1:]]
+            avg_corr = sum(abs(corr_matrix.loc[a, b]) for a, b in pairs) / len(pairs) if pairs else 0
+            clusters.append({"members": cluster, "avg_corr": avg_corr})
+            visited.update(cluster)
+
+    if not clusters:
+        return "No significant concentration clusters detected."
+
+    lines = [f"Concentration Clusters (≥3 positions, avg corr >{threshold:.2f})"]
+    for c in sorted(clusters, key=lambda x: -x["avg_corr"]):
+        members = ", ".join(c["members"])
+        risk_label = "HIGH" if c["avg_corr"] > CLUSTER_HIGH_RISK_CORR else "MODERATE"
+        lines.append(f"  ⚠️ [{risk_label}] {members}")
+        lines.append(f"     Avg correlation: {c['avg_corr']:.2f} — move as a block on macro shock")
+
+    return "\n".join(lines)
 
 
-def _skew_label(skew: str) -> str:
-    if skew == "PUT_HEAVY":
-        return "PUT_HEAVY — unusual put buying (hedge/bearish)"
-    if skew == "CALL_HEAVY":
-        return "CALL_HEAVY — bullish positioning"
-    return "NORMAL"
+def _format_top_hedges(corr_matrix: pd.DataFrame, top_n: int = 5) -> str:
+    """The `top_n` most negatively correlated position pairs — natural hedges."""
+    tickers = list(corr_matrix.columns)
+    hedge_pairs = []
+    for i, a in enumerate(tickers):
+        for b in tickers[i + 1:]:
+            c = corr_matrix.loc[a, b]
+            if pd.notna(c) and c < CORRELATION_HEDGE_THRESHOLD:
+                hedge_pairs.append((a, b, float(c)))
+    hedge_pairs.sort(key=lambda x: x[2])  # most negative first
+    top = hedge_pairs[:top_n]
+    if not top:
+        return "No significant natural hedges detected."
+    lines = [f"Top {len(top)} Natural Hedges"]
+    for a, b, c in top:
+        lines.append(f"  ✓ {a} ↔ {b}: {c:.2f}")
+    return "\n".join(lines)
 
 
-def _format_options_line(ticker: str, activity: dict) -> str:
-    iv30 = activity.get("iv30")
-    pcr = activity.get("put_call_ratio")
-    skew = activity.get("skew_signal", "NORMAL")
+def _format_options_flags(options_data: dict) -> str:
+    """Only the positions whose options `signal` is neither NORMAL nor NO_DATA."""
+    flagged = {
+        ticker: data for ticker, data in options_data.items()
+        if data.get("signal", "NORMAL") not in ("NORMAL", "NO_DATA")
+    }
+    if not flagged:
+        return "Options Activity: No unusual positioning detected across portfolio."
 
-    iv_str = f"IV30: {iv30:.0f}%" if iv30 is not None else "IV30: n/a"
-
-    if pcr is None:
-        # No call volume to build a ratio from (illiquid name, e.g. UMAC) —
-        # a P/C ratio here would be meaningless, so fall back to IV alone.
-        if iv30 is not None and iv30 > ELEVATED_IV30_PCT:
-            return f"  {ticker:<5}  {iv_str} — elevated vol (speculative)"
-        return f"  {ticker:<5}  {iv_str}"
-
-    return f"  {ticker:<5}  {iv_str}  P/C: {pcr:.1f}  {_skew_label(skew)}"
-
-
-def _build_highlights(sector_data: dict) -> list[str]:
-    highlights = []
-
-    for ticker1, ticker2 in sector_data.get("newly_crossed_pairs") or []:
-        highlights.append(
-            f"{ticker1} & {ticker2} newly crossed the {CORRELATION_CONCENTRATION_THRESHOLD:.2f} "
-            f"correlation threshold since the last check"
-        )
-
-    pct_breakdown = (sector_data.get("sector_concentration") or {}).get("pct_breakdown", {})
-    for sector, pct in pct_breakdown.items():
-        if pct > SECTOR_CONCENTRATION_MAX_PCT:
-            highlights.append(f"{sector} is {pct:.0f}% of your positions (by count) — concentration risk")
-
-    for ticker, activity in (sector_data.get("options_activity") or {}).items():
-        skew = activity.get("skew_signal")
-        pcr = activity.get("put_call_ratio")
-        if skew == "PUT_HEAVY":
-            highlights.append(f"{ticker}: PUT_HEAVY skew (P/C {pcr:.1f}) — unusual put buying, potential hedge/bearish positioning")
-        elif skew == "CALL_HEAVY":
-            highlights.append(f"{ticker}: CALL_HEAVY skew (P/C {pcr:.1f}) — unusual call buying, potential bullish positioning")
-
-    return highlights
+    lines = ["Options Flags (unusual positioning only)"]
+    for ticker, data in sorted(flagged.items()):
+        iv = data.get("iv30")
+        pc = data.get("put_call_ratio")
+        signal = data.get("signal", "")
+        iv_str = f"IV30: {iv:.0f}%" if iv is not None else "IV: n/a"
+        pc_str = f"P/C: {pc:.1f}" if pc is not None else "P/C: n/a"
+        lines.append(f"  ⚠️ {ticker}: {iv_str} | {pc_str} | {signal}")
+    return "\n".join(lines)
 
 
 def format_sector_section(sector_data: dict) -> str:
     """Render `fetch_sector_data()`'s output dict as a Telegram-ready string. Never raises."""
-    lines = ["🏭 SECTOR & CONCENTRATION", _DIVIDER, "Your Sector Exposure"]
+    lines = ["🏭 SECTOR & CONCENTRATION", _DIVIDER]
 
-    sector_concentration = sector_data.get("sector_concentration", {})
-    tickers_by_sector = sector_concentration.get("tickers_by_sector", {})
-    concentrated_sectors = set(sector_concentration.get("concentrated_sectors", []))
-    for sector, tickers in tickers_by_sector.items():
-        lines.append(_format_exposure_line(sector, tickers, sector in concentrated_sectors))
-
-    concentrated_flags = [f for f in sector_data.get("correlation_flags", []) if f["flag_type"] == "concentrated"]
-    for flag in concentrated_flags:
-        sector1 = positions_config.POSITIONS.get(flag["ticker1"], {}).get("sector", "?")
-        sector2 = positions_config.POSITIONS.get(flag["ticker2"], {}).get("sector", "?")
-        lines.append(
-            f"  ⚠️ Concentration: {flag['ticker1']} ({sector1}) + {flag['ticker2']} ({sector2}) are "
-            f"{flag['correlation'] * 100:.0f}% correlated"
-        )
+    # Block 1: sector weights (aggregated, not per-position)
+    lines.append(_format_sector_exposure(sector_data))
     lines.append("")
 
-    lines.append("60-Day Correlations (flags only)")
-    flags = sector_data.get("correlation_flags", [])
-    if flags:
-        lines.extend(_format_correlation_line(flag) for flag in flags)
-    else:
-        lines.append("  No correlation flags — all position pairs within -0.30 to 0.70")
-    lines.append("  Full N×N matrix available via /discuss PORTFOLIO")
-    lines.append("")
+    # Blocks 2/3: clusters + top hedges, replacing the old N×N pair listing.
+    # correlation_matrix is stored as a plain {ticker: {ticker: corr}} dict
+    # (JSON-cache-safe — see fetch_sector_data()) and rebuilt into a
+    # DataFrame here for the .loc-based cluster/hedge logic.
+    corr_dict = sector_data.get("correlation_matrix")
+    if corr_dict:
+        corr_matrix = pd.DataFrame(corr_dict)
+        if not corr_matrix.empty:
+            lines.append(_format_correlation_clusters(corr_matrix))
+            lines.append("")
+            lines.append(_format_top_hedges(corr_matrix))
+            lines.append("")
+            lines.append("Full correlation matrix: /discuss PORTFOLIO")
+            lines.append("")
 
-    lines.append("Options Activity (IV snapshot)")
+    # Block 4: options flags only (non-NORMAL/NO_DATA positions)
     options_activity = sector_data.get("options_activity", {})
-    if options_activity:
-        lines.extend(_format_options_line(ticker, activity) for ticker, activity in options_activity.items())
-    else:
-        lines.append("  No options data available")
-    lines.append("")
-
-    etf_flows = sector_data.get("etf_flows", {})
-    lines.append(f"ETF Flows: {etf_flows.get('message', 'Connect IBKR for institutional flow data')}")
-
-    highlights = _build_highlights(sector_data)
-    if highlights:
-        lines.append("")
-        lines.append("HIGHLIGHTS")
-        lines.extend(f"• {h}" for h in highlights)
+    lines.append(_format_options_flags(options_activity))
 
     warnings = sector_data.get("data_warnings") or []
     if warnings:
         lines.append("")
         lines.extend(f"⚠️ {w}" for w in warnings)
 
+    lines.append("")
     lines.append(_DIVIDER)
     return "\n".join(lines)
 

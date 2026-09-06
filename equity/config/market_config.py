@@ -195,9 +195,23 @@ SILVER_GOLD_RATIO_RISK_ON_THRESHOLD = 0.0  # positive change = risk-on signal
 POSITION_UNDERPERFORM_ALERT_PCT = 2.0  # flag if position lags sector by this much
 CORRELATION_CONCENTRATION_THRESHOLD = 0.70  # flag correlated positions
 CORRELATION_HEDGE_THRESHOLD = -0.30  # flag natural hedges
-SECTOR_CONCENTRATION_MAX_PCT = 40    # flag if one sector > this % of portfolio
+SECTOR_CONCENTRATION_MAX_PCT = 40    # flag if one sector > this % of portfolio (count-based breakdown)
+SECTOR_WEIGHT_CONCENTRATION_PCT = 20 # flag if one sector > this % of portfolio (size_pct-weighted breakdown)
 EARNINGS_LOOKAHEAD_DAYS = 7          # days ahead to show earnings
 EARNINGS_ALERT_DAYS = 2              # days before earnings to send alert
+
+# OPTIONS ACTIVITY CLASSIFICATION (sector_monitor.classify_options())
+# Replaces the old ELEVATED_IV30_PCT=50 / PUT_HEAVY_PCR=1.5 / CALL_HEAVY_PCR=0.4
+# thresholds, which were far too permissive and left almost every position
+# classified NORMAL. These are still applied only after a chain clears
+# sector_monitor's liquidity gates (MIN_TOTAL_VOLUME / VOLUME_OI_RATIO) —
+# see that module's docstring for why an ungated ratio on a thin chain is
+# noise, not signal.
+OPTIONS_IV_ELEVATED = 60       # IV30 > 60% = elevated
+OPTIONS_IV_EXTREME = 100       # IV30 > 100% = extreme
+OPTIONS_PC_PUT_HEAVY = 2.5     # P/C > 2.5 = unusual put buying (bearish hedge)
+OPTIONS_PC_CALL_HEAVY = 0.3    # P/C < 0.3 = unusual call buying (bullish speculation)
+OPTIONS_PC_EXTREME_PUT = 4.0   # P/C > 4.0 = extreme put positioning
 
 # Precious metals futures tickers (yfinance front-month)
 GOLD_FUTURES_TICKER = 'GC=F'    # COMEX gold front-month, USD/troy oz
