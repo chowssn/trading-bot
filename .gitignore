@@ -19,3 +19,4 @@ equity/data/logs/
 equity/data/backups/
 equity/data/monitoring.json
 equity/data/cache/fed_funds.json
+equity/data/cache/
