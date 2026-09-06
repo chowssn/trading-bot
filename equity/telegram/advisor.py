@@ -35,6 +35,25 @@ MODEL = "claude-sonnet-4-6"
 _PORTFOLIO_CONTEXT_TTL_SECONDS = 900  # 15 minutes
 _portfolio_context_cache: dict = {"text": None, "timestamp": 0.0}
 
+# Same pattern for get_live_macro_snapshot() — yields/FX/commodities are
+# also the same for every thread, so one 15-minute-old snapshot is shared
+# rather than re-running fetch_market_snapshot() on every chat message.
+_MACRO_SNAPSHOT_TTL_SECONDS = 900  # 15 minutes
+_macro_snapshot_cache: dict = {"text": None, "timestamp": 0.0}
+
+# Tenors/pairs/commodities shown in get_live_macro_snapshot() — the
+# subset of market_config's TREASURY_TICKERS+TREASURY_FRED_SERIES /
+# FX_TICKERS / COMMODITY_TICKERS_EXTENDED most relevant to this
+# portfolio's macro-sensitive positions (TLT, CCJ/CEG, FCX, PPLT, EM/China
+# exposure), rather than the full curve/board.
+_MACRO_SNAPSHOT_TENORS = ["2Y", "5Y", "10Y", "20Y", "30Y"]
+_MACRO_SNAPSHOT_FX = ["EURUSD=X", "USDJPY=X", "USDCNH=X"]
+_MACRO_SNAPSHOT_COMMODITIES = ["GC=F", "CL=F", "HG=F", "URA"]
+
+# Ticker aliases whose thesis is macro-driven enough that a live yields/FX/
+# commodities snapshot belongs in their discussion context (get_ticker_context()).
+MACRO_PROXY_TICKERS = {"TLT", "GLD", "SLV", "URA", "TIP", "PPLT", "GC=F", "SI=F"}
+
 # Same idea for _get_cross_thread_context() — it queries SQLite (thread
 # list + brief thread messages) but threads don't change that frequently
 # mid-conversation. Keyed by current_thread_id since "other active
@@ -130,6 +149,15 @@ class Advisor:
             logger.warning("build_system_prompt: portfolio context failed: %s", exc)
             sections.append("--- PORTFOLIO DATA UNAVAILABLE ---")
 
+        # Live macro snapshot — always included so the advisor has current
+        # yields/FX rather than only the (possibly hours-old) morning brief.
+        try:
+            macro_snapshot = self.get_live_macro_snapshot()
+            if macro_snapshot:
+                sections.append(macro_snapshot)
+        except Exception as exc:
+            logger.warning("build_system_prompt: macro snapshot failed: %s", exc)
+
         try:
             from equity.data.monitoring import load_monitoring
 
@@ -175,6 +203,84 @@ class Advisor:
             lines.append(f'  Exit: {tier["exit_rule"]}')
             lines.append("")
         lines.append("Reformulation rule: thesis development may suggest reclassification — no position is locked.")
+        return "\n".join(lines)
+
+    def get_live_macro_snapshot(self) -> str:
+        """Live Treasury yields / FX / key commodities for advisor context.
+
+        Called during discussions so the advisor has current levels rather
+        than relying on the morning brief snapshot, which can be hours
+        old by the time a discussion happens. Cached 15 minutes — same
+        cadence and module-level-cache pattern as
+        `_build_full_portfolio_context()`. Never raises: any failure
+        (including market_snapshot.fetch_market_snapshot() itself, which
+        does its own internal degrade-on-failure per section) returns ''
+        rather than blocking the system prompt.
+        """
+        now = time.time()
+        cached_text = _macro_snapshot_cache["text"]
+        if cached_text is not None and now - _macro_snapshot_cache["timestamp"] < _MACRO_SNAPSHOT_TTL_SECONDS:
+            return cached_text
+
+        try:
+            result = self._build_live_macro_snapshot_uncached()
+        except Exception as exc:
+            logger.warning("get_live_macro_snapshot: failed: %s", exc)
+            return ""
+
+        _macro_snapshot_cache["text"] = result
+        _macro_snapshot_cache["timestamp"] = now
+        return result
+
+    def _build_live_macro_snapshot_uncached(self) -> str:
+        """Builds the text `get_live_macro_snapshot()` caches.
+
+        Reuses `market_snapshot.fetch_market_snapshot()` (already imported
+        for `get_regime_context()`) rather than a separate yfinance fetch:
+        that function already covers 2Y/20Y (FRED — yfinance alone doesn't
+        carry them, see market_config.TREASURY_FRED_SERIES) and every FX/
+        commodity ticker below, each already paired with its move vs prior
+        close, plus the multi-index/retry handling its own batch download
+        needs.
+        """
+        snapshot = market_snapshot.fetch_market_snapshot()
+
+        lines = ["--- LIVE MACRO DATA (fetched now, ~15 min delayed) ---"]
+
+        treasury_curve = snapshot.get("treasury_curve", {})
+        yield_lines = [
+            f"  {tenor}: {entry['yield_pct']:.3f}% ({entry['change_1d_bps']:+.1f}bp)"
+            for tenor in _MACRO_SNAPSHOT_TENORS
+            if (entry := treasury_curve.get(tenor)) is not None
+        ]
+        if yield_lines:
+            lines.append("Yields:")
+            lines.extend(yield_lines)
+
+        fx_data = snapshot.get("fx", {})
+        fx_lines = [
+            f"  {entry.get('label', ticker)}: {entry['price']:.4f} ({entry['change_1d_pct']:+.2f}%)"
+            for ticker in _MACRO_SNAPSHOT_FX
+            if (entry := fx_data.get(ticker)) is not None
+        ]
+        if fx_lines:
+            lines.append("FX:")
+            lines.extend(fx_lines)
+
+        commodities_ext = snapshot.get("commodities_extended", {})
+        comm_lines = [
+            f"  {entry.get('label', ticker)}: ${entry['price']:.2f} ({entry['change_1d_pct']:+.2f}%)"
+            for ticker in _MACRO_SNAPSHOT_COMMODITIES
+            if (entry := commodities_ext.get(ticker)) is not None
+        ]
+        if comm_lines:
+            lines.append("Commodities:")
+            lines.extend(comm_lines)
+
+        warnings = snapshot.get("data_warnings") or []
+        if warnings:
+            lines.append(f"Data warnings: {'; '.join(warnings[:3])}")
+
         return "\n".join(lines)
 
     def _build_full_portfolio_context(self) -> str:
@@ -391,7 +497,8 @@ class Advisor:
         quality score, position context, news, regime) are each wrapped in
         their own try/except — one section failing never blocks the others,
         and a failure is surfaced as a one-line note rather than silently
-        dropped.
+        dropped. A seventh, live-macro section is added on top of those for
+        MACRO_PROXY_TICKERS only (TLT, GLD, SLV, etc. — see that constant).
         """
         start_time = time.monotonic()
         sections = []
@@ -674,6 +781,17 @@ class Advisor:
         except Exception as exc:
             logger.warning("get_ticker_context: regime fetch failed for %s: %s", ticker, exc)
             sections.append("--- CURRENT REGIME ---\nRegime context unavailable.")
+
+        # ------------------------------------------------------------
+        # Section 7 — Live macro context (macro-proxy tickers only)
+        # ------------------------------------------------------------
+        if ticker.upper() in MACRO_PROXY_TICKERS:
+            try:
+                macro_ctx = self.get_live_macro_snapshot()
+                if macro_ctx:
+                    sections.append(f"--- LIVE MACRO CONTEXT (relevant for {ticker} thesis) ---\n{macro_ctx}")
+            except Exception as exc:
+                logger.warning("get_ticker_context: macro snapshot failed for %s: %s", ticker, exc)
 
         elapsed = time.monotonic() - start_time
         logger.info(f"get_ticker_context({ticker}): {elapsed:.1f}s")

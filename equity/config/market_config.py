@@ -108,6 +108,54 @@ REGIME_SCREENER_ADJUSTMENTS = {
 LARGE_MOVE_THRESHOLD_PCT = 3.0    # flag LARGE_UP / LARGE_DOWN
 MEDIUM_MOVE_THRESHOLD_PCT = 1.0   # flag UP / DOWN
 
+# ============================================================
+# INTRADAY MACRO ALERT THRESHOLDS
+# These trigger alerts during market hours, same dedup logic as equity
+# alerts (see bot.py's intraday_alert_job() / _check_macro_alerts()).
+# Tenor/ticker keys match TREASURY_TICKERS + TREASURY_FRED_SERIES,
+# FX_TICKERS (+ the synthetic 'DXY' key, resolved to the DX-Y.NYB index
+# already in COMMODITY_TICKERS), and COMMODITY_TICKERS_EXTENDED.
+# ============================================================
+
+# Treasury yield move thresholds (in basis points — intraday move from prior close)
+YIELD_ALERT_BP = {
+    '2Y':  8,   # 2Y moving 8bp intraday is significant
+    '5Y':  8,
+    '10Y': 8,   # 10Y moving 8bp intraday warrants attention
+    '20Y': 10,  # longer end moves more slowly — higher threshold
+    '30Y': 10,
+}
+
+# FX move thresholds (% intraday move from prior close)
+FX_ALERT_PCT = {
+    'EURUSD=X': 0.5,   # 0.5% intraday EUR/USD move is significant
+    'USDJPY=X': 0.6,   # JPY more volatile
+    'GBPUSD=X': 0.6,
+    'USDCNH=X': 0.4,   # CNH moves are policy-significant even when small
+    'USDCHF=X': 0.5,
+    'DXY':      0.4,   # Dollar index — DX-Y.NYB, from COMMODITY_TICKERS
+}
+
+# Commodity move thresholds (% intraday move)
+COMMODITY_ALERT_PCT = {
+    'GC=F':  1.5,   # Gold
+    'SI=F':  2.0,   # Silver — more volatile
+    'CL=F':  2.0,   # WTI crude
+    'BZ=F':  2.0,   # Brent crude
+    'NG=F':  3.0,   # Nat gas — very volatile
+    'HG=F':  1.5,   # Copper
+    'URA':   2.5,   # Uranium ETF
+}
+
+# Yield level alerts — absolute level breaches worth flagging
+YIELD_LEVEL_ALERTS = {
+    '2Y':  [3.5, 4.0, 4.5, 5.0, 5.5],
+    '5Y':  [3.5, 4.0, 4.5, 5.0, 5.5],
+    '10Y': [3.5, 4.0, 4.5, 5.0, 5.5],
+    '20Y': [4.0, 4.5, 5.0, 5.5, 6.0],
+    '30Y': [4.0, 4.5, 5.0, 5.5, 6.0],
+}
+
 # NEWS TRIAGE
 MAX_HEADLINES_PER_TICKER = 3
 NEWS_KEYWORD_MIN_MATCHES = 2      # minimum keyword matches to flag thesis_breaker

@@ -53,7 +53,14 @@ from equity.brief.performance_tracker import (
 from equity.brief.sector_monitor import fetch_sector_data, format_sector_section
 from equity.config import config_manager
 from equity.config import positions as positions_module
-from equity.config.market_config import LARGE_MOVE_THRESHOLD_PCT, NEWS_HEADLINE_PAGE_SIZE
+from equity.config.market_config import (
+    COMMODITY_ALERT_PCT,
+    FX_ALERT_PCT,
+    LARGE_MOVE_THRESHOLD_PCT,
+    NEWS_HEADLINE_PAGE_SIZE,
+    YIELD_ALERT_BP,
+    YIELD_LEVEL_ALERTS,
+)
 from equity.portfolio.monitor import format_portfolio_monitor, run_portfolio_monitor
 from equity.portfolio.news_triage import format_news_triage, run_news_triage
 from equity.screener.quality_scorer import score_ticker
@@ -681,6 +688,40 @@ async def send_discuss(update, context):
 @authorized_only
 async def send_macro(update, context):
     await start_or_resume_discussion("MACRO", update, context, thread_type="topic")
+
+
+@authorized_only
+async def send_yields(update, context):
+    """
+    /yields — on-demand live macro snapshot: Treasury yields, key FX
+    pairs, key commodities. Useful when you need current yield levels
+    mid-discussion, without opening a MACRO discussion thread (/macro).
+
+    Forces a fresh fetch rather than reusing advisor.get_live_macro_snapshot()'s
+    normal 15-minute chat-context cache — the entire point of asking on
+    demand is "what's the level right now" (same private-cache-reset
+    pattern positions.reload() already uses on _portfolio_context_cache).
+    """
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, text="📡 Fetching live macro data..."
+    )
+
+    import equity.telegram.advisor as advisor_module
+    advisor_module._macro_snapshot_cache["timestamp"] = 0
+
+    snapshot = await run_in_executor(advisor.get_live_macro_snapshot)
+    if not snapshot:
+        await reply(
+            update, context,
+            "⚠️ Could not fetch live macro data. Check /logs errors.",
+            reply_markup=make_main_menu(),
+        )
+        return
+
+    await send_safe(
+        context.bot, update.effective_chat.id,
+        f"📡 *Live Macro Snapshot*\n\n{snapshot}", reply_markup=make_main_menu(),
+    )
 
 
 @authorized_only
@@ -1434,7 +1475,7 @@ async def handle_message(update, context):
 
 
 KNOWN_COMMANDS = [
-    "discuss", "macro", "portfolio", "portfolio_review",
+    "discuss", "macro", "yields", "portfolio", "portfolio_review",
     "screener", "news", "brief", "watchlist", "threads",
     "switch", "add", "remove", "update", "set", "save", "framework",
     "confirm", "cancel", "done", "audit", "logs", "status", "logout",
@@ -1532,6 +1573,164 @@ def _get_market_hours_now() -> bool:
     return market_open <= now_et <= market_close
 
 
+def _level_crossed(prev: float, curr: float, level: float) -> bool:
+    """True if the move from `prev` to `curr` crossed `level`, in either direction."""
+    return (prev < level <= curr) or (prev > level >= curr)
+
+
+def _fx_context_note(fx_ticker: str, move_pct: float) -> str:
+    """Portfolio-relevant note for an FX move alert."""
+    notes = {
+        "USDJPY=X": ("JPY strengthening — risk-off signal, watch SMFG thesis" if move_pct < 0
+                     else "JPY weakening — BOJ pressure or risk-on carry trade"),
+        "USDCNH=X": ("CNH strengthening — watch BYDDY, TSM, EWW exposure" if move_pct > 0
+                     else "CNH weakening — China macro stress, watch BYDDY, TSM, EWW"),
+        "EURUSD=X": ("EUR strengthening — watch European exposure, TLT correlation" if move_pct > 0
+                     else "EUR weakening — dollar strength, headwind for commodities"),
+        "DXY":      ("Dollar weakening — tailwind for gold, commodities, EM" if move_pct < 0
+                     else "Dollar strengthening — headwind for commodities, EM positions"),
+    }
+    return notes.get(fx_ticker, f'{"USD weakening" if move_pct < 0 else "USD strengthening"} — check commodity and EM exposure')
+
+
+def _commodity_context_note(ticker: str, move_pct: float) -> str:
+    """Portfolio-relevant note for a commodity move alert."""
+    notes = {
+        "GC=F": ("Gold surging — safe-haven or inflation signal, watch TLT relationship" if move_pct > 0
+                 else "Gold selling — risk-on or deflation signal, watch real rate direction"),
+        "CL=F": ("Oil rising — inflation risk, watch energy positioning" if move_pct > 0
+                 else "Oil falling — growth concern or supply, watch FCX/commodity exposure"),
+        "BZ=F": ("Brent rising — inflation risk, global demand signal" if move_pct > 0
+                 else "Brent falling — demand concern, watch commodity positions"),
+        "HG=F": ("Copper surging — strong global growth signal, positive for FCX, CAT, industrials" if move_pct > 0
+                 else "Copper falling — growth slowdown signal, watch FCX, CAT, industrials"),
+        "URA":  ("Uranium ETF surging — nuclear thesis accelerating, constructive for CCJ/CEG" if move_pct > 0
+                 else "Uranium ETF falling — watch CCJ/CEG thesis, check for sector news"),
+        "NG=F": ("Nat gas surging — energy cost pressure, watch utility margins" if move_pct > 0
+                 else "Nat gas falling — energy cost relief"),
+        "SI=F": ("Silver surging — industrial/monetary demand, watch PPLT relationship" if move_pct > 0
+                 else "Silver falling — check gold/silver ratio for regime signal"),
+    }
+    return notes.get(ticker, f'{"Rising" if move_pct > 0 else "Falling"} — check portfolio exposure')
+
+
+def _check_macro_alerts(today: str) -> list[dict]:
+    """Checks Treasury yields, FX rates, and commodities for intraday alerts.
+
+    Returns a list of alert dicts in the same shape `intraday_alert_job()`
+    already expects. Called in executor — no async, and does its own
+    (synchronous) data fetch rather than taking a pre-fetched snapshot.
+
+    Built on `market_snapshot.fetch_market_snapshot()` — already imported
+    in this module for the morning brief — rather than a second yfinance/
+    FRED fetch of its own: that function already covers every tenor in
+    `YIELD_ALERT_BP` (2Y/20Y come from FRED; yfinance alone doesn't carry
+    them — see `market_config.TREASURY_FRED_SERIES`) and every FX/commodity
+    ticker below, each already paired with its move vs prior close. 'DXY'
+    isn't an FX_TICKERS pair — it resolves to the DX-Y.NYB dollar index in
+    `snapshot['commodities']`, the same one `market_snapshot` already
+    fetches for its own regime inputs, rather than a separate ETF proxy.
+    """
+    alerts = []
+
+    try:
+        snapshot = fetch_market_snapshot()
+    except Exception as e:
+        logger.warning(f"_check_macro_alerts: snapshot fetch failed: {e}")
+        return alerts
+
+    # --- Treasury yields ---
+    treasury_curve = snapshot.get("treasury_curve", {})
+    for tenor, threshold_bp in YIELD_ALERT_BP.items():
+        entry = treasury_curve.get(tenor)
+        if entry is None:
+            continue
+        curr = entry.get("yield_pct")
+        move_bp = entry.get("change_1d_bps")
+        if curr is None or move_bp is None:
+            continue
+        prev = curr - move_bp / 100
+
+        alert_key = f"yield_{tenor}_{today}"
+        if abs(move_bp) >= threshold_bp and alert_key not in _alerted_today:
+            direction = "📈" if move_bp > 0 else "📉"
+            alerts.append({
+                "ticker": f"{tenor} Treasury",
+                "type": "macro_yield",
+                "message": (
+                    f"{direction} *{tenor} Treasury yield* "
+                    f"{move_bp:+.1f}bp intraday → {curr:.2f}%\n"
+                    f"{'Rising yields — watch TLT, duration-sensitive positions' if move_bp > 0 else 'Falling yields — watch TLT thesis, rate-sensitive positioning'}"
+                ),
+                "key": alert_key,
+            })
+
+        for level in YIELD_LEVEL_ALERTS.get(tenor, []):
+            level_key = f"yield_{tenor}_level_{level}_{today}"
+            if level_key in _alerted_today or not _level_crossed(prev, curr, level):
+                continue
+            direction = "broke above" if curr > prev else "broke below"
+            emoji = "⚠️" if curr > prev else "✅"
+            alerts.append({
+                "ticker": f"{tenor} Treasury",
+                "type": "macro_yield_level",
+                "message": (
+                    f"{emoji} *{tenor} yield {direction} {level:.2f}%*\n"
+                    f"Current: {curr:.3f}% | Prior close: {prev:.3f}%\n"
+                    f"Key level breach — reassess duration positioning"
+                ),
+                "key": level_key,
+            })
+
+    # --- FX rates ---
+    fx_data = snapshot.get("fx", {})
+    dxy_entry = snapshot.get("commodities", {}).get("DX-Y.NYB")
+    for fx_ticker, threshold in FX_ALERT_PCT.items():
+        if fx_ticker == "DXY":
+            entry, label = dxy_entry, "DXY Dollar Index"
+        else:
+            entry = fx_data.get(fx_ticker)
+            label = entry.get("label", fx_ticker) if entry else fx_ticker
+        if entry is None:
+            continue
+        move_pct = entry.get("change_1d_pct")
+        if move_pct is None:
+            continue
+
+        alert_key = f"fx_{fx_ticker}_{today}"
+        if abs(move_pct) >= threshold and alert_key not in _alerted_today:
+            direction = "📈" if move_pct > 0 else "📉"
+            alerts.append({
+                "ticker": label,
+                "type": "macro_fx",
+                "message": f"{direction} *{label}* {move_pct:+.2f}% intraday\n{_fx_context_note(fx_ticker, move_pct)}",
+                "key": alert_key,
+            })
+
+    # --- Commodities ---
+    commodities_ext = snapshot.get("commodities_extended", {})
+    for comm_ticker, threshold in COMMODITY_ALERT_PCT.items():
+        entry = commodities_ext.get(comm_ticker)
+        if entry is None:
+            continue
+        move_pct = entry.get("change_1d_pct")
+        if move_pct is None:
+            continue
+        label = entry.get("label", comm_ticker)
+
+        alert_key = f"commodity_{comm_ticker}_{today}"
+        if abs(move_pct) >= threshold and alert_key not in _alerted_today:
+            direction = "📈" if move_pct > 0 else "📉"
+            alerts.append({
+                "ticker": label,
+                "type": "macro_commodity",
+                "message": f"{direction} *{label}* {move_pct:+.2f}% intraday\n{_commodity_context_note(comm_ticker, move_pct)}",
+                "key": alert_key,
+            })
+
+    return alerts
+
+
 async def intraday_alert_job(context) -> None:
     """
     Runs every 30 minutes during market hours (see __main__ job_queue
@@ -1604,10 +1803,27 @@ async def intraday_alert_job(context) -> None:
     except Exception as e:
         logger.warning(f"intraday_alert_job: news check failed: {e}")
 
+    # Macro alerts — Treasury yields, FX rates, commodities
+    try:
+        macro_alerts = await run_in_executor(_check_macro_alerts, today)
+        alerts.extend(macro_alerts)
+    except Exception as e:
+        logger.warning(f"intraday_alert_job: macro check failed: {e}")
+
     # Send alerts
     for alert in alerts:
         ticker = alert["ticker"]
-        kb = make_tickers_keyboard([ticker], label="💬 Discuss")
+        if alert["type"].startswith("macro_"):
+            # Macro alerts' "ticker" is a display label ("10Y Treasury", "DXY
+            # Dollar Index"), not a real discussable symbol — route Discuss
+            # to the existing MACRO topic thread (same callback as /macro's
+            # menu button) rather than make_tickers_keyboard(), which would
+            # build a ticker_<label> thread for a symbol that doesn't exist.
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Discuss Macro", callback_data="cmd_macro")]])
+        else:
+            kb = make_tickers_keyboard([ticker], label="💬 Discuss")
         try:
             await send_safe(context.bot, TELEGRAM_USER_ID,
                              f"🔔 *INTRADAY ALERT*\n\n{alert['message']}", reply_markup=kb)
@@ -1680,6 +1896,7 @@ async def post_init(application):
         BotCommand("brief", "Full morning brief"),
         BotCommand("discuss", "Discuss a ticker: /discuss APP"),
         BotCommand("macro", "Macro and regime discussion"),
+        BotCommand("yields", "Live yields, FX and commodity prices"),
         BotCommand("portfolio", "Portfolio price action"),
         BotCommand("portfolio_review", "In-depth portfolio review"),
         BotCommand("screener", "Run equity screener"),
@@ -1760,6 +1977,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threads", send_threads))
     app.add_handler(CommandHandler("discuss", send_discuss))
     app.add_handler(CommandHandler("macro", send_macro))
+    app.add_handler(CommandHandler("yields", send_yields))
     app.add_handler(CommandHandler("portfolio_review", send_portfolio_review))
     app.add_handler(CommandHandler("switch", send_switch))
     app.add_handler(CommandHandler("done", send_done))
