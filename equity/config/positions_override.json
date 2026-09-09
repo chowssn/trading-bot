@@ -97,11 +97,13 @@
     },
     "APP": {
       "avg_cost": 300.0,
+      "classification_status": "complete",
       "last_reviewed": "2026-09",
       "macro_thesis": "Mobile advertising spend is structurally growing as app ecosystems expand globally; AI-driven performance advertising is taking share from brand advertising; post-IDFA environment favors probabilistic AI platforms like APP's Axon over legacy attribution models",
       "market_value": 638.07,
       "shares": 2.0,
       "size_pct": 0.81,
+      "style": "growth",
       "target_exit_conditions": "Exit if price reclaims 50D SMA then fails again with deteriorating fundamentals, or if VVIX sustains above 100 triggering speculative sleeve reduction, or if next earnings shows Axon revenue growth below 20% YoY",
       "thesis": "APP is a high-quality adtech compounder with a dominant AI-driven mobile advertising platform (Axon) generating exceptional returns on capital. The business has strong structural tailwinds from mobile gaming and app monetization growth, with forward earnings multiples that appear reasonable relative to growth if execution continues. The current drawdown reflects macro/sentiment compression rather than fundamental deterioration.",
       "thesis_breakers": [
@@ -109,7 +111,8 @@
         "Revenue growth decelerates below 20% YoY for two consecutive quarters without clear macro explanation",
         "Key customer concentration risk materializes with loss of top 3 gaming publishers representing >15% of revenue"
       ],
-      "tier": "high_conviction"
+      "tier": "high_conviction",
+      "tier_v2": "speculative_high"
     },
     "BSX": {
       "avg_cost": 57.46,
