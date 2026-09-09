@@ -135,6 +135,26 @@ Exit rule: thesis broken — not price target. Build positions in pieces.
 Prefer smaller frequent wins over large infrequent wins with deep drawdowns."""
 
 
+def _extract_text(response, label: str) -> str:
+    """Response text, warning if the model was cut off at max_tokens.
+
+    A `max_tokens` stop is invisible in the returned text — it just ends
+    mid-sentence — but it silently drops whatever the prompt asked for
+    last. For the two synthesis calls that request a NEW MONITORING ITEMS
+    block (which the prompts place at the end), that meant the block was
+    never emitted and `_parse_and_persist_monitoring()` found nothing to
+    parse. This was the actual cause of the empty monitoring list: the
+    parser was looking for a section the response never got to.
+    """
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        logger.warning(
+            "%s: response hit max_tokens and was truncated — trailing sections "
+            "(including any NEW MONITORING ITEMS block) are missing. Raise max_tokens.",
+            label,
+        )
+    return response.content[0].text.strip()
+
+
 def synthesize_section(section_name: str, section_data: str, regime_flags: list[str] | None = None) -> str:
     """Concise synthesis for one brief section. Cached `SYNTHESIS_CACHE_HOURS` hours by content hash."""
     data_hash = hashlib.md5(section_data.encode()).hexdigest()
@@ -176,7 +196,7 @@ Under 200 words total."""
 
     try:
         r = client.messages.create(model=MODEL, max_tokens=400, messages=[{"role": "user", "content": prompt}])
-        result = r.content[0].text.strip()
+        result = _extract_text(r, f"Section synthesis ({section_name})")
         _save_cache(path, result)
         return result
     except Exception as exc:  # anthropic SDK can raise a variety of API/network errors
@@ -276,18 +296,26 @@ If no action is warranted, say so in one sentence — do not invent suggestions.
 Never suggest adding to a position that is NOT in the dislocation zone
 (down 10-50% from highs with RSI confirming a turn) unless explicitly noted as an exception.
 
-NEW MONITORING ITEMS:
-List any new items that emerged from today's data that should be tracked going forward.
-Format: TICKER | specific condition to watch | priority (high/medium/low)
-Only add items that are genuinely worth tracking for multiple days.
-Examples of good monitoring items:
-  TSLA | Megapack margin trajectory in next earnings | high
-  TSLA | RSI 14D — watch for oversold + turn signal as framework entry setup | medium
-  PLTR | Multi-year high resistance — do not add until RSI confirms pullback absorbed | medium
-  GOOGL | 200D MA test — follow-through in next 3 sessions determines if support holds | high
-Examples of bad monitoring items (too vague, not actionable):
-  MSFT | watch for weakness | low
-  General | market conditions | medium
+<<<NEW_MONITORING_ITEMS>>>
+List items in EXACTLY this format, one per line, pipe-delimited:
+TICKER | specific measurable condition to watch | high/medium/low
+
+Example:
+TSLA | Megapack margin trajectory in next earnings | high
+PLTR | RSI 14D — watch for oversold + turn signal as framework entry setup | medium
+GOOGL | 200D MA test — follow-through in next 3 sessions determines if support holds | high
+
+Rules:
+- Use the exact pipe-delimited format above — no other format
+- TICKER must be the exact ticker symbol (TSLA not Tesla)
+- Condition must be specific and measurable
+- Only include if genuinely worth tracking for 3+ sessions
+- Maximum 3 items per synthesis call
+- If nothing warrants monitoring, write: NONE
+<<<END_MONITORING_ITEMS>>>
+
+This delimited block is REQUIRED — always emit it, and emit it last. Keep
+the preceding sections short enough that you always reach it.
 
 Be direct. Be specific. Name tickers and levels. Avoid generic macro commentary
 that does not connect to a specific position or actionable decision."""
@@ -295,10 +323,16 @@ that does not connect to a specific position or actionable decision."""
     try:
         r = client.messages.create(
             model=MODEL,
-            max_tokens=800,  # higher limit than synthesize_section() — this is the richest section
+            # Richest section, and the one whose prompt ends with the
+            # required NEW MONITORING ITEMS block. At 800 the response was
+            # reliably hitting max_tokens partway through the MONITORING
+            # UPDATES section and never reaching that block, so monitoring
+            # items were silently never captured. Sized with headroom over
+            # the ~800-token bodies actually observed.
+            max_tokens=1400,
             messages=[{"role": "user", "content": prompt}],
         )
-        result = r.content[0].text.strip()
+        result = _extract_text(r, "Performance synthesis")
         _save_cache(path, result)
         return result
     except Exception as exc:  # anthropic SDK can raise a variety of API/network errors
@@ -306,51 +340,347 @@ that does not connect to a specific position or actionable decision."""
         return f"[Performance synthesis unavailable: {exc}]"
 
 
-def _parse_and_persist_monitoring(synthesis_text: str) -> None:
-    """Extracts the NEW MONITORING ITEMS block from `synthesize_performance()`'s
+def synthesize_global_signals(
+    section_data: str,
+    regime_flags: list[str] | None = None,
+    monitoring_items: list[dict] | None = None,
+) -> str:
+    """Dedicated synthesis for the global signals section — same
+    monitoring-list-integration and NEW MONITORING ITEMS pattern as
+    `synthesize_performance()`, since this section spans multiple asset
+    classes simultaneously and its cross-asset reads are exactly the kind
+    of thing worth tracking across sessions (see `_parse_and_persist_monitoring()`).
+
+    Higher max_tokens than `synthesize_section()`'s generic per-section
+    call — cross-asset synthesis has more to potentially cover (futures,
+    vol, crypto, international, credit, ratios) than a single-asset-class
+    section. Cached `SYNTHESIS_CACHE_HOURS` hours by content hash.
+    """
+    data_hash = hashlib.md5(section_data.encode()).hexdigest()
+    path = _cache_path("global_signals", data_hash)
+    cached = _load_cache(path)
+    if cached:
+        return cached
+
+    regime_str = ", ".join(regime_flags) if regime_flags else "No active regime flags"
+    positions_ctx = _get_positions_context()
+
+    monitoring_str = ""
+    if monitoring_items:
+        monitoring_str = "\n\nACTIVE MONITORING LIST (carry these forward unless dismissed):\n"
+        for item in monitoring_items:
+            monitoring_str += (
+                f'- [{item["ticker"]}] {item["item"]} '
+                f'(priority: {item.get("priority", "medium")}, age: {item.get("age_days", 0)}d)\n'
+            )
+
+    prompt = f"""{FRAMEWORK}
+
+Current regime: {regime_str}
+
+{positions_ctx}
+{monitoring_str}
+
+GLOBAL SIGNALS DATA:
+{section_data}
+
+You are writing the global signals synthesis for a discretionary portfolio manager.
+This section covers futures, volatility, crypto, international indices, credit proxies,
+and cross-asset ratios. It should inform real-time decisions and regime assessment.
+
+Length guidance: Scale to signal density. A quiet session with no notable moves
+warrants 100-150 words. A session with multiple cross-asset signals or regime-relevant
+moves warrants 200-350 words. Never pad — every sentence must earn its place.
+
+Structure as follows:
+
+SUMMARY (2-4 sentences):
+What is the dominant cross-asset theme right now?
+Be specific about which instruments are confirming vs. contradicting each other.
+Identify whether the signal pattern is risk-on, risk-off, growth-driven, inflation-driven,
+liquidity-driven, or idiosyncratic. Name specific levels and moves.
+Example of good summary: "Equity futures flat but VIX/VVIX diverging upward while
+copper/gold ratio falls — surface calm masking growing hedging demand. International
+indices bifurcating: Asia +2% while Europe flat, suggesting regional rather than global
+risk-on. Credit spreads (HYG -0.3%) contradicting equity futures strength."
+Example of bad summary: "Markets showing mixed signals across asset classes today."
+
+PORTFOLIO IMPLICATIONS (3-5 bullets, scaled to signal significance):
+- For each cross-asset signal: name the specific portfolio positions affected and how.
+  Be direct — "KOSPI +3% confirms TSM thesis" not "Korean markets moving positively."
+- For volatility signals: if VIX/VVIX elevated, name which positions face multiple
+  compression risk and whether the QQQ/SPY put hedge overlay is relevant.
+- For FX moves: name which positions are directly affected
+  (USD/JPY → SMFG thesis; USD/CNH → BYDDY, TSM, EWW; copper → FCX, CAT, industrials).
+- For yield moves: name duration-sensitive positions (TLT thesis, MSFT/AMZN/GOOGL
+  multiple compression risk) and the bp move relative to thesis-breaker levels.
+- For crypto: flag if BTC move is risk-appetite signal relevant to broader positioning.
+- For credit proxies: HYG vs LQD spread changes indicate credit stress — name which
+  speculative positions (PLTR, RDDT, UMAC, QBTS) are most credit-sensitive.
+
+CROSS-ASSET VERDICT (1-2 sentences):
+What does the aggregate signal say about the current regime?
+Is this a CONFIRM (signals consistent with existing regime), CONTRADICT (signals
+inconsistent — warrants reassessment), or MIXED (no clear directional read)?
+Name the single most important cross-asset signal today.
+
+MONITORING UPDATES (only if monitoring list is non-empty):
+For each active monitoring item related to macro/global signals:
+one line stating current status. Escalate if worsening. Flag if resolved.
+
+SUGGESTIONS (1-3 items):
+Specific and actionable. Name the ticker and the exact condition.
+For monitoring items: state what would trigger dismissal vs. escalation.
+Never suggest adding to a position not in the dislocation zone.
+If no action is warranted, say so in one sentence.
+
+<<<NEW_MONITORING_ITEMS>>>
+List items in EXACTLY this format, one per line, pipe-delimited:
+TICKER | specific measurable condition to watch | high/medium/low
+
+Example:
+USDJPY | BOJ intervention risk approaching 160 — watch SMFG thesis | high
+COPPER | Copper/gold ratio falling — growth concern signal, watch FCX thesis | medium
+VVIX | VVIX trending toward 90 — tail risk building, watch speculative position sizes | high
+
+Rules:
+- Use the exact pipe-delimited format above — no other format
+- TICKER must be the exact ticker/pair symbol (USDJPY not "the yen")
+- Condition must be specific and measurable
+- Only include if genuinely worth tracking for 3+ sessions
+- Maximum 3 items per synthesis call
+- If nothing warrants monitoring, write: NONE
+<<<END_MONITORING_ITEMS>>>
+
+This delimited block is REQUIRED — always emit it, and emit it last. Keep
+the preceding sections short enough that you always reach it.
+
+Be specific about cross-asset relationships. Name tickers. Name levels.
+The person making decisions needs to know WHAT to do, not just WHAT is happening."""
+
+    try:
+        r = client.messages.create(
+            model=MODEL,
+            # Same truncation problem as synthesize_performance() at 700 —
+            # the trailing NEW MONITORING ITEMS block was being cut off.
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = _extract_text(r, "Global signals synthesis")
+        _save_cache(path, result)
+        return result
+    except Exception as exc:  # anthropic SDK can raise a variety of API/network errors
+        logger.warning("Global signals synthesis failed: %s", exc)
+        return f"[Global signals synthesis unavailable: {exc}]"
+
+
+# Sentinel the synthesis prompts now ask for. Unlike a prose header it
+# can't collide with the model merely *mentioning* the section by name in
+# a preamble, and its explicit end marker means a blank line between items
+# no longer truncates the block.
+MONITORING_BLOCK_START = "<<<NEW_MONITORING_ITEMS>>>"
+MONITORING_BLOCK_END = "<<<END_MONITORING_ITEMS>>>"
+
+# Where a legacy (undelimited) block ends: two blank lines, a markdown
+# horizontal rule ON ITS OWN LINE, or end of text. The rule alternative is
+# anchored to a full line on purpose — an unanchored `---` also matched the
+# `|---|---|` separator row inside a markdown table, cutting the block off
+# before any of the table's item rows.
+_BLOCK_END = r"(?:\n\s*\n\s*\n|\n\s*-{3,}\s*(?:\n|$)|\Z)"
+
+# Tried in order, but see `_extract_monitoring_block()`: the FIRST pattern
+# to match is not automatically the winner. Every pattern is tried at every
+# position and the candidate yielding the most parseable item lines wins.
+#
+# That matters because these patterns overlap. "NEW MONITORING ITEMS" is a
+# substring of "**NEW MONITORING ITEMS**", and the plain-header pattern also
+# matches where the model merely *names* the section in a preamble ("I'll
+# close with NEW MONITORING ITEMS and SUGGESTIONS") — under first-match-wins
+# either case captured an empty or junk block and the real items, sitting a
+# few lines further down, were never looked for.
+_MONITORING_HEADER_PATTERNS = [
+    # Explicit delimiter pair — most reliable, no ambiguity about where the
+    # block ends.
+    rf"{re.escape(MONITORING_BLOCK_START)}(.*?){re.escape(MONITORING_BLOCK_END)}",
+    # Same delimiter, but the response was cut off before the end marker.
+    rf"{re.escape(MONITORING_BLOCK_START)}(.*)\Z",
+    # Legacy prose headers, kept so a cached synthesis from before the
+    # delimiter change still parses.
+    r"\*\*NEW MONITORING ITEMS\*\*[:\s]*(.*?)" + _BLOCK_END,
+    r"NEW MONITORING ITEMS[:\s]*(.*?)" + _BLOCK_END,
+    r"NEW ITEMS TO MONITOR[:\s]*(.*?)" + _BLOCK_END,
+    r"MONITORING ITEMS[:\s]*(.*?)" + _BLOCK_END,
+]
+
+
+_NO_ITEMS_MARKERS = ("none", "(none)", "n/a", "-")
+
+# Column labels from a markdown table header row. The model sometimes
+# renders the items as a table instead of bare pipe-delimited lines, and
+# its header row is pipe-delimited too — without this it parsed into a
+# monitoring item for a ticker literally named "TICKER".
+_TABLE_HEADER_TOKENS = {"ticker", "symbol", "item", "condition", "priority", "name", "level"}
+
+
+def _emitted_empty_monitoring_block(synthesis_text: str) -> bool:
+    """True if the response emitted the monitoring block but declared no items.
+
+    Distinguishes "the model got to the block and said NONE" (expected,
+    quiet) from "the block never appeared at all" (a real failure worth a
+    warning — a truncated response, or a header shape nothing matches).
+    """
+    start = synthesis_text.find(MONITORING_BLOCK_START)
+    if start == -1:
+        return False
+    body = synthesis_text[start + len(MONITORING_BLOCK_START):]
+    end = body.find(MONITORING_BLOCK_END)
+    if end != -1:
+        body = body[:end]
+    lines = [ln.strip().lstrip("- •*").strip().lower() for ln in body.split("\n")]
+    content = [ln for ln in lines if ln]
+    return all(ln in _NO_ITEMS_MARKERS for ln in content)
+
+
+def _count_item_lines(block: str) -> int:
+    """How many lines in `block` look like `TICKER | condition | priority`."""
+    return sum(1 for line in block.split("\n") if "|" in line.strip().lstrip("- •*").strip())
+
+
+def _extract_monitoring_block(synthesis_text: str) -> tuple[str | None, str | None]:
+    """Best monitoring block in `synthesis_text`, as `(block, pattern_used)`.
+
+    Scores every match of every pattern by how many pipe-delimited item
+    lines it contains and returns the highest scorer, so a pattern that
+    matches early but captures nothing useful can't shadow one that
+    actually found the items. Ties break toward the earlier pattern in
+    `_MONITORING_HEADER_PATTERNS`, which is ordered most- to least-specific.
+    """
+    best_block = None
+    best_pattern = None
+    best_score = 0
+
+    for pattern in _MONITORING_HEADER_PATTERNS:
+        for match in re.finditer(pattern, synthesis_text, re.DOTALL | re.IGNORECASE):
+            block = match.group(1).strip()
+            if not block:
+                continue
+            score = _count_item_lines(block)
+            if score > best_score:
+                best_block, best_pattern, best_score = block, pattern, score
+
+    return best_block, best_pattern
+
+
+def _parse_and_persist_monitoring(synthesis_text: str, source: str = "synthesis") -> None:
+    """Extracts the NEW MONITORING ITEMS block from a synthesis call's
     output and persists it via `equity.data.monitoring.add_monitoring_items()`.
 
-    Expected line format: `TICKER | condition | priority`. Never raises —
-    a malformed or absent block just means nothing new gets persisted this
-    run, which is no worse than the monitoring list not growing that day.
+    Only the strict `TICKER | condition | priority` line format is parsed
+    — both synthesis prompts now say "use EXACTLY this format" for exactly
+    this reason. An earlier version of this function also tried to recover
+    a ticker from colon/dash-separated prose lines when a line had no `|`;
+    dropped it — scoped to a block that's supposed to be item lines, a
+    stray line of ordinary prose (e.g. "(none)" written as a full sentence,
+    or the model wandering back into commentary before the actual `\n\n`
+    break) could still parse as "TICKER: the rest of the sentence" and
+    create a bogus monitoring item, which is worse than just not parsing
+    that line.
+
+    `source` is which synthesis call this came from (e.g.
+    "performance_synthesis", "global_signals_synthesis") — stored per item
+    so `equity.data.monitoring`'s history shows where it originated.
+
+    Never raises — a malformed or absent block just means nothing new gets
+    persisted this run, which is no worse than the monitoring list not
+    growing that day. Logs at each stage (which header pattern matched, if
+    any; how many items parsed) so an actual failure — as opposed to the
+    model legitimately writing "(none)" for the block — is diagnosable
+    from the logs rather than just silently not showing up.
     """
-    match = re.search(
-        r"NEW MONITORING ITEMS[:\s]*(.*?)(?:\n\n|\Z)",
-        synthesis_text, re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
+    if not synthesis_text:
+        logger.debug("_parse_and_persist_monitoring: empty synthesis text (source=%s)", source)
         return
 
-    block = match.group(1).strip()
-    new_items = []
+    logger.debug(
+        "_parse_and_persist_monitoring: parsing %d chars from %s",
+        len(synthesis_text), source,
+    )
 
+    block, pattern = _extract_monitoring_block(synthesis_text)
+
+    if not block and _emitted_empty_monitoring_block(synthesis_text):
+        # The model reached the block and correctly reported nothing to
+        # track. That's a normal outcome, not a parse failure — don't warn.
+        logger.debug(
+            "_parse_and_persist_monitoring: model reported no items to monitor (source=%s)", source,
+        )
+        return
+
+    if not block:
+        # WARNING, not DEBUG, and with a much longer tail: when this fires
+        # the items are silently lost, and the tail is the only evidence of
+        # why. A tail that stops mid-sentence means the response hit
+        # max_tokens before it ever reached the monitoring block — that is a
+        # token-budget problem, not a regex problem, and no additional
+        # pattern will fix it (see the max_tokens note on the synthesis
+        # calls above).
+        logger.warning(
+            "_parse_and_persist_monitoring: no monitoring block found in %d char synthesis "
+            "(source=%s). Last 500 chars: %r",
+            len(synthesis_text), source, synthesis_text[-500:],
+        )
+        return
+
+    logger.debug(
+        "_parse_and_persist_monitoring: matched pattern %r -> %d char block",
+        pattern[:50], len(block),
+    )
+
+    new_items = []
     for line in block.split("\n"):
-        line = line.strip().lstrip("- •").strip()
+        line = line.strip().lstrip("- •*").strip()
         if "|" not in line:
             continue
-        parts = [p.strip() for p in line.split("|")]
+        # Markdown table separator rows ("|---|---|") aren't items.
+        if set(line) <= set("|- :"):
+            continue
+        # A markdown table row ("| TSLA | cond | high |") splits into empty
+        # leading/trailing fields — drop them so the ticker lands in parts[0].
+        parts = [p.strip() for p in line.strip("|").split("|")]
         if len(parts) < 2:
             continue
-        ticker = parts[0].upper()
+        ticker = parts[0].upper().strip("*_")
         item_text = parts[1]
-        priority = parts[2].lower() if len(parts) > 2 else "medium"
+        if ticker.lower() in _TABLE_HEADER_TOKENS:
+            continue
+        priority = parts[2].lower().strip("*_ ") if len(parts) > 2 else "medium"
         priority = priority if priority in ("high", "medium", "low") else "medium"
         if ticker and item_text:
             new_items.append({
                 "ticker": ticker,
                 "item": item_text,
                 "priority": priority,
-                "source": "performance_synthesis",
+                "source": source,
             })
 
-    if new_items:
-        try:
-            from equity.data.monitoring import add_monitoring_items
+    if not new_items:
+        logger.debug(
+            "_parse_and_persist_monitoring: header matched but no valid items parsed "
+            "(source=%s). Block: %r",
+            source, block[:200],
+        )
+        return
 
-            add_monitoring_items(new_items)
-            logger.info("_parse_and_persist_monitoring: added %d items", len(new_items))
-        except Exception as exc:
-            logger.warning("_parse_and_persist_monitoring: failed to persist items: %s", exc)
+    logger.info(
+        "_parse_and_persist_monitoring: adding %d item(s) from %s: %s",
+        len(new_items), source, [i["ticker"] for i in new_items],
+    )
+    try:
+        from equity.data.monitoring import add_monitoring_items
+
+        add_monitoring_items(new_items)
+    except Exception as exc:
+        logger.warning("_parse_and_persist_monitoring: failed to persist items: %s", exc)
 
 
 def synthesize_full_brief(all_sections_text: str, regime_flags: list[str] | None = None) -> str:
@@ -379,6 +709,15 @@ OVERALL ASSESSMENT (2-3 sentences): The single most important thing to know this
 
 TOP 3 PORTFOLIO IMPLICATIONS (3 bullets max): The most material cross-section implications for current positions. Prioritize by urgency and magnitude. Name the ticker.
 
+When assessing these, consider:
+- Cross-asset confirmation/contradiction: do futures, vol, credit, and international indices tell the same story or different stories?
+- If VIX/VVIX elevated: which speculative positions face the most compression risk?
+- If yield moves are significant: TLT thesis status and duration exposure across the book.
+- If FX moves are significant: SMFG (JPY), BYDDY/EWW/TSM (CNH), FCX/commodities (DXY).
+- If copper/gold ratio moving: FCX, CAT, industrials thesis implications.
+- If crypto moving significantly: risk appetite signal relevant to RDDT, PLTR positioning.
+The most actionable implications often come from CONTRADICTIONS between asset classes, not confirmations. Flag these explicitly when present.
+
 TODAY'S FOCUS (1-2 bullets): If you had to focus on one position decision and one thing to monitor today — what are they? Be specific.
 
 IMPORTANT constraints for the position decision in TODAY'S FOCUS:
@@ -394,7 +733,7 @@ Direct, specific, prioritized. Under 250 words."""
 
     try:
         r = client.messages.create(model=MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
-        result = r.content[0].text.strip()
+        result = _extract_text(r, "Full brief synthesis")
         _save_cache(path, result)
         return result
     except Exception as exc:  # anthropic SDK can raise a variety of API/network errors
@@ -413,3 +752,9 @@ if __name__ == "__main__":
     full = synthesize_full_brief(test_data, ["DOLLAR_STRENGTH"])
     print("=== Full brief synthesis test ===")
     print(full)
+
+    global_test_data = "ES=F +0.1% | VIX 14.5 | VVIX 84.4 | BTC-USD +0.4% | Nikkei 225 +2.0% | HYG -0.06%"
+    global_result = synthesize_global_signals(global_test_data, ["DOLLAR_STRENGTH"])
+    print()
+    print("=== Global signals synthesis test ===")
+    print(global_result)

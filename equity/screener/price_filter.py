@@ -279,11 +279,24 @@ def _run_price_filter_uncached(tickers: list[str], batch_size: int, rsi_threshol
     for batch in _chunk(tickers, batch_size):
         rows.extend(_process_batch(batch, rsi_threshold))
 
+    # Count where names are lost. `rows` is what survived download +
+    # per-ticker computation; a big gap between len(tickers) and len(rows)
+    # means yfinance batches are failing, not that the market is quiet.
+    logger.info(
+        "Price filter: %d tickers requested, %d downloaded and computed (%d lost in fetch/compute)",
+        len(tickers), len(rows), len(tickers) - len(rows),
+    )
+
     if not rows:
+        logger.warning("Price filter: no tickers survived download — every batch failed or returned no data")
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     df = pd.DataFrame(rows)
     passing = df[df["passes_dislocation"]].reset_index(drop=True)
+    logger.info(
+        "Price filter: %d computed -> %d passed dislocation screen (RSI threshold %.1f)",
+        len(df), len(passing), rsi_threshold,
+    )
 
     # Market cap filter — real company market cap from yfinance, fetched
     # only for the (small) set of names that already passed price/RSI/volume.
@@ -293,7 +306,12 @@ def _run_price_filter_uncached(tickers: list[str], batch_size: int, rsi_threshol
     passing["market_cap_unverified"] = [unverified for _, unverified in market_caps]
 
     keep = passing["market_cap_unverified"] | (passing["market_cap_b"] >= settings.UNIVERSE_MIN_MARKET_CAP_B)
+    before_mcap = len(passing)
     passing = passing[keep].reset_index(drop=True)
+    logger.info(
+        "Price filter: %d dislocated -> %d after market cap floor ($%.1fB)",
+        before_mcap, len(passing), settings.UNIVERSE_MIN_MARKET_CAP_B,
+    )
 
     return passing[OUTPUT_COLUMNS]
 

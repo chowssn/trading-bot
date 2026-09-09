@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 import pandas as pd
@@ -18,6 +19,7 @@ import yfinance as yf
 
 from backtest.indicators import rsi as calc_rsi
 from equity.brief import market_snapshot
+from equity.data.price_cache import price_cache
 from equity.config import positions as positions_config
 from equity.config import settings
 from equity.config.market_config import HIGHLIGHT_MA_PERIODS
@@ -27,6 +29,12 @@ from equity.telegram.threads import ThreadManager
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-6"
+
+# Hourly cap on _fetch_web_fundamentals() batches — each batch is 4
+# searches x 2 Claude calls (a web search + a grounded-extraction pass
+# each) = 8 calls. See _web_fundamentals_budget_ok() for why this can't
+# just reuse bot.py's check_claude_rate_limit().
+WEB_FUNDAMENTALS_MAX_PER_HOUR = 8
 
 # Module-level cache for _build_full_portfolio_context() — shared across
 # Advisor instances since the content (positions + live prices) doesn't
@@ -65,6 +73,28 @@ _cross_thread_context_cache: dict = {"text": {}, "timestamp": {}}
 # brief's synthesis sections to — must match the literal there.
 _BRIEF_THREAD_ID = "topic_BRIEF"
 
+
+def _other_thread_depth(age_hours: float) -> tuple[int | None, bool, int, str]:
+    """Recency-weighted context depth for one "other thread" in
+    `_get_cross_thread_context_uncached()`, given how long ago it was last
+    active.
+
+    Returns (verbatim_count, include_summary, summary_chars, age_label).
+    `verbatim_count` is None past the 30-day cutoff — the caller omits the
+    thread from cross-thread context entirely rather than dragging a
+    month-old conversation into every prompt.
+    """
+    age_days = age_hours / 24
+    if age_hours < 24:
+        return 10, True, 500, f"{int(age_hours)}h ago"
+    if age_days < 2:
+        return 5, True, 300, "yesterday"
+    if age_days < 7:
+        return 2, True, 200, f"{int(age_days)}d ago"
+    if age_days < 30:
+        return 0, True, 100, f"{int(age_days)}d ago"
+    return None, False, 0, ""
+
 _FRAMEWORK = """--- Investment Framework ---
 Liquidity-first, macro-aware, quality-at-discount strategy.
 Primary edge: identifying structurally sound businesses temporarily
@@ -81,6 +111,30 @@ Position sizing: building in pieces over time, not all at once.
 Drawdown philosophy: prefer smaller frequent wins over large
 infrequent wins with deep drawdowns between them."""
 
+_DATA_INTEGRITY_RULES = """--- DATA INTEGRITY RULES ---
+These rules are absolute. Violating them destroys the value of this system.
+
+NEVER fabricate or estimate these figures if not in your context:
+  - Market cap, shares outstanding
+  - Revenue, revenue by segment, revenue by geography
+  - Customer names or customer concentration percentages
+  - Analyst price targets or consensus ratings
+  - Contract values or pipeline figures
+  - Short interest
+  - ROIC (must come from the quality score section — never estimated)
+
+When data is missing, say exactly:
+  "I don't have current [market cap / revenue / etc] in my context.
+   Check FMP, Bloomberg, or the company's most recent 10-Q."
+
+It is never acceptable to provide a plausible-sounding number without a source.
+A wrong number is worse than no number — it leads to bad decisions.
+
+Ticker context sections labeled "searched this session" (web search) are
+current as of this discussion. Anything else — including your own training
+data — is NOT current for company-specific figures and must not be cited
+as if it were."""
+
 
 class Advisor:
     def __init__(self, api_key: str, thread_manager: ThreadManager):
@@ -91,6 +145,9 @@ class Advisor:
         # session. In-memory only (not persisted via thread_manager) —
         # this is UX polish, not state that needs to survive a restart.
         self._suggestion_history: dict[str, list[str]] = {}
+        # Rolling timestamps of _fetch_web_fundamentals() batches, for
+        # _web_fundamentals_budget_ok()'s hourly cap.
+        self._web_fundamentals_call_times: list[float] = []
 
     # ------------------------------------------------------------------
     # System prompt construction
@@ -102,7 +159,7 @@ class Advisor:
         include_positions: bool = True,
         current_thread_id: str | None = None,
     ) -> str:
-        sections = [_FRAMEWORK, self._get_framework_context()]
+        sections = [_FRAMEWORK, self._get_framework_context(), _DATA_INTEGRITY_RULES]
 
         if include_positions:
             lines = ["--- Current Positions ---"]
@@ -213,9 +270,7 @@ class Advisor:
         old by the time a discussion happens. Cached 15 minutes — same
         cadence and module-level-cache pattern as
         `_build_full_portfolio_context()`. Never raises: any failure
-        (including market_snapshot.fetch_market_snapshot() itself, which
-        does its own internal degrade-on-failure per section) returns ''
-        rather than blocking the system prompt.
+        returns '' rather than blocking the system prompt.
         """
         now = time.time()
         cached_text = _macro_snapshot_cache["text"]
@@ -235,51 +290,76 @@ class Advisor:
     def _build_live_macro_snapshot_uncached(self) -> str:
         """Builds the text `get_live_macro_snapshot()` caches.
 
-        Reuses `market_snapshot.fetch_market_snapshot()` (already imported
-        for `get_regime_context()`) rather than a separate yfinance fetch:
-        that function already covers 2Y/20Y (FRED — yfinance alone doesn't
-        carry them, see market_config.TREASURY_FRED_SERIES) and every FX/
-        commodity ticker below, each already paired with its move vs prior
-        close, plus the multi-index/retry handling its own batch download
-        needs.
+        Reads the shared `equity.data.price_cache` rather than fetching
+        independently — see that module's docstring. `price_cache.get_yield()`
+        transparently resolves 2Y/20Y to their FRED-sourced cache entries
+        (not on yfinance — see market_config.TREASURY_FRED_SERIES) so this
+        doesn't need its own FRED handling.
         """
-        snapshot = market_snapshot.fetch_market_snapshot()
+        from equity.config.market_config import (
+            COMMODITY_TICKERS_EXTENDED,
+            CROSS_ASSET_RATIOS,
+            FX_TICKERS,
+            SIGNAL_THRESHOLDS,
+        )
 
         lines = ["--- LIVE MACRO DATA (fetched now, ~15 min delayed) ---"]
 
-        treasury_curve = snapshot.get("treasury_curve", {})
         yield_lines = [
-            f"  {tenor}: {entry['yield_pct']:.3f}% ({entry['change_1d_bps']:+.1f}bp)"
+            f"  {tenor}: {entry['price']:.3f}% ({entry['change_1d_bps']:+.1f}bp)"
             for tenor in _MACRO_SNAPSHOT_TENORS
-            if (entry := treasury_curve.get(tenor)) is not None
+            if (entry := price_cache.get_yield(tenor)) is not None
         ]
         if yield_lines:
             lines.append("Yields:")
             lines.extend(yield_lines)
 
-        fx_data = snapshot.get("fx", {})
         fx_lines = [
-            f"  {entry.get('label', ticker)}: {entry['price']:.4f} ({entry['change_1d_pct']:+.2f}%)"
+            f"  {FX_TICKERS.get(ticker, ticker)}: {entry['price']:.4f} ({entry['change_1d_pct']:+.2f}%)"
             for ticker in _MACRO_SNAPSHOT_FX
-            if (entry := fx_data.get(ticker)) is not None
+            if (entry := price_cache.get(ticker)) is not None
         ]
         if fx_lines:
             lines.append("FX:")
             lines.extend(fx_lines)
 
-        commodities_ext = snapshot.get("commodities_extended", {})
         comm_lines = [
-            f"  {entry.get('label', ticker)}: ${entry['price']:.2f} ({entry['change_1d_pct']:+.2f}%)"
+            f"  {COMMODITY_TICKERS_EXTENDED.get(ticker, ticker)}: ${entry['price']:.2f} ({entry['change_1d_pct']:+.2f}%)"
             for ticker in _MACRO_SNAPSHOT_COMMODITIES
-            if (entry := commodities_ext.get(ticker)) is not None
+            if (entry := price_cache.get(ticker)) is not None
         ]
         if comm_lines:
             lines.append("Commodities:")
             lines.extend(comm_lines)
 
-        warnings = snapshot.get("data_warnings") or []
-        if warnings:
-            lines.append(f"Data warnings: {'; '.join(warnings[:3])}")
+        # Cross-asset signals — a compact read of the same ratios
+        # market_snapshot.format_global_signals() shows in the brief, so a
+        # mid-discussion advisor question about regime confirmation doesn't
+        # have to wait for the next brief run.
+        ratio_lines = ["Cross-asset signals:"]
+        for ratio_name, (t1, t2, description) in CROSS_ASSET_RATIOS.items():
+            d1, d2 = price_cache.get(t1), price_cache.get(t2)
+            if not d1 or not d2 or not d2.get("price"):
+                continue
+            ratio = d1["price"] / d2["price"]
+            if d1.get("prev_close") and d2.get("prev_close"):
+                prev_ratio = d1["prev_close"] / d2["prev_close"]
+                if prev_ratio:
+                    chg = (ratio / prev_ratio - 1) * 100
+                    direction = "↑" if chg > 0 else "↓"
+                    ratio_lines.append(f"  {description}: {ratio:.4f} {direction}{abs(chg):.1f}% today")
+        if len(ratio_lines) > 1:
+            lines.append("\n".join(ratio_lines))
+
+        vix, vvix = price_cache.get("^VIX"), price_cache.get("^VVIX")
+        if vix and vvix:
+            vvix_val = vvix["price"]
+            vol_regime = (
+                "EXTREME" if vvix_val > SIGNAL_THRESHOLDS["vvix_extreme"]
+                else "ELEVATED" if vvix_val > SIGNAL_THRESHOLDS["vvix_elevated"]
+                else "NORMAL"
+            )
+            lines.append(f"Vol regime: VIX {vix['price']:.1f} | VVIX {vvix_val:.1f} → {vol_regime}")
 
         return "\n".join(lines)
 
@@ -457,34 +537,275 @@ class Advisor:
                     lines.append("...(truncated)")
             lines.append("")
 
-        all_threads = self.thread_manager.list_threads()
-        other_threads = [
-            t
-            for t in all_threads
-            if t["thread_id"] != current_thread_id
-            and t["thread_id"] != _BRIEF_THREAD_ID
-            and t.get("message_count", 0) > 0
-        ]
+        # --- Other active threads, recency-weighted depth ---
+        #
+        # A thread active in the last day earns real verbatim messages; one
+        # untouched for weeks earns a one-line summary, if that. Depth
+        # tiers by age (see _OTHER_THREAD_DEPTH_TIERS): active-today gets
+        # up to 10 verbatim messages, active-this-week gets 2, older gets a
+        # thread summary only, and anything past 30 days is omitted
+        # entirely — a flat "last 2 messages regardless of age" (the
+        # previous behavior here) either starved a same-day thread of
+        # context or kept dragging a month-old one into every prompt.
+        try:
+            all_threads = self.thread_manager.list_threads()
+            other_threads = [
+                t
+                for t in all_threads
+                if t["thread_id"] != current_thread_id
+                and t["thread_id"] != _BRIEF_THREAD_ID
+                and t.get("message_count", 0) > 0
+            ]
 
-        if other_threads:
-            lines.append("--- RECENT ACTIVITY IN OTHER THREADS ---")
-            lines.append("(For cross-reference — use these to avoid contradicting prior discussions)")
-            lines.append("")
+            if other_threads:
+                lines.append("--- RECENT ACTIVITY IN OTHER THREADS ---")
+                lines.append("(For cross-reference — use these to avoid contradicting prior discussions)")
+                lines.append("")
 
-            for thread in other_threads[:5]:  # cap to keep the prompt bounded
-                thread_id = thread["thread_id"]
-                subject = thread.get("subject", thread_id)
-                last_active = thread.get("last_active", "unknown")
-                msg_count = thread.get("message_count", 0)
+                for thread in other_threads[:8]:
+                    thread_id = thread["thread_id"]
+                    subject = thread.get("subject", thread_id)
+                    last_active_str = thread.get("last_active", "")
+                    msg_count = thread.get("message_count", 0)
 
-                recent_msgs = self.thread_manager.get_messages_for_api(thread_id, recent_verbatim=2)
-                if recent_msgs:
-                    last_msg = recent_msgs[-1].get("content", "")[:300]
-                    lines.append(f"Thread: {subject} ({msg_count} messages, last active {last_active})")
-                    lines.append(f"Last discussed: {last_msg}...")
+                    try:
+                        age_hours = (datetime.now() - datetime.fromisoformat(last_active_str)).total_seconds() / 3600 if last_active_str else 999.0
+                    except ValueError:
+                        age_hours = 999.0
+
+                    verbatim_count, include_summary, summary_chars, age_label = _other_thread_depth(age_hours)
+                    if verbatim_count is None:  # past 30 days — omit entirely
+                        continue
+
+                    lines.append(f"Thread: {subject} ({msg_count} messages, {age_label})")
+
+                    if include_summary:
+                        try:
+                            thread_info = self.thread_manager.get_thread_info(thread_id)
+                            summary = (thread_info or {}).get("summary") or ""
+                            if summary:
+                                lines.append(f"Summary: {summary[:summary_chars]}")
+                        except Exception as exc:
+                            logger.debug("cross_thread_context: summary fetch failed for %s: %s", thread_id, exc)
+
+                    if verbatim_count > 0:
+                        try:
+                            recent_msgs = self.thread_manager.get_messages_for_api(thread_id, recent_verbatim=verbatim_count)
+                        except Exception:
+                            recent_msgs = []
+                        for msg in recent_msgs[-verbatim_count:]:
+                            role_label = "You" if msg.get("role") == "user" else "Advisor"
+                            lines.append(f"  {role_label}: {msg.get('content', '')[:300]}")
+
                     lines.append("")
+        except Exception as exc:
+            logger.debug("cross_thread_context: other-threads section failed: %s", exc)
+
+        # --- High-priority monitoring items ---
+        try:
+            from equity.data.monitoring import load_monitoring
+
+            high_priority = [m for m in load_monitoring() if m.get("priority") == "high"]
+            if high_priority:
+                lines.append("--- HIGH PRIORITY MONITORING ---")
+                for item in high_priority[:5]:
+                    lines.append(f'  [{item["ticker"]}] {item["item"]} ({item.get("age_days", 0)}d)')
+                lines.append("")
+        except Exception as exc:
+            logger.debug("cross_thread_context: monitoring fetch failed: %s", exc)
 
         return "\n".join(lines) if lines else ""
+
+    # ------------------------------------------------------------------
+    # Web-searched fundamentals — the gap-filling layer for get_ticker_context()
+    # ------------------------------------------------------------------
+    #
+    # Architecture: search for what yfinance/the quality scorer DON'T
+    # already give us, not what they do. Already covered elsewhere in
+    # get_ticker_context() and never re-searched here: price, 1Y/3M/etc.
+    # returns, 52W high/low, moving averages, RSI, trailing/forward P/E,
+    # P/B, P/S, EV/EBITDA (all yfinance), ROIC/CFO-NI/net-debt/margins/
+    # share count (the quality scorer), recent headlines (yfinance news),
+    # position cost basis/size/P&L (IBKR import), and regime flags
+    # (market_snapshot). The four searches below cover the remaining gap:
+    # verified market cap/shares/segment/customer detail, earnings date +
+    # analyst consensus, recent material events, and named competitors —
+    # none of which yfinance or FMP's free tier reliably carries.
+
+    def _web_fundamentals_budget_ok(self) -> bool:
+        """Self-contained hourly cap on _fetch_web_fundamentals() batches.
+
+        advisor.py can't reuse bot.py's check_claude_rate_limit() —
+        bot.py already imports Advisor from here, so importing back would
+        be circular — and get_ticker_context() (which calls
+        _fetch_web_fundamentals()) runs *before* bot.py's own rate-limit
+        check on the chat() call that follows it in
+        start_or_resume_discussion(). Without a check here, opening
+        several new /discuss TICKER threads in a row would burn through
+        8 uncounted Claude calls each (4 searches x 2 calls) with nothing
+        bounding it until the unrelated chat-budget check downstream.
+        """
+        now = time.time()
+        self._web_fundamentals_call_times[:] = [
+            t for t in self._web_fundamentals_call_times if now - t < 3600
+        ]
+        if len(self._web_fundamentals_call_times) >= WEB_FUNDAMENTALS_MAX_PER_HOUR:
+            return False
+        self._web_fundamentals_call_times.append(now)
+        return True
+
+    def _web_search_and_extract(self, query: str, extract_prompt: str, max_tokens: int = 400) -> str:
+        """One web search + grounded-extraction pass: search, then re-read
+        the raw result and pull out only the facts `extract_prompt` asks
+        for, refusing anything not literally present in the source. Same
+        shape as bot.py's `_enrich_alert_with_context()`, with a stricter
+        no-inference instruction since this feeds investment decisions
+        rather than a one-off alert note. Never raises — returns '' on
+        any failure (missing search results, API error) so one search
+        failing doesn't take down the others in `_fetch_web_fundamentals()`.
+        """
+        try:
+            response = self.client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": query}],
+            )
+            raw = "\n".join(
+                b.text for b in response.content if hasattr(b, "text") and b.text
+            ).strip()
+            if not raw:
+                return ""
+
+            extraction = self.client.messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"{extract_prompt}\n\n"
+                        f"Source material:\n{raw}\n\n"
+                        f"Rules: Only state facts present in source material. "
+                        f'If a fact is absent, write "not found". '
+                        f"Never estimate or infer. "
+                        f"Include source name and date for each key fact."
+                    ),
+                }],
+            )
+            text_parts = [b.text for b in extraction.content if hasattr(b, "text") and b.text]
+            return "\n".join(text_parts).strip()
+        except Exception as exc:
+            logger.warning("_web_search_and_extract failed: %s", exc)
+            return ""
+
+    def _fetch_web_fundamentals(self, ticker: str, company_name: str = "") -> dict:
+        """Four targeted web searches filling get_ticker_context()'s data
+        gaps — market cap/shares/segments/customers, earnings date +
+        analyst consensus, recent material events (last 90 days), and
+        named competitors. Returns {section_key: extracted_text}; a
+        section is simply absent from the dict if its search found
+        nothing or failed (never a fabricated placeholder).
+
+        Results are used in this conversation's context only — nothing
+        here is written to thread history or any other persisted store.
+
+        The 4 searches are independent (each its own search + extraction
+        pair) and run concurrently, not sequentially — each pair is two
+        blocking Anthropic calls, so doing all 4 one after another would
+        push a ticker-open to 40-60s+ rather than the ~10-20s a fresh
+        /discuss TICKER is expected to take.
+        """
+        if not self._web_fundamentals_budget_ok():
+            logger.warning(
+                "_fetch_web_fundamentals: hourly budget (%d/hr) exhausted — skipping web search for %s",
+                WEB_FUNDAMENTALS_MAX_PER_HOUR, ticker,
+            )
+            return {}
+
+        name_ctx = company_name or ticker
+
+        # query, extract_prompt, max_tokens — one entry per search.
+        searches: dict[str, tuple[str, str, int]] = {
+            "fundamentals": (
+                f"{ticker} {name_ctx} stock market cap shares outstanding "
+                f"revenue breakdown by segment geography fiscal 2025 2026 "
+                f"customer concentration top customers",
+                f"Extract these specific facts about {ticker} from the source:\n"
+                f"- Market cap (current, verified)\n"
+                f"- Shares outstanding (current)\n"
+                f"- Total revenue (trailing 12M or most recent fiscal year)\n"
+                f"- Revenue by segment (name each segment and its % or $ contribution)\n"
+                f"- Revenue by geography if disclosed\n"
+                f"- Top customers (names and % of revenue if disclosed)\n"
+                f"- Customer concentration risk (is any customer >10% of revenue?)\n"
+                f"Format as a concise bulleted list. One fact per bullet.",
+                500,
+            ),
+            "earnings_consensus": (
+                f"{ticker} {name_ctx} next earnings date "
+                f"analyst price target consensus EPS revenue estimate "
+                f"Wall Street forecast",
+                f"Extract these specific facts about {ticker} from the source:\n"
+                f"- Next earnings date (exact date or expected quarter)\n"
+                f"- Consensus EPS estimate for next quarter\n"
+                f"- Consensus revenue estimate for next quarter\n"
+                f"- Analyst consensus rating (Buy/Hold/Sell counts)\n"
+                f"- Consensus price target (mean)\n"
+                f"- High price target and source\n"
+                f"- Low price target and source\n"
+                f"- Number of analysts covering\n"
+                f"- Any recent estimate revisions (upgrades or downgrades in last 30 days)\n"
+                f"Format as a concise bulleted list. One fact per bullet.",
+                400,
+            ),
+            "recent_events": (
+                f"{ticker} {name_ctx} news contract award regulatory "
+                f"management change acquisition partnership earnings results "
+                f"guidance update last 90 days",
+                f"Extract material events for {ticker} from the last 90 days:\n"
+                f"- Any contract wins or losses (include value if disclosed)\n"
+                f"- Regulatory filings or decisions (FDA, FCC, DOD, SEC, etc.)\n"
+                f"- Management changes (CEO, CFO, board)\n"
+                f"- M&A activity (acquisitions, divestitures, partnerships)\n"
+                f"- Guidance changes (raised, lowered, withdrawn)\n"
+                f"- Most recent earnings: EPS vs estimate, revenue vs estimate, key management commentary\n"
+                f"- Short interest current % and trend (increasing/decreasing)\n"
+                f"- Any institutional ownership changes (13F filings)\n"
+                f"Only include events that are material to the investment thesis. "
+                f"Format: [Date] Event — one line per event, most recent first.",
+                500,
+            ),
+            "competitive": (
+                f"{ticker} {name_ctx} competitors market share competitive position "
+                f"industry landscape peer comparison",
+                f"Extract competitive context for {ticker}:\n"
+                f"- Primary competitors (name each, one line on why they compete)\n"
+                f"- Market position (leader/challenger/niche, and in which specific market)\n"
+                f"- Total addressable market size and {ticker}'s estimated share\n"
+                f"- Key competitive advantages {ticker} claims\n"
+                f"- Key competitive threats or vulnerabilities\n"
+                f"- Any recent competitive wins or losses vs named peers\n"
+                f'Do not estimate market share if not found — write "not found".',
+                400,
+            ),
+        }
+
+        results: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(searches)) as pool:
+            future_to_key = {
+                pool.submit(self._web_search_and_extract, query, extract_prompt, max_tokens): key
+                for key, (query, extract_prompt, max_tokens) in searches.items()
+            }
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    text = future.result()
+                except Exception as exc:
+                    logger.warning("_fetch_web_fundamentals: %s search failed for %s: %s", key, ticker, exc)
+                    text = ""
+                if text:
+                    results[key] = text
+        return results
 
     # ------------------------------------------------------------------
     # Ticker / regime context
@@ -493,16 +814,23 @@ class Advisor:
     def get_ticker_context(self, ticker: str) -> str:
         """Build comprehensive per-ticker context for a new discussion thread.
 
-        Six independently-failing sections (price/technicals, valuation,
-        quality score, position context, news, regime) are each wrapped in
-        their own try/except — one section failing never blocks the others,
-        and a failure is surfaced as a one-line note rather than silently
-        dropped. A seventh, live-macro section is added on top of those for
-        MACRO_PROXY_TICKERS only (TLT, GLD, SLV, etc. — see that constant).
+        Seven independently-failing sections (price/technicals, valuation,
+        quality score, web-searched fundamentals, position context, news,
+        regime) are each wrapped in their own try/except — one section
+        failing never blocks the others, and a failure is surfaced as a
+        one-line note rather than silently dropped. An eighth, live-macro
+        section is added on top of those for MACRO_PROXY_TICKERS only
+        (TLT, GLD, SLV, etc. — see that constant).
+
+        The web-searched fundamentals section (`_fetch_web_fundamentals()`)
+        is the only one that costs real time/money — 4 concurrent web
+        search + extraction passes, expected around 10-20s total. Everything
+        else here is a yfinance/local read.
         """
         start_time = time.monotonic()
         sections = []
         price: float | None = None
+        company_name: str = ""
 
         # ------------------------------------------------------------
         # Section 1 — Price & technicals
@@ -611,6 +939,11 @@ class Advisor:
         # ------------------------------------------------------------
         try:
             info = yf.Ticker(ticker).info
+            # Captured here (outer-scope `company_name`) rather than
+            # re-fetched with a second yf.Ticker(ticker).info call in the
+            # web-fundamentals section below — same info dict, no reason
+            # to hit yfinance twice for it.
+            company_name = info.get("longName") or info.get("shortName") or ""
 
             def _x(val) -> str:
                 return f"{val:.1f}x" if val is not None else "n/a"
@@ -700,7 +1033,54 @@ class Advisor:
             )
 
         # ------------------------------------------------------------
-        # Section 4 — Position context
+        # Section 4 — Web-searched fundamentals (the gap-filling layer —
+        # see _fetch_web_fundamentals()'s own comment for what this does
+        # and doesn't cover). Runs for every ticker discussion, budget
+        # permitting (_web_fundamentals_budget_ok()) — an ETF/index
+        # ticker (e.g. a MACRO_PROXY_TICKERS entry) will mostly come back
+        # "not found" for segment/customer/competitor facts that don't
+        # apply to it, which is the correct behavior (no fabrication),
+        # just not very informative.
+        # ------------------------------------------------------------
+        try:
+            web_data = self._fetch_web_fundamentals(ticker, company_name)
+
+            if web_data:
+                lines = [
+                    "--- WEB-SEARCHED FUNDAMENTALS (searched this session) ---",
+                    "Current as of this discussion. Cross-reference against SEC filings before "
+                    "acting on any figure below.",
+                ]
+                section_labels = {
+                    "fundamentals": "MARKET CAP, SEGMENTS & CUSTOMERS",
+                    "earnings_consensus": "EARNINGS & ANALYST CONSENSUS",
+                    "recent_events": "MATERIAL EVENTS (last 90 days)",
+                    "competitive": "COMPETITIVE LANDSCAPE",
+                }
+                for key, label in section_labels.items():
+                    if web_data.get(key):
+                        lines.append(f"\n{label}:")
+                        lines.append(web_data[key])
+                sections.append("\n".join(lines))
+            else:
+                sections.append(
+                    "--- WEB-SEARCHED FUNDAMENTALS: unavailable ---\n"
+                    "Search failed, found nothing, or the hourly search budget was "
+                    "exhausted this run. Do not estimate market cap, revenue, segment/"
+                    "customer detail, or analyst targets — state explicitly that "
+                    "current web data isn't available for this discussion."
+                )
+        except Exception as exc:
+            logger.warning("get_ticker_context: web fundamentals failed for %s: %s", ticker, exc)
+            sections.append(
+                "--- WEB-SEARCHED FUNDAMENTALS: unavailable ---\n"
+                "Do not estimate market cap, revenue, segment/customer detail, or "
+                "analyst targets — state explicitly that current web data isn't "
+                "available for this discussion."
+            )
+
+        # ------------------------------------------------------------
+        # Section 5 — Position context
         # ------------------------------------------------------------
         try:
             if ticker in positions_config.POSITIONS:
@@ -740,7 +1120,7 @@ class Advisor:
             sections.append("--- POSITION CONTEXT ---\nPosition context unavailable.")
 
         # ------------------------------------------------------------
-        # Section 5 — News headlines
+        # Section 6 — News headlines
         # ------------------------------------------------------------
         try:
             news_items = yf.Ticker(ticker).news or []
@@ -773,7 +1153,7 @@ class Advisor:
             sections.append("News headlines unavailable.")
 
         # ------------------------------------------------------------
-        # Section 6 — Regime context
+        # Section 7 — Regime context
         # ------------------------------------------------------------
         try:
             regime = self.get_regime_context()
@@ -783,7 +1163,7 @@ class Advisor:
             sections.append("--- CURRENT REGIME ---\nRegime context unavailable.")
 
         # ------------------------------------------------------------
-        # Section 7 — Live macro context (macro-proxy tickers only)
+        # Section 8 — Live macro context (macro-proxy tickers only)
         # ------------------------------------------------------------
         if ticker.upper() in MACRO_PROXY_TICKERS:
             try:

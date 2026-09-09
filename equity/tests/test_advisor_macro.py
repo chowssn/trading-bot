@@ -1,6 +1,10 @@
 """Tests for equity/telegram/advisor.py's live macro snapshot (get_live_macro_snapshot)
 — the advisor-side half of the macro monitoring extension. The alert-side half
 (_check_macro_alerts) is covered in test_bot_macro_alerts.py.
+
+get_live_macro_snapshot() reads the shared `equity.data.price_cache`
+singleton — these tests patch its `get`/`get_yield` methods rather than
+hitting real yfinance/FRED.
 """
 
 import unittest
@@ -16,20 +20,20 @@ def _make_advisor() -> Advisor:
     return Advisor(api_key="test-key", thread_manager=MagicMock())
 
 
-_FAKE_SNAPSHOT = {
-    "treasury_curve": {
-        "2Y": {"yield_pct": 4.10, "change_1d_bps": 3.2},
-        "10Y": {"yield_pct": 4.35, "change_1d_bps": -1.5},
-    },
-    "fx": {
-        "EURUSD=X": {"label": "EUR/USD", "price": 1.0850, "change_1d_pct": 0.25},
-    },
-    "commodities_extended": {
-        "GC=F": {"label": "Gold", "price": 2650.10, "change_1d_pct": 1.1},
-    },
-    "commodities": {},
-    "data_warnings": [],
+_FAKE_CACHE = {
+    "2Y": {"price": 4.10, "prev_close": 4.068, "change_1d_bps": 3.2, "is_yield": True},
+    "10Y": {"price": 4.35, "prev_close": 4.365, "change_1d_bps": -1.5, "is_yield": True},
+    "EURUSD=X": {"price": 1.0850, "prev_close": 1.0823, "change_1d_pct": 0.25, "is_yield": False},
+    "GC=F": {"price": 2650.10, "prev_close": 2621.28, "change_1d_pct": 1.1, "is_yield": False},
 }
+
+
+def _fake_get(ticker):
+    return _FAKE_CACHE.get(ticker)
+
+
+def _fake_get_yield(tenor):
+    return _FAKE_CACHE.get(tenor)
 
 
 class TestGetLiveMacroSnapshot(unittest.TestCase):
@@ -37,28 +41,38 @@ class TestGetLiveMacroSnapshot(unittest.TestCase):
         # Module-level cache is shared state — reset it between tests.
         advisor_module._macro_snapshot_cache["text"] = None
         advisor_module._macro_snapshot_cache["timestamp"] = 0.0
+        self._patches = (
+            patch.object(advisor_module.price_cache, "get", side_effect=_fake_get),
+            patch.object(advisor_module.price_cache, "get_yield", side_effect=_fake_get_yield),
+        )
+        for p in self._patches:
+            p.start()
 
-    @patch("equity.telegram.advisor.market_snapshot.fetch_market_snapshot", return_value=_FAKE_SNAPSHOT)
-    def test_includes_available_sections(self, mock_fetch):
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def test_includes_available_sections(self):
         result = _make_advisor().get_live_macro_snapshot()
         self.assertIn("2Y: 4.100% (+3.2bp)", result)
         self.assertIn("EUR/USD", result)
         self.assertIn("Gold", result)
 
-    @patch("equity.telegram.advisor.market_snapshot.fetch_market_snapshot", return_value=_FAKE_SNAPSHOT)
-    def test_caches_within_ttl(self, mock_fetch):
+    def test_caches_within_ttl(self):
         adv = _make_advisor()
         adv.get_live_macro_snapshot()
-        adv.get_live_macro_snapshot()
-        self.assertEqual(mock_fetch.call_count, 1)
+        with patch.object(advisor_module.price_cache, "get_yield", side_effect=AssertionError("should be cached")):
+            adv.get_live_macro_snapshot()  # must not touch price_cache again
 
-    @patch("equity.telegram.advisor.market_snapshot.fetch_market_snapshot", side_effect=Exception("boom"))
-    def test_never_raises_on_failure(self, mock_fetch):
-        self.assertEqual(_make_advisor().get_live_macro_snapshot(), "")
+    def test_empty_cache_still_returns_header(self):
+        with patch.object(advisor_module.price_cache, "get", return_value=None), \
+             patch.object(advisor_module.price_cache, "get_yield", return_value=None):
+            result = _make_advisor().get_live_macro_snapshot()
+        self.assertIn("LIVE MACRO DATA", result)
 
-    @patch("equity.telegram.advisor.market_snapshot.fetch_market_snapshot", return_value={})
-    def test_empty_snapshot_still_returns_header(self, mock_fetch):
-        self.assertIn("LIVE MACRO DATA", _make_advisor().get_live_macro_snapshot())
+    def test_never_raises_on_failure(self):
+        with patch.object(advisor_module.price_cache, "get_yield", side_effect=Exception("boom")):
+            self.assertEqual(_make_advisor().get_live_macro_snapshot(), "")
 
 
 class TestMacroProxyTickers(unittest.TestCase):
@@ -74,6 +88,33 @@ class TestMacroProxyTickers(unittest.TestCase):
     def test_excludes_ordinary_equity_positions(self):
         self.assertNotIn("AAPL", advisor_module.MACRO_PROXY_TICKERS)
         self.assertNotIn("MSFT", advisor_module.MACRO_PROXY_TICKERS)
+
+
+class TestOtherThreadDepth(unittest.TestCase):
+    def test_same_day_gets_full_verbatim(self):
+        verbatim, include_summary, chars, label = advisor_module._other_thread_depth(2.0)
+        self.assertEqual(verbatim, 10)
+        self.assertTrue(include_summary)
+        self.assertIn("h ago", label)
+
+    def test_yesterday_gets_moderate_verbatim(self):
+        verbatim, _, _, label = advisor_module._other_thread_depth(30.0)
+        self.assertEqual(verbatim, 5)
+        self.assertEqual(label, "yesterday")
+
+    def test_this_week_gets_light_verbatim(self):
+        verbatim, _, _, label = advisor_module._other_thread_depth(4 * 24.0)
+        self.assertEqual(verbatim, 2)
+
+    def test_this_month_gets_summary_only(self):
+        verbatim, include_summary, _, _ = advisor_module._other_thread_depth(15 * 24.0)
+        self.assertEqual(verbatim, 0)
+        self.assertTrue(include_summary)
+
+    def test_past_30_days_is_omitted(self):
+        verbatim, include_summary, _, _ = advisor_module._other_thread_depth(45 * 24.0)
+        self.assertIsNone(verbatim)
+        self.assertFalse(include_summary)
 
 
 if __name__ == "__main__":

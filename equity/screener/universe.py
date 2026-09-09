@@ -72,12 +72,32 @@ DELISTED_TICKERS = {
 }
 
 # A tradable US-equity ticker as it appears in this feed: 1-5 uppercase
-# letters. Used to find where the real holdings table ends (see
-# `_parse_raw_holdings`) — futures/cash line items sorted to the tail
-# (e.g. "FAU6", "ESU6") fail this, while non-equity rows shuffled into the
-# middle of the table (e.g. "USD", "XTSLA") pass it and are dropped later
-# by the asset_class == 'Equity' filter instead.
-TICKER_PATTERN = re.compile(r"^[A-Z]{1,5}$")
+# letters, optionally followed by a single-letter share-class suffix
+# separated by a space, dot, or hyphen ("BRK B", "HEI A", "BF B"). Used to
+# find where the real holdings table ends (see `_parse_raw_holdings`) —
+# futures/cash line items sorted to the tail (e.g. "FAU6", "ESU6") fail
+# this on their digits, while non-equity rows shuffled into the middle of
+# the table (e.g. "USD", "XTSLA") pass it and are dropped later by the
+# asset_class == 'Equity' filter instead.
+#
+# The class-suffix branch is NOT cosmetic: iShares switched multi-class
+# tickers from the concatenated form ("BRKB") to a space-separated one
+# ("BRK B") in the feed. Because `_parse_raw_holdings` truncates the table
+# at the FIRST ticker that fails this pattern, and Berkshire sits at row
+# ~12 by weight, the old letters-only pattern silently cut the universe
+# down to 11 names — the screener's "scanning 11 names" symptom. Any future
+# narrowing of this pattern risks the same silent truncation; the
+# `MIN_EXPECTED_TICKERS` guard in `fetch_russell_1000()` is the backstop.
+TICKER_PATTERN = re.compile(r"^[A-Z]{1,5}(?:[ .\-][A-Z])?$")
+
+# A parsed universe smaller than this means the feed shape changed (or the
+# endpoint returned a stub) rather than the index genuinely shrinking —
+# the Russell 1000 has ~1000 names. Below it we refuse to trust the fetch,
+# and in particular refuse to overwrite a good cache with it.
+MIN_EXPECTED_TICKERS = 100
+
+# Share-class separators iShares uses that yfinance expects as a hyphen.
+_CLASS_SUFFIX_RE = re.compile(r"^([A-Z]{1,5})[ .]([A-Z])$")
 
 # Row-level tickers that show up in the holdings table but are obviously not
 # tradable US equities (cash sweep, futures margin, etc.), belt-and-suspenders
@@ -104,6 +124,28 @@ TICKER_TRANSLATION = {
 # already in yfinance's expected format (plain 'HOLX'), so this was never a
 # ticker-format mismatch. HOLX went private (Blackstone, late 2025) and is
 # now excluded upstream via DELISTED_TICKERS instead.
+
+
+def _normalize_ticker(ticker: str) -> str:
+    """iShares ticker -> yfinance ticker.
+
+    Two steps, in order:
+
+    1. An explicit `TICKER_TRANSLATION` entry wins if one exists (that map
+       still carries the concatenated forms — 'BRKB', 'HEIA' — the feed used
+       before it switched to space separators, so a revert doesn't re-break
+       anything).
+    2. Otherwise a space/dot share-class separator becomes a hyphen, which
+       is the form yfinance wants: 'BRK B' -> 'BRK-B', 'HEI A' -> 'HEI-A'.
+
+    Anything else passes through unchanged.
+    """
+    if ticker in TICKER_TRANSLATION:
+        return TICKER_TRANSLATION[ticker]
+    match = _CLASS_SUFFIX_RE.match(ticker)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    return ticker
 
 
 def _is_cache_fresh(path: Path) -> bool:
@@ -154,10 +196,23 @@ def _parse_raw_holdings(csv_text: str) -> pd.DataFrame:
 
     ticker_col = df["Ticker"].astype(str).str.strip().str.strip('"').str.upper()
     valid_mask = ticker_col.str.match(TICKER_PATTERN)
+    rows_before_truncation = len(df)
     if not valid_mask.all():
         first_invalid = (~valid_mask).idxmax()
+        # Log WHAT stopped the table and WHERE. A truncation this early is
+        # the failure mode that quietly shrank the universe to 11 names
+        # (see TICKER_PATTERN) — surfacing the offending ticker makes the
+        # next feed-format change a one-line diagnosis instead of a hunt.
+        logger.info(
+            "Universe parse: table truncated at row %s of %d on ticker %r",
+            first_invalid, rows_before_truncation, ticker_col.loc[first_invalid],
+        )
         df = df.loc[: first_invalid - 1] if first_invalid > df.index[0] else df.iloc[0:0]
 
+    logger.info(
+        "Universe parse: %d raw rows from CSV, %d rows kept after end-of-table truncation",
+        rows_before_truncation, len(df),
+    )
     return df
 
 
@@ -182,13 +237,27 @@ def _clean_holdings(df_raw: pd.DataFrame) -> pd.DataFrame:
         )
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    rows_in = len(df)
+
     # Asset class: equities only.
     df = df[df["asset_class"] == "Equity"]
+    after_equity = len(df)
 
-    # Remove confirmed delisted/private tickers
-    df = df[~df['ticker'].isin(DELISTED_TICKERS)]
+    # Translate iShares tickers to yfinance format. Runs BEFORE the
+    # validity filter below, not after: the feed's share-class tickers
+    # arrive as "BRK B"/"HEI A", and the validity filter rejects residual
+    # spaces and dots — so normalizing afterwards would mean those names
+    # were already dropped. See `_normalize_ticker()`.
+    df["ticker"] = df["ticker"].map(_normalize_ticker)
 
-    # Ticker validity: non-blank, no dots, no spaces, not a known non-equity symbol.
+    # Remove confirmed delisted/private tickers (matched on the normalized
+    # yfinance form, which is what DELISTED_TICKERS holds).
+    df = df[~df["ticker"].isin(DELISTED_TICKERS)]
+
+    # Ticker validity: non-blank, not a known non-equity symbol, and no
+    # residual space/dot — a hyphen is fine (it's the normalized share-class
+    # form), but anything still carrying a separator after normalization is
+    # a shape this parser doesn't understand and shouldn't guess at.
     valid_ticker = (
         df["ticker"].notna()
         & ~df["ticker"].isin(["", "-", "NAN", "NONE"])
@@ -196,18 +265,21 @@ def _clean_holdings(df_raw: pd.DataFrame) -> pd.DataFrame:
         & ~df["ticker"].str.contains(" ", regex=False)
         & ~df["ticker"].isin(NON_EQUITY_TICKER_BLACKLIST)
     )
+    dropped = df.loc[~valid_ticker, "ticker"].tolist()
+    if dropped:
+        logger.debug("Universe: dropped %d row(s) on ticker validity: %s", len(dropped), dropped[:20])
     df = df[valid_ticker]
+    after_valid = len(df)
 
     # No market cap filter here — see module docstring: market_value is
     # IWB's position size, not company market cap. Market cap filtering
     # happens downstream in price_filter.py using yfinance data.
     df = df.drop_duplicates(subset="ticker").reset_index(drop=True)
 
-    # Translate iShares tickers to yfinance format. Runs last, after the
-    # ticker-validity filters and dedup above (which operate on the
-    # original iShares format) — see TICKER_TRANSLATION comment.
-    df["ticker"] = df["ticker"].map(lambda t: TICKER_TRANSLATION.get(t, t))
-
+    logger.info(
+        "Universe clean: %d parsed rows -> %d equity -> %d valid ticker -> %d after dedup",
+        rows_in, after_equity, after_valid, len(df),
+    )
     return df
 
 
@@ -242,8 +314,35 @@ def fetch_russell_1000(force_refresh: bool = False) -> pd.DataFrame:
             return pd.read_csv(CACHE_FILE)
         raise RuntimeError(f"Failed to fetch Russell 1000 universe and no cache exists at {CACHE_FILE}: {exc}") from exc
 
+    # Sanity gate. The download can succeed (HTTP 200, parses cleanly) and
+    # still yield a near-empty universe if the feed's shape changed — that
+    # is what happened when iShares switched to space-separated share-class
+    # tickers and the parser truncated the table at row 12. A short result
+    # is therefore treated as a failed fetch, not as the index shrinking:
+    # we fall back to cache and, critically, do NOT overwrite the cache with
+    # it (otherwise one bad fetch poisons every later run's fallback too).
+    if len(df) < MIN_EXPECTED_TICKERS:
+        logger.error(
+            "Universe fetch returned only %d tickers (expected >= %d) — likely a feed-format "
+            "change or an endpoint stub. Not caching this result.",
+            len(df), MIN_EXPECTED_TICKERS,
+        )
+        if CACHE_FILE.exists():
+            cached = pd.read_csv(CACHE_FILE)
+            if len(cached) >= MIN_EXPECTED_TICKERS:
+                logger.warning("Falling back to cached universe: %d tickers from %s", len(cached), CACHE_FILE)
+                return cached
+            logger.error(
+                "Cached universe at %s is also short (%d tickers) — no good fallback available.",
+                CACHE_FILE, len(cached),
+            )
+        raise RuntimeError(
+            f"Russell 1000 universe fetch returned only {len(df)} tickers "
+            f"(expected >= {MIN_EXPECTED_TICKERS}) and no usable cache exists at {CACHE_FILE}"
+        )
+
     df.to_csv(CACHE_FILE, index=False)
-    logger.info("Fetched Russell 1000 universe: %d tickers, cached to %s", len(df), CACHE_FILE)
+    logger.info("Universe fetch: %d tickers returned, cached to %s", len(df), CACHE_FILE)
     return df
 
 
@@ -253,8 +352,8 @@ def get_universe_tickers() -> list[str]:
 
 
 def translate_ticker(ticker: str) -> str:
-    """Translates an iShares CSV ticker to yfinance format. Returns unchanged if no translation exists."""
-    return TICKER_TRANSLATION.get(ticker, ticker)
+    """Translates an iShares CSV ticker to yfinance format. Returns unchanged if no translation applies."""
+    return _normalize_ticker(ticker)
 
 
 if __name__ == "__main__":

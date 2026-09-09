@@ -155,15 +155,34 @@ def run_screener(force_refresh: bool = False, regime_flags: list[str] | None = N
     else:
         tickers = universe.get_universe_tickers()
 
+    # A Russell 1000 universe that isn't roughly 1000 names means the
+    # upstream fetch degraded (see universe.MIN_EXPECTED_TICKERS) — worth
+    # a loud line here too, since this is where the shrunken count actually
+    # becomes visible as "the screener only scanned N names".
+    logger.info("Screener: universe stage -> %d tickers", len(tickers))
+    if len(tickers) < universe.MIN_EXPECTED_TICKERS:
+        logger.error(
+            "Screener: universe is only %d tickers — expected ~1000. Downstream counts "
+            "will be meaningless; check the iShares feed and universe.py parsing.",
+            len(tickers),
+        )
+
     price_df = price_filter.run_price_filter(tickers, regime_flags=regime_flags)
+    logger.info("Screener: %d universe -> %d after price filter", len(tickers), len(price_df))
     position_tickers = list(POSITIONS)
 
     rows = []
+    rejected_score = 0
+    rejected_flags = 0
     for _, prow in price_df.iterrows():
         ticker = prow["ticker"]
         quality = quality_scorer.score_ticker(ticker, settings.FMP_API_KEY)
 
-        if quality["quality_score"] < settings.MIN_QUALITY_SCORE or quality["red_flags"]:
+        if quality["quality_score"] < settings.MIN_QUALITY_SCORE:
+            rejected_score += 1
+            continue
+        if quality["red_flags"]:
+            rejected_flags += 1
             continue
 
         correlation = _check_entry_correlation(ticker, position_tickers)
@@ -180,6 +199,12 @@ def run_screener(force_refresh: bool = False, regime_flags: list[str] | None = N
             "market_cap_b": prow.get("market_cap_b"),
             **correlation,
         })
+
+    logger.info(
+        "Screener: %d after price filter -> %d after quality "
+        "(%d below score %.0f, %d on red flags)",
+        len(price_df), len(rows), rejected_score, settings.MIN_QUALITY_SCORE, rejected_flags,
+    )
 
     result = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     if not result.empty:
