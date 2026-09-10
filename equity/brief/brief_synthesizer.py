@@ -258,10 +258,10 @@ POSITIONS AFFECTED:
 ACTION: [specific ticker + action] OR "no action warranted"
 Condition: [what would change this]
 
-<<<NEW_MONITORING_ITEMS>>>
+<<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
 [TICKER] | [specific measurable condition] | [high/medium/low]
 (1-3 items max, or NONE)
-<<<END_MONITORING_ITEMS>>>
+<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
 
 Every line must be specific. No generic observations.
 If unsure, write less not more."""
@@ -368,7 +368,7 @@ If no action is warranted, say so in one sentence — do not invent suggestions.
 Never suggest adding to a position that is NOT in the dislocation zone
 (down 10-50% from highs with RSI confirming a turn) unless explicitly noted as an exception.
 
-<<<NEW_MONITORING_ITEMS>>>
+<<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
 List items in EXACTLY this format, one per line, pipe-delimited:
 TICKER | specific measurable condition to watch | high/medium/low
 
@@ -384,7 +384,7 @@ Rules:
 - Only include if genuinely worth tracking for 3+ sessions
 - Maximum 3 items per synthesis call
 - If nothing warrants monitoring, write: NONE
-<<<END_MONITORING_ITEMS>>>
+<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
 
 This delimited block is REQUIRED — always emit it, and emit it last. Keep
 the preceding sections short enough that you always reach it.
@@ -506,7 +506,7 @@ For monitoring items: state what would trigger dismissal vs. escalation.
 Never suggest adding to a position not in the dislocation zone.
 If no action is warranted, say so in one sentence.
 
-<<<NEW_MONITORING_ITEMS>>>
+<<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
 List items in EXACTLY this format, one per line, pipe-delimited:
 TICKER | specific measurable condition to watch | high/medium/low
 
@@ -522,7 +522,7 @@ Rules:
 - Only include if genuinely worth tracking for 3+ sessions
 - Maximum 3 items per synthesis call
 - If nothing warrants monitoring, write: NONE
-<<<END_MONITORING_ITEMS>>>
+<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
 
 This delimited block is REQUIRED — always emit it, and emit it last. Keep
 the preceding sections short enough that you always reach it.
@@ -576,6 +576,11 @@ _MONITORING_HEADER_PATTERNS = [
     rf"{re.escape(MONITORING_BLOCK_START)}(.*?){re.escape(MONITORING_BLOCK_END)}",
     # Same delimiter, but the response was cut off before the end marker.
     rf"{re.escape(MONITORING_BLOCK_START)}(.*)\Z",
+    # Claude sometimes drops the underscores from the delimiter
+    # (<<<NEWMONITORINGITEMS>>> instead of <<<NEW_MONITORING_ITEMS>>>) despite
+    # the prompt spelling it out — same two variants as above, underscore-free.
+    r"<<<NEWMONITORINGITEMS>>>(.*?)<<<ENDMONITORINGITEMS>>>",
+    r"<<<NEWMONITORINGITEMS>>>(.*)\Z",
     # Legacy prose headers, kept so a cached synthesis from before the
     # delimiter change still parses.
     r"\*\*NEW MONITORING ITEMS\*\*[:\s]*(.*?)" + _BLOCK_END,
@@ -810,10 +815,10 @@ Monitor: [ticker/signal + specific condition]
 
 RISK: [1 sentence — single biggest portfolio risk right now]
 
-<<<NEW_MONITORING_ITEMS>>>
+<<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
 [TICKER] | [specific measurable condition] | [high/medium/low]
 (1-3 items, or NONE)
-<<<END_MONITORING_ITEMS>>>"""
+<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)"""
 
     try:
         r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
