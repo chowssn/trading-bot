@@ -48,7 +48,11 @@ from fredapi import Fred
 from equity.config.market_config import (
     COMMODITY_TICKERS,
     COMMODITY_TICKERS_EXTENDED,
+    CREDIT_TICKERS,
+    CROSS_ASSET_RATIOS,
+    CRYPTO_TICKERS,
     EQUITY_BENCHMARKS,
+    EQUITY_FUTURES,
     FX_FORWARD_FOREIGN_RATES,
     FX_FORWARD_TENORS,
     FX_TENOR_DAYS,
@@ -56,16 +60,20 @@ from equity.config.market_config import (
     HIGHLIGHT_EXTREMES_PCT,
     HIGHLIGHT_MA_PERIODS,
     HIGHLIGHT_MA_PROXIMITY_PCT,
+    INTERNATIONAL_INDICES,
     JGB_10Y_FRED_SERIES,
     RATE_TICKERS,
     REGIME_RULES,
+    SIGNAL_THRESHOLDS,
     TREASURY_FRED_SERIES,
     TREASURY_SPREADS,
     TREASURY_TICKERS,
     VIX_ELEVATED,
     VIX_EXTREME,
     VIX_HIGH,
+    VOLATILITY_TICKERS,
 )
+from equity.data.price_cache import price_cache
 from equity.data.yfinance_utils import yf_download
 
 load_dotenv()
@@ -857,8 +865,214 @@ def format_market_snapshot(snapshot: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Global signals — equity futures, crypto, volatility, international
+# indices, credit proxies, and cross-asset ratios. All read from the
+# shared price_cache (see that module's docstring) rather than fetched
+# here — this module's own 5Y-history batches exist for MA/extremes on
+# the tickers above, which none of these need.
+# ---------------------------------------------------------------------------
+
+# Local trading hours per international index (weekday-only, holidays not
+# accounted for — same simplification price_cache.py's staleness estimate
+# makes). Distinct from price_cache's own is_stale/session_label: this
+# answers "is that index's market open right now," from the wall clock;
+# is_stale answers "how old is the data we actually have," from the last
+# bar's timestamp. Both are shown together for international indices since
+# they answer different questions.
+_INTL_SESSION_HOURS = {
+    "^N225":     ("Asia/Tokyo", 9, 0, 15, 30),
+    "^KS11":     ("Asia/Seoul", 9, 0, 15, 30),
+    "^TWII":     ("Asia/Taipei", 9, 0, 13, 30),
+    "^HSI":      ("Asia/Hong_Kong", 9, 30, 16, 0),
+    "^GDAXI":    ("Europe/Berlin", 9, 0, 17, 30),
+    "^FTSE":     ("Europe/London", 8, 0, 16, 30),
+    "^FCHI":     ("Europe/Paris", 9, 0, 17, 30),
+    "^STOXX50E": ("Europe/Berlin", 9, 0, 17, 30),
+    "^AXJO":     ("Australia/Sydney", 10, 0, 16, 0),
+    "^BSESN":    ("Asia/Kolkata", 9, 15, 15, 30),
+}
+
+
+def _get_market_session_status(index_ticker: str) -> str:
+    """' 🟢 live' / ' ⚪ opens in Nm' / ' 🔴 closed' for `index_ticker`'s home
+    exchange, right now — weekday-only, holidays not accounted for.
+    '' if `index_ticker` isn't in `_INTL_SESSION_HOURS`.
+    """
+    import pytz
+
+    if index_ticker not in _INTL_SESSION_HOURS:
+        return ""
+
+    tz_name, open_h, open_m, close_h, close_m = _INTL_SESSION_HOURS[index_ticker]
+    local_now = datetime.now(pytz.utc).astimezone(pytz.timezone(tz_name))
+
+    if local_now.weekday() >= 5:
+        return " 🔴 closed"
+
+    open_time = local_now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    close_time = local_now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+
+    if open_time <= local_now <= close_time:
+        return " 🟢 live"
+    if local_now < open_time:
+        mins_to_open = int((open_time - local_now).total_seconds() / 60)
+        return f" ⚪ opens in {mins_to_open}min"
+    return " 🔴 closed"
+
+
+def fetch_global_signals() -> dict:
+    """Global market signals from `price_cache`. Never raises: a ticker
+    price_cache doesn't have (e.g. ^MOVE, frequently unavailable on
+    yfinance) is simply absent from its section rather than erroring.
+    """
+    def get(ticker: str) -> dict:
+        return price_cache.get(ticker) or {}
+
+    # Each section keyed by ticker (not label) — format_global_signals()
+    # looks the label up from the same market_config dict at render time.
+    # Keying by label here would mean either mutating price_cache's own
+    # cache entry to stash the ticker on it (get() returns the live dict,
+    # not a copy) or losing the ticker entirely — neither is worth it just
+    # to save one dict lookup downstream.
+    result: dict = {"futures": {}, "crypto": {}, "volatility": {}, "international": {}, "credit": {}, "ratios": {}}
+
+    for ticker in EQUITY_FUTURES:
+        d = get(ticker)
+        if d.get("price") is not None:
+            result["futures"][ticker] = d
+
+    for ticker in CRYPTO_TICKERS:
+        d = get(ticker)
+        if d.get("price") is not None:
+            result["crypto"][ticker] = d
+
+    for ticker in VOLATILITY_TICKERS:
+        d = get(ticker)
+        if d.get("price") is not None:
+            result["volatility"][ticker] = d
+
+    for ticker in INTERNATIONAL_INDICES:
+        d = get(ticker)
+        if d.get("price") is not None:
+            result["international"][ticker] = d
+
+    for ticker in CREDIT_TICKERS:
+        d = get(ticker)
+        if d.get("price") is not None:
+            result["credit"][ticker] = d
+
+    for ratio_name, (t1, t2, description) in CROSS_ASSET_RATIOS.items():
+        d1, d2 = get(t1), get(t2)
+        if not d1.get("price") or not d2.get("price"):
+            continue
+        ratio = d1["price"] / d2["price"]
+        ratio_chg = None
+        if d1.get("prev_close") and d2.get("prev_close"):
+            prev_ratio = d1["prev_close"] / d2["prev_close"]
+            if prev_ratio:
+                ratio_chg = (ratio / prev_ratio - 1) * 100
+        result["ratios"][ratio_name] = {"ratio": ratio, "change_pct": ratio_chg, "description": description}
+
+    return result
+
+
+def format_global_signals(signals: dict) -> str:
+    """Render `fetch_global_signals()`'s output as a Telegram-ready string. Never raises."""
+    lines = ["🌍 GLOBAL SIGNALS", _DIVIDER]
+
+    if signals.get("futures"):
+        lines.append("Equity Futures")
+        for ticker, d in signals["futures"].items():
+            label = EQUITY_FUTURES.get(ticker, ticker)
+            chg = d.get("change_1d_pct", 0)
+            price = d.get("price", 0)
+            emoji = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+            lines.append(f"  {emoji} {label}: {price:,.0f} ({chg:+.2f}%)")
+        lines.append("")
+
+    if signals.get("volatility"):
+        lines.append("Volatility")
+        for ticker, d in signals["volatility"].items():
+            label = VOLATILITY_TICKERS.get(ticker, ticker)
+            price = d.get("price", 0)
+            chg = d.get("change_1d_pct", 0)
+            flag = ""
+            if "VVIX" in label:
+                if price > SIGNAL_THRESHOLDS["vvix_extreme"]:
+                    flag = " 🔴 EXTREME"
+                elif price > SIGNAL_THRESHOLDS["vvix_elevated"]:
+                    flag = " ⚠️ elevated"
+            elif "VIX" in label:
+                if price > SIGNAL_THRESHOLDS["vix_high"]:
+                    flag = " 🔴 HIGH"
+                elif price > SIGNAL_THRESHOLDS["vix_elevated"]:
+                    flag = " ⚠️ elevated"
+            lines.append(f"  {label}: {price:.1f} ({chg:+.1f}%){flag}")
+        lines.append("")
+
+    if signals.get("crypto"):
+        lines.append("Crypto")
+        for ticker, d in signals["crypto"].items():
+            label = CRYPTO_TICKERS.get(ticker, ticker)
+            price = d.get("price", 0)
+            chg = d.get("change_1d_pct", 0)
+            emoji = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+            flag = " ⚠️" if abs(chg) > SIGNAL_THRESHOLDS["btc_move_pct"] else ""
+            lines.append(f"  {emoji} {label}: ${price:,.0f} ({chg:+.1f}%){flag}")
+        lines.append("")
+
+    if signals.get("international"):
+        lines.append("International Indices")
+        for ticker, d in signals["international"].items():
+            label = INTERNATIONAL_INDICES.get(ticker, ticker)
+            price = d.get("price", 0)
+            chg = d.get("change_1d_pct", 0)
+            emoji = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+            flag = " ⚠️" if abs(chg) > SIGNAL_THRESHOLDS["intl_index_pct"] else ""
+            session = _get_market_session_status(ticker)
+            lines.append(f"  {emoji} {label}: {price:,.0f} ({chg:+.2f}%){flag}{session}")
+        lines.append("")
+
+    if signals.get("credit"):
+        lines.append("Credit Proxies")
+        for ticker, d in signals["credit"].items():
+            label = CREDIT_TICKERS.get(ticker, ticker)
+            price = d.get("price", 0)
+            chg = d.get("change_1d_pct", 0)
+            emoji = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+            lines.append(f"  {emoji} {label}: ${price:.2f} ({chg:+.2f}%)")
+        lines.append("")
+
+    if signals.get("ratios"):
+        lines.append("Cross-Asset Signals")
+        for ratio_name, data in signals["ratios"].items():
+            ratio = data["ratio"]
+            chg = data.get("change_pct")
+            desc = data["description"]
+            chg_str = f" ({chg:+.2f}%)" if chg is not None else ""
+            if ratio_name == "copper_gold":
+                signal = "↑ growth" if (chg or 0) > 0 else "↓ growth concern"
+            elif ratio_name == "silver_gold":
+                signal = "↑ risk-on" if (chg or 0) > 0 else "↓ risk-off"
+            elif ratio_name == "vix_vvix":
+                signal = "⚠️ vol spike expected" if ratio > 0.25 else "normal"
+            else:
+                signal = ""
+            arrow = f" → {signal}" if signal else ""
+            lines.append(f"  {desc}: {ratio:.4f}{chg_str}{arrow}")
+        lines.append("")
+
+    lines.append(_DIVIDER)
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     snapshot_result = fetch_market_snapshot()
     print(format_market_snapshot(snapshot_result))
+
+    global_signals_result = fetch_global_signals()
+    print()
+    print(format_global_signals(global_signals_result))

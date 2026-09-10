@@ -44,3 +44,4 @@
 ## 2026-09-09
 - positions.py: Updated APP thesis — Updated from Telegram discussion 2026-09-09
 - positions.py: Updated APP thesis — Classified from Telegram discussion 2026-09-09
+- APP reclassified to speculative_high (growth) — Classified from Telegram discussion 2026-09-09

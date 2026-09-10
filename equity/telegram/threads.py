@@ -178,6 +178,7 @@ class ThreadManager:
             "message_count": count_row["n"],
             "last_active": thread_row["last_active"],
             "has_summary": thread_row["summary"] is not None,
+            "summary": thread_row["summary"],
         }
 
     def list_threads(self) -> list[dict]:
@@ -278,6 +279,78 @@ class ThreadManager:
                 [(i,) for i in ids],
             )
             conn.commit()
+
+    def summarize_old_exchanges(self, thread_id: str, summarize_fn, days_to_keep_verbatim: int = 3) -> None:
+        """Condenses exchanges older than `days_to_keep_verbatim` days into a summary.
+
+        Complements `auto_summarize_thread()`'s message-count trigger
+        (>100 unsummarized) with a time-based one: a thread that never
+        crosses 100 messages but has been running for weeks would
+        otherwise never get summarized, leaving
+        `Advisor._get_cross_thread_context_uncached()` with nothing but a
+        raw message count for it. Called daily (see
+        `bot.daily_thread_summarization()`), independent of message count.
+
+        Newer exchanges stay verbatim; older ones are marked
+        `summarized = 1` (full history stays in the DB either way — this
+        only affects what `get_messages_for_api()`'s recent-verbatim
+        window and the cross-thread context pick up) and folded into
+        `threads.summary`, dated so a second run doesn't re-summarize the
+        same window under a different label.
+        """
+        cutoff = datetime.now() - timedelta(days=days_to_keep_verbatim)
+        cutoff_str = cutoff.isoformat()
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, role, content FROM messages
+                WHERE thread_id = ? AND summarized = 0 AND timestamp < ?
+                ORDER BY timestamp ASC
+                """,
+                (thread_id, cutoff_str),
+            ).fetchall()
+
+        if len(rows) < 4:  # not enough to bother summarizing
+            return
+
+        try:
+            messages_for_summary = [{"role": r["role"], "content": r["content"]} for r in rows]
+            summary = summarize_fn(messages_for_summary)
+        except Exception as exc:
+            logger.error("summarize_old_exchanges: summarize_fn failed for %s: %s", thread_id, exc)
+            return
+
+        if not summary:
+            return
+
+        ids = [r["id"] for r in rows]
+        date_prefix = cutoff.strftime("%Y-%m-%d")
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT summary FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            existing_summary = (existing["summary"] if existing else "") or ""
+            new_summary = (
+                f"{existing_summary}\n\n[Through {date_prefix}]: {summary}"
+                if existing_summary
+                else f"[Through {date_prefix}]: {summary}"
+            ).strip()
+
+            conn.execute(
+                "UPDATE threads SET summary = ? WHERE thread_id = ?",
+                (new_summary, thread_id),
+            )
+            conn.executemany(
+                "UPDATE messages SET summarized = 1 WHERE id = ?",
+                [(i,) for i in ids],
+            )
+            conn.commit()
+
+        logger.info(
+            "summarize_old_exchanges: condensed %d messages in %s (older than %dd)",
+            len(rows), thread_id, days_to_keep_verbatim,
+        )
 
     # ------------------------------------------------------------------
     # Pending changes (config edits awaiting /confirm)

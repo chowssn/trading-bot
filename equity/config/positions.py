@@ -365,6 +365,15 @@ def reload() -> None:
         advisor_module._portfolio_context_cache["timestamp"] = 0
     except Exception:
         pass
+    # Invalidate the shared price cache too — a newly added/removed ticker
+    # changes price_cache's own ticker list (see its _build_ticker_list()),
+    # so the next read should refetch rather than serve a batch that predates
+    # this change.
+    try:
+        from equity.data.price_cache import price_cache
+        price_cache.invalidate()
+    except Exception:
+        pass
 
 
 def get_all_tickers() -> list[str]:

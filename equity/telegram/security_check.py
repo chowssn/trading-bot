@@ -47,7 +47,10 @@ def find_all_handlers_authorized(source: str, tree) -> bool:
     return True
 
 def find_write_handlers_email_authed(source: str, tree) -> bool:
-    required = {'send_add', 'send_remove', 'send_update', 'send_set'}
+    required = {
+        'send_add', 'send_remove', 'send_update', 'send_set', 'send_dismiss',
+        'send_restart', 'send_kill',
+    }
     found = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):

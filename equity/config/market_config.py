@@ -156,6 +156,103 @@ YIELD_LEVEL_ALERTS = {
     '30Y': [4.0, 4.5, 5.0, 5.5, 6.0],
 }
 
+# ============================================================
+# GLOBAL MARKET SIGNALS
+# Fed into price_cache, the morning brief's Global Signals section, and
+# /prices. Tickers here join price_cache's own batch — see
+# equity/data/price_cache.py's module docstring for what a "current
+# price" cache can and can't serve.
+# ============================================================
+
+# Equity futures (yfinance tickers — Bloomberg notation differs)
+EQUITY_FUTURES = {
+    'ES=F':   'S&P 500 Futures (ES1)',
+    'NQ=F':   'Nasdaq 100 Futures (NQ1)',
+    'YM=F':   'Dow Futures',
+    'RTY=F':  'Russell 2000 Futures',
+    'NKD=F':  'Nikkei Futures',
+}
+
+# Crypto (yfinance tickers — XBT/XET are Bloomberg notation)
+CRYPTO_TICKERS = {
+    'BTC-USD': 'Bitcoin (XBT)',
+    'ETH-USD': 'Ethereum (XET)',
+    'SOL-USD': 'Solana',
+}
+
+# Volatility indices. ^MOVE (Treasury vol) is frequently unavailable on
+# yfinance — price_cache's per-ticker try/except just drops it from the
+# cache rather than failing the whole batch; VIXY is kept as a standing
+# fallback proxy, not a substitute fetched only when ^MOVE is missing.
+VOLATILITY_TICKERS = {
+    '^VIX':  'VIX (S&P 500 vol)',
+    '^VVIX': 'VVIX (Vol of Vol)',
+    '^MOVE': 'MOVE (Treasury vol)',
+    'VIXY':  'VIX Short-Term Futures ETF',
+}
+
+# International equity indices
+INTERNATIONAL_INDICES = {
+    '^N225':     'Nikkei 225',
+    '^GDAXI':    'DAX (Germany)',
+    '^KS11':     'KOSPI (Korea)',
+    '^TWII':     'TWSE (Taiwan)',
+    '^HSI':      'Hang Seng (HK)',
+    '^FTSE':     'FTSE 100 (UK)',
+    '^STOXX50E': 'Euro Stoxx 50',
+    '^FCHI':     'CAC 40 (France)',
+    '^AXJO':     'ASX 200 (Australia)',
+    '^BSESN':    'Nifty 50 (India)',
+}
+
+# Credit market proxies (ETF-based — free via yfinance)
+CREDIT_TICKERS = {
+    'HYG':  'HY Credit (HYG ETF)',
+    'LQD':  'IG Credit (LQD ETF)',
+    'EMB':  'EM Bonds (EMB ETF)',
+    'TIP':  'TIPS (TIP ETF)',       # breakeven inflation proxy
+    'BKLN': 'Leveraged Loans (BKLN ETF)',
+}
+
+# Cross-asset ratio signals — derived from price_cache in format functions,
+# not fetched directly. (t1, t2, description); ratio is price(t1)/price(t2).
+CROSS_ASSET_RATIOS = {
+    'copper_gold':    ('HG=F', 'GC=F',  'Copper/Gold ratio — growth signal'),
+    'silver_gold':    ('SI=F', 'GC=F',  'Silver/Gold ratio — risk appetite'),
+    'hy_ig_spread':   ('HYG',  'LQD',   'HY vs IG relative — credit stress proxy'),
+    'tips_breakeven': ('TIP',  'IEF',   'TIPS vs nominal — breakeven inflation proxy'),
+    'vix_vvix':       ('^VIX', '^VVIX', 'VIX vs VVIX — vol-of-vol regime signal'),
+}
+
+# Thresholds for signal interpretation (morning brief display)
+SIGNAL_THRESHOLDS = {
+    'vvix_elevated':    90,    # VVIX > 90 = options market stressed
+    'vvix_extreme':    110,    # VVIX > 110 = tail risk pricing
+    'vix_elevated':     20,    # VIX > 20 = elevated
+    'vix_high':         30,    # VIX > 30 = high
+    'btc_move_pct':      5,    # BTC daily move > 5% = significant
+    'crypto_move_pct':   7,    # ETH/SOL daily move > 7% = significant
+    'intl_index_pct':    1.5,  # International index move > 1.5% = notable
+    'credit_spread_pct': 0.5,  # HYG/LQD daily move > 0.5% = notable
+}
+
+# Intraday alert thresholds — same dedup logic as YIELD_ALERT_BP etc.
+VOLATILITY_ALERT = {
+    '^VIX':  3.0,    # VIX move > 3 points intraday
+    '^VVIX': 5.0,    # VVIX move > 5 points
+}
+CRYPTO_ALERT_PCT = {
+    'BTC-USD': 4.0,
+    'ETH-USD': 5.0,
+}
+INTL_ALERT_PCT = {
+    '^N225':  1.5,
+    '^GDAXI': 1.5,
+    '^KS11':  1.5,
+    '^TWII':  1.5,
+    '^HSI':   2.0,
+}
+
 # NEWS TRIAGE
 MAX_HEADLINES_PER_TICKER = 3
 NEWS_KEYWORD_MIN_MATCHES = 2      # minimum keyword matches to flag thesis_breaker

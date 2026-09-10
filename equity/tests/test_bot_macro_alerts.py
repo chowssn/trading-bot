@@ -299,6 +299,53 @@ class TestFormatPriceLine(unittest.TestCase):
         line = bot._format_price_line("Gold", data)
         self.assertIn("Fri 2026-09-04 close", line)
 
+    def test_prefers_official_close_over_raw_price(self):
+        # After hours, `price` becomes the AH print — the headline number
+        # must stay the regular-session close, not that AH print.
+        data = {"price": 366.42, "official_close": 368.16, "change_1d_pct": -0.05}
+        line = bot._format_price_line("TSLA", data)
+        self.assertIn("368.16", line)
+        self.assertNotIn("366.42 (", line)  # not as the headline price
+
+    def test_afterhours_price_appended_when_present(self):
+        data = {
+            "price": 366.42, "official_close": 368.16, "afterhours_price": 366.42,
+            "session_type": "afterhours", "change_1d_pct": -0.05,
+        }
+        line = bot._format_price_line("TSLA", data)
+        self.assertIn("AH: 366.42", line)
+        self.assertIn("-0.47%", line)  # 366.42/368.16 - 1
+
+    def test_premarket_price_labeled_pm_not_ah(self):
+        data = {
+            "price": 370.00, "official_close": 368.16, "afterhours_price": 370.00,
+            "session_type": "premarket", "change_1d_pct": -0.05,
+        }
+        line = bot._format_price_line("TSLA", data)
+        self.assertIn("PM: 370", line)
+        self.assertNotIn("AH:", line)
+
+    def test_no_afterhours_line_without_extended_price(self):
+        data = {"price": 368.16, "official_close": 368.16, "change_1d_pct": -0.05}
+        line = bot._format_price_line("TSLA", data)
+        self.assertNotIn("AH:", line)
+        self.assertNotIn("PM:", line)
+
+    def test_afterhours_line_omitted_when_flat(self):
+        # AH print within a cent of the close isn't worth its own line.
+        data = {
+            "price": 368.17, "official_close": 368.16, "afterhours_price": 368.17,
+            "session_type": "afterhours", "change_1d_pct": 0.0,
+        }
+        line = bot._format_price_line("TSLA", data)
+        self.assertNotIn("AH:", line)
+
+    def test_no_official_close_falls_back_to_price(self):
+        # Crypto/futures never get official_close — must still render.
+        data = {"price": 90123.45, "change_1d_pct": 1.5}
+        line = bot._format_price_line("BTC-USD", data)
+        self.assertIn("90,123", line)
+
 
 class TestFormatAlertMessage(unittest.TestCase):
     """_format_alert_message() — the no-web-search, price_cache-only alert

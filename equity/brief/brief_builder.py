@@ -42,6 +42,7 @@ from equity.brief import earnings_monitor, eco_calendar, market_snapshot, perfor
 from equity.brief.brief_synthesizer import (
     _parse_and_persist_monitoring,
     synthesize_full_brief,
+    synthesize_global_signals,
     synthesize_performance,
     synthesize_section,
 )
@@ -134,6 +135,28 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     sections.append((f"💡 *Snapshot*\n{_run_synthesis('market_snapshot', snap_text, regime_flags)}", None))
     all_text_for_synthesis.append(snap_text)
 
+    # Global signals — equity futures, crypto, volatility, international
+    # indices, credit proxies, cross-asset ratios. Dedicated synthesizer
+    # (synthesize_global_signals(), same pattern as performance/sector),
+    # with the persistent monitoring list folded in — cross-asset reads
+    # are exactly the kind of thing worth tracking across sessions.
+    global_text = _run_section("Global signals", market_snapshot.fetch_global_signals, market_snapshot.format_global_signals)
+    sections.append((global_text, None))
+    all_text_for_synthesis.append(global_text)
+
+    try:
+        global_synthesis = synthesize_global_signals(
+            section_data=global_text,
+            regime_flags=regime_flags,
+            monitoring_items=load_monitoring(),
+        )
+    except Exception as exc:
+        logger.exception("Global signals synthesis failed")
+        global_synthesis = f"[Global signals synthesis unavailable: {exc}]"
+
+    _parse_and_persist_monitoring(global_synthesis, source="global_signals_synthesis")
+    sections.append((f"💡 *Global Signals*\n{global_synthesis}", None))
+
     # Eco calendar
     cal_text = _run_section("Eco calendar", lambda: eco_calendar.fetch_eco_calendar(days_ahead=7), eco_calendar.format_eco_calendar)
     sections.append((cal_text, None))
@@ -185,7 +208,7 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     # Persist any new monitoring items the synthesis surfaced — never raises
     # (see _parse_and_persist_monitoring()'s own docstring), so this can't
     # take down the rest of the brief.
-    _parse_and_persist_monitoring(perf_synthesis)
+    _parse_and_persist_monitoring(perf_synthesis, source="performance_synthesis")
 
     sections.append((f"💡 *Performance*\n{perf_synthesis}", None))
     all_text_for_synthesis.append(perf_text)

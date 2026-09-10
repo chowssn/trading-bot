@@ -198,6 +198,48 @@ def _cagr(close: pd.Series, years: float) -> float | None:
     return ((float(close.iloc[-1]) / base) ** (1 / years) - 1) * 100
 
 
+def _cagr_with_fallback(close: pd.Series, years: float) -> tuple[float | None, str]:
+    """`_cagr(close, years)`, or — when `close` doesn't go back that far — the
+    annualized (or plain, if under 1Y) return over whatever history IS
+    available, paired with a label describing the actual span used.
+
+    Never silently returns a bare "N/A" for a ticker just younger than the
+    window: a recent IPO (RDDT), a newly listed factor ETF, or anything
+    else with less than `years` of history still gets a real number,
+    labeled by how much history backs it (e.g. "18M ann", "8M") — the
+    caller renders the label alongside the value rather than a nominal
+    "3Y"/"5Y" column header that would otherwise silently mean two
+    different things for two different tickers.
+
+    Only a ticker with fewer than 5 trading days total (nothing meaningful
+    to compute a return over at all) actually gets a None/"N/A" pair.
+    """
+    nominal = f"{years:g}Y"
+    full = _cagr(close, years)
+    if full is not None:
+        return full, nominal
+
+    if len(close) < 5:
+        return None, f"{nominal} N/A"
+
+    base = float(close.iloc[0])
+    if not base:
+        return None, f"{nominal} N/A"
+
+    actual_days = len(close)
+    actual_years = actual_days / 252
+    actual_months = max(int(actual_days / 21), 1)
+    curr = float(close.iloc[-1])
+
+    if actual_years >= 1:
+        pct = ((curr / base) ** (1 / actual_years) - 1) * 100
+        label = f"{actual_months}M ann"
+    else:
+        pct = (curr / base - 1) * 100
+        label = f"{actual_months}M"
+    return round(pct, 2), label
+
+
 # ---------------------------------------------------------------------------
 # Benchmark cache (1 hour)
 # ---------------------------------------------------------------------------
@@ -241,10 +283,14 @@ def _write_benchmark_cache(data: dict) -> None:
 def fetch_benchmark_performance() -> dict:
     """Batch-fetch every `market_config.BENCHMARK_TICKERS`, cache-first (1 hour).
 
-    Fetches 5 years of daily history (up from 'ytd') so 1D/1W/1M/1Y windows
-    plus 3Y/5Y annualized CAGR (`market_config.PERFORMANCE_PERIODS`) and
+    Fetches `period="max"` daily history (up from 'ytd', and from a flat
+    '5y' — see `_cagr_with_fallback()`) so 1D/1W/1M/1Y windows plus 3Y/5Y
+    annualized CAGR (`market_config.PERFORMANCE_PERIODS`) and
     `compute_ma_flags()` (SMA20/50/200 proximity, 5Y high/low) are all
-    computable from one batch.
+    computable from one batch, and a ticker with less than 3Y/5Y of
+    history (a recent IPO, a newly listed ETF) still gets its longest
+    available annualized return rather than a bare None/"n/a" — see
+    `_cagr_with_fallback()`.
 
     Never raises: a failed batch download or a ticker missing enough
     history for a given window is recorded in `data_warnings` and that
@@ -256,7 +302,7 @@ def fetch_benchmark_performance() -> dict:
 
     data_warnings: list[str] = []
     tickers = list(BENCHMARK_TICKERS) + [COPPER_FUTURES_TICKER, GOLD_FUTURES_TICKER, SILVER_FUTURES_TICKER]
-    data = _download_batch(tickers, period="5y")
+    data = _download_batch(tickers, period="max")
     if data is None:
         data_warnings.append("yf.download returned no data for the benchmark batch")
 
@@ -273,14 +319,18 @@ def fetch_benchmark_performance() -> dict:
         # _cagr()'s **(1/1) a no-op anyway, but _price_years_ago() directly
         # makes that "plain return, not CAGR" distinction explicit.
         price_1y_ago = _price_years_ago(close, 1)
+        cagr_3y, cagr_3y_label = _cagr_with_fallback(close, 3)
+        cagr_5y, cagr_5y_label = _cagr_with_fallback(close, 5)
         entry = {
             "price": price,
             "change_1d_pct": _pct_change(close, -2),
             "change_1w_pct": _pct_change(close, -6),
             "change_1m_pct": _pct_change(close, -22),
             "change_1y_pct": (price / price_1y_ago - 1) * 100 if price_1y_ago else None,
-            "cagr_3y": _cagr(close, 3),
-            "cagr_5y": _cagr(close, 5),
+            "cagr_3y": cagr_3y,
+            "cagr_3y_label": cagr_3y_label,
+            "cagr_5y": cagr_5y,
+            "cagr_5y_label": cagr_5y_label,
             "ma_flags": compute_ma_flags(close, price),
         }
 
@@ -386,7 +436,7 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
     fetch fails, or whose sector ETF has no benchmark data, comes back with
     an `'error'` key instead of raising.
 
-    Fetches 5 years of daily history per position (up from 5 days) so
+    Fetches `period="max"` daily history per position (up from 5 days) so
     `compute_ma_flags()` can flag SMA20/50/200 proximity and 5Y high/low —
     surfaced as `position_flags` on each result.
     """
@@ -395,7 +445,7 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
     benchmarks = benchmark_data.get("benchmarks", {})
 
     tickers = list(positions_config.POSITIONS)
-    data = _download_batch(tickers, period="5y")
+    data = _download_batch(tickers, period="max")
 
     result: dict[str, dict] = {}
     for ticker in tickers:
@@ -447,12 +497,25 @@ def _fmt_amount(value: float | None, decimals: int) -> str:
     return f"${value:,.{decimals}f}" if value is not None else "n/a"
 
 
+def _fmt_cagr_cell(pct: float | None, label: str, nominal: str) -> str:
+    """A 3Y/5Y CAGR cell — see `_cagr_with_fallback()`. Plain "+9.2%" when
+    `label` matches the nominal period (full history available); annotated
+    "+9.2% (18M ann)" when it's a shorter-history fallback, so a fallback
+    value is never confused for a genuine 3Y/5Y figure. "n/a" only for the
+    genuine no-data case (fewer than 5 trading days total).
+    """
+    if pct is None:
+        return "n/a"
+    base = f"{pct:+.1f}%"
+    return base if label == nominal else f"{base} ({label})"
+
+
 def _fmt_multi_period(b: dict) -> str:
     """1D / 1W / 1M / 1Y / 5Y-ann returns, space-separated — the common row shape for factor lines."""
     return (
         f"{_fmt_pct(b.get('change_1d_pct')):>7} {_fmt_pct(b.get('change_1w_pct')):>7} "
         f"{_fmt_pct(b.get('change_1m_pct')):>7} {_fmt_pct(b.get('change_1y_pct')):>7} "
-        f"{_fmt_pct(b.get('cagr_5y')):>7}"
+        f"{_fmt_cagr_cell(b.get('cagr_5y'), b.get('cagr_5y_label', '5Y'), '5Y'):>7}"
     )
 
 
@@ -616,7 +679,8 @@ def format_performance_section(benchmark_data: dict, portfolio_data: dict, relat
         lines.append(
             f"{ticker:<6} {_fmt_pct(b['change_1d_pct']):>7} {_fmt_pct(b['change_1w_pct']):>7} "
             f"{_fmt_pct(b['change_1m_pct']):>7} {_fmt_pct(b['change_1y_pct']):>7} "
-            f"{_fmt_pct(b.get('cagr_3y')):>7} {_fmt_pct(b.get('cagr_5y')):>7}"
+            f"{_fmt_cagr_cell(b.get('cagr_3y'), b.get('cagr_3y_label', '3Y'), '3Y'):>7} "
+            f"{_fmt_cagr_cell(b.get('cagr_5y'), b.get('cagr_5y_label', '5Y'), '5Y'):>7}"
             f"{format_flag(b.get('ma_flags', []))}"
         )
     lines.append("")

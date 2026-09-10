@@ -17,21 +17,23 @@ there is no separate override lookup needed in this module. Tickers with
 no override data yet (`size_pct` still `None`) render "Size: pending
 IBKR".
 
-Price data comes from `yf.Ticker(ticker).history(period='5d')` rather than
-`.info` or a batched `yf.download()` — this module runs on a handful of
-tickers at a time (not the ~1000-name screener universe), so per-ticker
-call overhead doesn't matter, and `.history()` gives us both the latest
-close and the prior close in one call without relying on `.info`'s
-`previousClose` field (which yfinance sometimes returns stale/None for).
+Price data comes from `equity.data.price_cache` — the system-wide shared
+price cache (positions, watchlist, sector/benchmark/factor ETFs, FX,
+commodities, Treasury yields, and now global-signal tickers all fetched
+in one batch, see that module's docstring) — rather than a per-ticker
+`yf.Ticker(ticker).history()` or its own independent `yf.download()`.
+This module previously fetched independently; consolidating onto the
+shared cache means portfolio monitor prices, the morning brief, and the
+advisor's live macro snapshot are all reading the same fetch rather than
+three separately-timed ones that could disagree by tens of minutes.
 """
 
 import logging
 from datetime import datetime
 
-import yfinance as yf
-
 from equity.config import positions as positions_config
 from equity.config.market_config import POSITION_SIZE_ALERT_ENABLED, POSITION_TIERS
+from equity.data.price_cache import price_cache
 
 logger = logging.getLogger(__name__)
 
@@ -61,19 +63,17 @@ def _move_flag(change_1d_pct: float) -> str:
 
 
 def _fetch_price(ticker: str) -> tuple[float, float] | None:
-    """Return (price_current, price_prev_close) from a 5-day history, or None on failure."""
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-    except Exception as exc:  # yfinance can raise a variety of things on network/format issues
-        logger.warning("Price history fetch failed for %s: %s", ticker, exc)
-        return None
+    """Return (price_current, price_prev_close) from the shared price cache, or None if unavailable.
 
-    close = hist["Close"].dropna() if "Close" in hist.columns else hist.iloc[0:0]
-    if len(close) < 2:
-        logger.warning("Not enough price history for %s (%d row(s)) — need >= 2", ticker, len(close))
+    `price_cache.get()` auto-refreshes if stale — every position/watchlist
+    ticker is already part of its batch (see price_cache.py's
+    `_build_ticker_list()`), so this is a cache read, not a new fetch.
+    """
+    data = price_cache.get(ticker)
+    if data is None:
+        logger.warning("No price cache data for %s", ticker)
         return None
-
-    return float(close.iloc[-1]), float(close.iloc[-2])
+    return data["price"], data["prev_close"]
 
 
 def _build_entry(ticker: str, config: dict) -> dict | None:

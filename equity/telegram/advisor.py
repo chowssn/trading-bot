@@ -62,6 +62,43 @@ _MACRO_SNAPSHOT_COMMODITIES = ["GC=F", "CL=F", "HG=F", "URA"]
 # commodities snapshot belongs in their discussion context (get_ticker_context()).
 MACRO_PROXY_TICKERS = {"TLT", "GLD", "SLV", "URA", "TIP", "PPLT", "GC=F", "SI=F"}
 
+# Monitoring-item "ticker" labels that are actually thematic/macro subjects
+# rather than a real instrument — e.g. brief_synthesizer's NEW MONITORING
+# ITEMS parser stored "COPPER" (a copper/gold-ratio watch item, correct
+# instrument is HG=F) as if it were a ticker. yfinance doesn't error on an
+# unrecognized symbol; it silently returns an empty/None-filled result, so
+# a bogus label here produced a real garbage quality-score cache entry
+# (equity/data/cache/quality_COPPER_*.json) rather than an obvious failure.
+# _is_valid_ticker() is the guard every dynamic-ticker yfinance call in this
+# module (and the Telegram callback handlers in bot.py that source a
+# "ticker" from a monitoring item) checks first. Add to this set — never
+# silently drop from it — whenever a synthesis run invents another
+# non-instrument label.
+NON_TICKER_SUBJECTS = {"COPPER"}
+
+
+class _NotATickerError(Exception):
+    """Raised inside a get_ticker_context() section to short-circuit it when
+    `ticker` fails _is_valid_ticker(). Caught by that section's own
+    except clause, ahead of its generic `except Exception`, so the section
+    renders a clear "not a tradable ticker" message instead of being
+    lumped in with (and logged as) an actual fetch failure.
+    """
+
+
+def _is_valid_ticker(ticker: str) -> bool:
+    """False if `ticker` is a known non-instrument monitoring subject
+    (see NON_TICKER_SUBJECTS) rather than a real yfinance-fetchable ticker.
+
+    This is a denylist, not a format validator — it doesn't try to
+    recognize every possible valid ticker shape (plain symbols, ^indices,
+    X=F futures, X=X FX pairs, BRK.B-style share classes all pass through
+    unchecked); it only catches subjects already known to be non-tickers.
+    """
+    if not ticker:
+        return False
+    return ticker.upper() not in NON_TICKER_SUBJECTS
+
 # Same idea for _get_cross_thread_context() — it queries SQLite (thread
 # list + brief thread messages) but threads don't change that frequently
 # mid-conversation. Keyed by current_thread_id since "other active
@@ -836,6 +873,8 @@ class Advisor:
         # Section 1 — Price & technicals
         # ------------------------------------------------------------
         try:
+            if not _is_valid_ticker(ticker):
+                raise _NotATickerError(ticker)
             hist = yf.Ticker(ticker).history(period="2y", auto_adjust=True)
             if hist is None or hist.empty:
                 sections.append("--- PRICE & TECHNICALS ---\nPrice/technical data unavailable.")
@@ -930,6 +969,11 @@ class Advisor:
                     lines.append("Volume: n/a")
 
                 sections.append("\n".join(lines))
+        except _NotATickerError:
+            sections.append(
+                "--- PRICE & TECHNICALS ---\n"
+                f"{ticker} is a monitoring subject, not a tradable ticker — no price data to fetch."
+            )
         except Exception as exc:
             logger.warning("get_ticker_context: price/technicals failed for %s: %s", ticker, exc)
             sections.append("--- PRICE & TECHNICALS ---\nPrice/technical data unavailable.")
@@ -938,6 +982,8 @@ class Advisor:
         # Section 2 — Valuation
         # ------------------------------------------------------------
         try:
+            if not _is_valid_ticker(ticker):
+                raise _NotATickerError(ticker)
             info = yf.Ticker(ticker).info
             # Captured here (outer-scope `company_name`) rather than
             # re-fetched with a second yf.Ticker(ticker).info call in the
@@ -965,6 +1011,11 @@ class Advisor:
                 f"P/S: {_x(info.get('priceToSalesTrailing12Months'))} | "
                 f"EV/EBITDA: {_x(info.get('enterpriseToEbitda'))}"
             )
+        except _NotATickerError:
+            sections.append(
+                "--- VALUATION ---\n"
+                f"{ticker} is a monitoring subject, not a tradable ticker — no valuation data to fetch."
+            )
         except Exception as exc:
             logger.warning("get_ticker_context: valuation fetch failed for %s: %s", ticker, exc)
             sections.append("--- VALUATION ---\nValuation data unavailable.")
@@ -973,6 +1024,8 @@ class Advisor:
         # Section 3 — Quality score (screener's own cache-or-fetch)
         # ------------------------------------------------------------
         try:
+            if not _is_valid_ticker(ticker):
+                raise _NotATickerError(ticker)
             quality = quality_scorer.score_ticker(ticker, settings.FMP_API_KEY)
             if quality.get("tier") == "error":
                 sections.append(
@@ -1025,6 +1078,11 @@ class Advisor:
                 lines.append(f'Flags: {", ".join(flags) if flags else "None"}')
 
                 sections.append("\n".join(lines))
+        except _NotATickerError:
+            sections.append(
+                "--- QUALITY SCORE ---\n"
+                f"{ticker} is a monitoring subject, not a company ticker — quality score not applicable."
+            )
         except Exception as exc:
             logger.warning("get_ticker_context: quality score failed for %s: %s", ticker, exc)
             sections.append(
@@ -1123,6 +1181,8 @@ class Advisor:
         # Section 6 — News headlines
         # ------------------------------------------------------------
         try:
+            if not _is_valid_ticker(ticker):
+                raise _NotATickerError(ticker)
             news_items = yf.Ticker(ticker).news or []
             headlines = []
             for item in news_items[:5]:
@@ -1148,6 +1208,8 @@ class Advisor:
                 sections.append("\n".join(lines))
             else:
                 sections.append("No recent headlines available.")
+        except _NotATickerError:
+            sections.append(f"{ticker} is a monitoring subject, not a tradable ticker — no news to fetch.")
         except Exception as exc:
             logger.warning("get_ticker_context: news fetch failed for %s: %s", ticker, exc)
             sections.append("News headlines unavailable.")
