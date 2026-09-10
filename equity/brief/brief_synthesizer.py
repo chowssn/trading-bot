@@ -281,14 +281,17 @@ def synthesize_performance(
     regime_flags: list[str] | None = None,
     monitoring_items: list[dict] | None = None,
     cross_thread_context: str = "",
+    _retry: bool = False,
 ) -> str:
-    """Dedicated performance-section synthesis, richer than `synthesize_section()`.
+    """Dense-format performance-section synthesis, same SIGNAL/POSITIONS
+    AFFECTED/ACTION structure as `synthesize_section()` — no narrative
+    prose. Still gets its own prompt (rather than the generic per-section
+    one) for the monitoring-list check-ins and the NEW MONITORING ITEMS
+    block that `_parse_and_persist_monitoring()` parses back out.
 
-    The performance section carries the full day's price action, so it
-    gets its own prompt rather than the generic per-section one: explicit
-    check-ins on the persistent monitoring list (see `equity.data.monitoring`),
-    cross-section context from earlier brief sections, and a NEW MONITORING
-    ITEMS block that `_parse_and_persist_monitoring()` parses back out.
+    `_retry=True` multiplies `SYNTHESIS_MAX_TOKENS['portfolio_status']` by
+    1.3 — for a caller retrying after a response got cut off before reaching
+    the monitoring-items block.
 
     Cached `SYNTHESIS_CACHE_HOURS` hours, keyed by a hash of `section_data`
     + `cross_thread_context` — the monitoring list itself doesn't affect
@@ -315,93 +318,45 @@ def synthesize_performance(
             )
 
     prompt = f"""{FRAMEWORK}
-
-Current regime: {regime_str}
+Regime: {regime_str}
 
 {positions_ctx}
-
-CROSS-SECTION CONTEXT (from today's other brief sections and recent threads):
-{cross_thread_context[:1000] if cross_thread_context else "Not available"}
 {monitoring_str}
 
 PERFORMANCE DATA:
-{section_data}
+{section_data[:2000]}
 
-You are writing the performance synthesis for a discretionary portfolio manager's morning brief.
-This section should be the most actionable part of the brief — it has the full day's price action
-and should integrate context from the monitoring list and cross-section data.
+Respond in EXACTLY this format — no markdown headers, no narrative prose:
 
-Length guidance: Scale to the day's significance. A quiet day warrants 100-150 words.
-A day with significant divergences, thesis-proximity events, or monitoring list developments
-warrants 200-300 words. Never pad — every sentence must earn its place.
+SIGNAL: [1 sentence — dominant performance theme today]
 
-Structure as follows:
+POSITIONS AFFECTED:
+[TICKER] [↑/↓/→] [vs sector divergence ≤10 words, include %] [WATCH/ACT/HOLD]
+(4-5 lines — include any position with >2% sector divergence)
 
-SUMMARY (2-4 sentences):
-Identify the dominant intraday theme across the portfolio. Go beyond surface labels —
-not just "idiosyncratic selling" but what KIND: bifurcation within a sector (winners vs losers
-on the same catalyst), multiple compression at elevated RSI, profit-taking after extended run,
-news-driven vs tape-driven, etc. Name the specific positions driving the theme.
+ACTION: [specific ticker + action] OR "no action warranted"
+Condition: [what would change this]
 
-PORTFOLIO IMPLICATIONS (3-5 bullets, scaled to the day):
-- For each materially moving position: name the specific divergence vs sector, classify the move
-  type, and state whether it is thesis-proximity (close to a breaker), thesis-neutral (noise),
-  or thesis-constructive (thesis delivering).
-- For positions on the monitoring list: explicitly check in on each item. Has the condition
-  improved, worsened, or stayed the same? Update the status.
-- For positions approaching technical levels (RSI extremes, MA crosses, 52W high/low proximity):
-  name the level and its significance to the entry/exit framework.
-- Flag any earnings or catalyst dates within 14 days for held positions — these are
-  thesis-confirmation or thesis-breaker events.
-- If sector divergence exceeds 3% for any position, classify as WATCH or FLAG explicitly.
-
-MONITORING UPDATES (only if monitoring list is non-empty):
-For each active monitoring item: one line stating current status vs. when it was added.
-If a condition has resolved (positively or negatively), say so clearly.
-If it has worsened, escalate priority.
-
-SUGGESTIONS (1-3 items, scaled to the day):
-Be specific about what would constitute a framework-compliant setup.
-For WATCH items: name the exact RSI level, price level, or event that would trigger action.
-For monitoring items: state what would cause dismissal vs. escalation.
-If no action is warranted, say so in one sentence — do not invent suggestions.
-Never suggest adding to a position that is NOT in the dislocation zone
-(down 10-50% from highs with RSI confirming a turn) unless explicitly noted as an exception.
+MONITORING UPDATES:
+[For each active monitoring item in the list: 1 line — status unchanged/improved/worsened]
+(omit section entirely if no active monitoring items)
 
 <<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
-List items in EXACTLY this format, one per line, pipe-delimited:
-TICKER | specific measurable condition to watch | high/medium/low
-
-Example:
-TSLA | Megapack margin trajectory in next earnings | high
-PLTR | RSI 14D — watch for oversold + turn signal as framework entry setup | medium
-GOOGL | 200D MA test — follow-through in next 3 sessions determines if support holds | high
-
-Rules:
-- Use the exact pipe-delimited format above — no other format
-- TICKER must be the exact ticker symbol (TSLA not Tesla)
-- Condition must be specific and measurable
-- Only include if genuinely worth tracking for 3+ sessions
-- Maximum 3 items per synthesis call
-- If nothing warrants monitoring, write: NONE
+[TICKER] | [specific measurable condition] | [high/medium/low]
+(1-3 items, or NONE)
 <<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
 
-This delimited block is REQUIRED — always emit it, and emit it last. Keep
-the preceding sections short enough that you always reach it.
+Every line specific. No generic observations. No markdown."""
 
-Be direct. Be specific. Name tickers and levels. Avoid generic macro commentary
-that does not connect to a specific position or actionable decision."""
+    # Use SYNTHESIS_MAX_TOKENS for consistency
+    max_tokens_to_use = SYNTHESIS_MAX_TOKENS.get("portfolio_status", 900)
+    if _retry:
+        max_tokens_to_use = int(max_tokens_to_use * 1.3)
 
     try:
         r = client.messages.create(
             model=MODEL,
-            # Richest section, and the one whose prompt ends with the
-            # required NEW MONITORING ITEMS block. At 800 the response was
-            # reliably hitting max_tokens partway through the MONITORING
-            # UPDATES section and never reaching that block, so monitoring
-            # items were silently never captured. Sized with headroom over
-            # the ~800-token bodies actually observed.
-            max_tokens=1400,
+            max_tokens=max_tokens_to_use,
             messages=[{"role": "user", "content": prompt}],
         )
         result = _extract_text(r, "Performance synthesis")
@@ -416,26 +371,29 @@ def synthesize_global_signals(
     section_data: str,
     regime_flags: list[str] | None = None,
     monitoring_items: list[dict] | None = None,
+    override_max_tokens: int | None = None,
+    _retry: bool = False,
 ) -> str:
-    """Dedicated synthesis for the global signals section — same
-    monitoring-list-integration and NEW MONITORING ITEMS pattern as
-    `synthesize_performance()`, since this section spans multiple asset
-    classes simultaneously and its cross-asset reads are exactly the kind
-    of thing worth tracking across sessions (see `_parse_and_persist_monitoring()`).
+    """Dense-format synthesis for the global signals section — same
+    SIGNAL/POSITIONS AFFECTED/ACTION structure as `synthesize_section()`,
+    no narrative prose. Still gets its own prompt (rather than the generic
+    per-section one) for the monitoring-list integration and NEW MONITORING
+    ITEMS block that `_parse_and_persist_monitoring()` parses back out,
+    since this section spans multiple asset classes simultaneously and its
+    cross-asset reads are exactly the kind of thing worth tracking across
+    sessions.
 
-    Higher max_tokens than `synthesize_section()`'s generic per-section
-    call — cross-asset synthesis has more to potentially cover (futures,
-    vol, crypto, international, credit, ratios) than a single-asset-class
-    section. Cached `SYNTHESIS_CACHE_HOURS` hours by content hash.
+    `override_max_tokens` bypasses `SYNTHESIS_MAX_TOKENS['global_markets']`
+    for a caller with a different budget; `_retry=True` multiplies whichever
+    of the two is in effect by 1.3 — for a caller retrying after a response
+    got cut off before reaching the monitoring-items block. Cached
+    `SYNTHESIS_CACHE_HOURS` hours by content hash.
     """
     data_hash = hashlib.md5(section_data.encode()).hexdigest()
     path = _cache_path("global_signals", data_hash)
     cached = _load_cache(path)
     if cached:
         return cached
-
-    regime_str = ", ".join(regime_flags) if regime_flags else "No active regime flags"
-    positions_ctx = _get_positions_context()
 
     monitoring_str = ""
     if monitoring_items:
@@ -447,95 +405,43 @@ def synthesize_global_signals(
             )
 
     prompt = f"""{FRAMEWORK}
+Regime: {", ".join(regime_flags) if regime_flags else "none"}
 
-Current regime: {regime_str}
-
-{positions_ctx}
+{_get_positions_context()}
 {monitoring_str}
 
 GLOBAL SIGNALS DATA:
-{section_data}
+{section_data[:2000]}
 
-You are writing the global signals synthesis for a discretionary portfolio manager.
-This section covers futures, volatility, crypto, international indices, credit proxies,
-and cross-asset ratios. It should inform real-time decisions and regime assessment.
+Respond in EXACTLY this format — no markdown headers, no narrative prose:
 
-Length guidance: Scale to signal density. A quiet session with no notable moves
-warrants 100-150 words. A session with multiple cross-asset signals or regime-relevant
-moves warrants 200-350 words. Never pad — every sentence must earn its place.
+SIGNAL: [1 sentence — dominant cross-asset theme, specific instruments named]
 
-Structure as follows:
+POSITIONS AFFECTED:
+[TICKER] [↑/↓/→] [specific cross-asset reason ≤10 words] [WATCH/ACT/HOLD]
+(3-4 lines max — FX/commodity/vol impacts on named positions only)
 
-SUMMARY (2-4 sentences):
-What is the dominant cross-asset theme right now?
-Be specific about which instruments are confirming vs. contradicting each other.
-Identify whether the signal pattern is risk-on, risk-off, growth-driven, inflation-driven,
-liquidity-driven, or idiosyncratic. Name specific levels and moves.
-Example of good summary: "Equity futures flat but VIX/VVIX diverging upward while
-copper/gold ratio falls — surface calm masking growing hedging demand. International
-indices bifurcating: Asia +2% while Europe flat, suggesting regional rather than global
-risk-on. Credit spreads (HYG -0.3%) contradicting equity futures strength."
-Example of bad summary: "Markets showing mixed signals across asset classes today."
+CROSS-ASSET: [CONFIRM/CONTRADICT/MIXED] — [1 sentence — what the contradiction or confirmation is]
 
-PORTFOLIO IMPLICATIONS (3-5 bullets, scaled to signal significance):
-- For each cross-asset signal: name the specific portfolio positions affected and how.
-  Be direct — "KOSPI +3% confirms TSM thesis" not "Korean markets moving positively."
-- For volatility signals: if VIX/VVIX elevated, name which positions face multiple
-  compression risk and whether the QQQ/SPY put hedge overlay is relevant.
-- For FX moves: name which positions are directly affected
-  (USD/JPY → SMFG thesis; USD/CNH → BYDDY, TSM, EWW; copper → FCX, CAT, industrials).
-- For yield moves: name duration-sensitive positions (TLT thesis, MSFT/AMZN/GOOGL
-  multiple compression risk) and the bp move relative to thesis-breaker levels.
-- For crypto: flag if BTC move is risk-appetite signal relevant to broader positioning.
-- For credit proxies: HYG vs LQD spread changes indicate credit stress — name which
-  speculative positions (PLTR, RDDT, UMAC, QBTS) are most credit-sensitive.
-
-CROSS-ASSET VERDICT (1-2 sentences):
-What does the aggregate signal say about the current regime?
-Is this a CONFIRM (signals consistent with existing regime), CONTRADICT (signals
-inconsistent — warrants reassessment), or MIXED (no clear directional read)?
-Name the single most important cross-asset signal today.
-
-MONITORING UPDATES (only if monitoring list is non-empty):
-For each active monitoring item related to macro/global signals:
-one line stating current status. Escalate if worsening. Flag if resolved.
-
-SUGGESTIONS (1-3 items):
-Specific and actionable. Name the ticker and the exact condition.
-For monitoring items: state what would trigger dismissal vs. escalation.
-Never suggest adding to a position not in the dislocation zone.
-If no action is warranted, say so in one sentence.
+ACTION: [specific action] OR "no action warranted"
+Condition: [what would change this]
 
 <<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
-List items in EXACTLY this format, one per line, pipe-delimited:
-TICKER | specific measurable condition to watch | high/medium/low
-
-Example:
-USDJPY | BOJ intervention risk approaching 160 — watch SMFG thesis | high
-COPPER | Copper/gold ratio falling — growth concern signal, watch FCX thesis | medium
-VVIX | VVIX trending toward 90 — tail risk building, watch speculative position sizes | high
-
-Rules:
-- Use the exact pipe-delimited format above — no other format
-- TICKER must be the exact ticker/pair symbol (USDJPY not "the yen")
-- Condition must be specific and measurable
-- Only include if genuinely worth tracking for 3+ sessions
-- Maximum 3 items per synthesis call
-- If nothing warrants monitoring, write: NONE
+[TICKER] | [specific measurable condition] | [high/medium/low]
+(1-3 items, or NONE)
 <<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
 
-This delimited block is REQUIRED — always emit it, and emit it last. Keep
-the preceding sections short enough that you always reach it.
+Every line must be specific. No generic observations. No markdown formatting."""
 
-Be specific about cross-asset relationships. Name tickers. Name levels.
-The person making decisions needs to know WHAT to do, not just WHAT is happening."""
+    # Use SYNTHESIS_MAX_TOKENS for consistency
+    max_tokens_to_use = override_max_tokens if override_max_tokens else SYNTHESIS_MAX_TOKENS.get("global_markets", 800)
+    if _retry:
+        max_tokens_to_use = int(max_tokens_to_use * 1.3)
 
     try:
         r = client.messages.create(
             model=MODEL,
-            # Same truncation problem as synthesize_performance() at 700 —
-            # the trailing NEW MONITORING ITEMS block was being cut off.
-            max_tokens=1200,
+            max_tokens=max_tokens_to_use,
             messages=[{"role": "user", "content": prompt}],
         )
         result = _extract_text(r, "Global signals synthesis")
