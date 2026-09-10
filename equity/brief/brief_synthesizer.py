@@ -39,6 +39,32 @@ SYNTHESIS_CACHE_HOURS = 6
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+# Per-section token budget for the 5-section brief (see
+# equity/brief/brief_builder.py's build_morning_brief()). Maxima, not
+# targets — the dense SIGNAL/POSITIONS AFFECTED/ACTION format synthesize_section()
+# and synthesize_full_brief() now use rarely needs the full budget. Replaces the
+# pre-reorg split (market_snapshot 400 + global_signals 1200 + performance 1400 +
+# full_brief 500 =~ 3500, plus a second sector/news synthesize_section() call each
+# at 400) with one call per section, totaling ~3000 tokens across a brief instead
+# of ~6100.
+SYNTHESIS_MAX_TOKENS = {
+    "global_markets": 800,
+    "portfolio_status": 900,
+    "news_signals": 600,
+    "full_brief": 700,
+}
+
+# Pre-reorg section names that used to be synthesized separately, keyed by
+# the new 5-section name that now covers them. synthesize_section() checks
+# these as a cache fallback so a synthesis cached under an old name earlier
+# today still counts as a hit instead of forcing a redundant Claude call —
+# see _load_cache_with_aliases().
+SECTION_ALIASES = {
+    "global_markets": ["market_snapshot", "global_signals"],
+    "portfolio_status": ["performance", "sector"],
+    "news_signals": ["news", "screener"],
+}
+
 
 def _cleanup_old_synthesis_cache() -> None:
     """Delete synthesis cache files from prior days on module load.
@@ -155,47 +181,93 @@ def _extract_text(response, label: str) -> str:
     return response.content[0].text.strip()
 
 
-def synthesize_section(section_name: str, section_data: str, regime_flags: list[str] | None = None) -> str:
-    """Concise synthesis for one brief section. Cached `SYNTHESIS_CACHE_HOURS` hours by content hash."""
+def _load_cache_with_aliases(section_name: str, data_hash: str) -> str | None:
+    """Today's synthesis cache for `section_name`, falling back to its
+    pre-reorg alias names (`SECTION_ALIASES`) on a miss.
+
+    The 5-section reorg means a section's formatted text (and so its
+    content hash) rarely matches what used to be cached under the old,
+    narrower section names — but when it does (e.g. a section whose
+    upstream data hasn't changed since a pre-reorg cache entry was
+    written earlier today), this counts it as a hit rather than paying
+    for a redundant Claude call.
+    """
+    cached = _load_cache(_cache_path(section_name, data_hash))
+    if cached:
+        return cached
+    for alias in SECTION_ALIASES.get(section_name, []):
+        cached = _load_cache(_cache_path(alias, data_hash))
+        if cached:
+            return cached
+    return None
+
+
+def synthesize_section(
+    section_name: str,
+    section_data: str,
+    regime_flags: list[str] | None = None,
+    monitoring_items: list[dict] | None = None,
+    max_tokens: int = 700,
+) -> str:
+    """Dense, structured synthesis for one of the 5 morning-brief sections.
+
+    Structured density over narrative prose: SIGNAL / POSITIONS AFFECTED /
+    ACTION, plus the same `<<<NEW_MONITORING_ITEMS>>>` block every other
+    synthesis call emits (see `_parse_and_persist_monitoring()`) — every
+    line must be specific enough to act on, nothing padded out to sound
+    thorough. `max_tokens` is caller-controlled — see `SYNTHESIS_MAX_TOKENS`
+    for the budget each of the 5 sections is called with.
+
+    Cached `SYNTHESIS_CACHE_HOURS` hours by content hash; see
+    `_load_cache_with_aliases()` for the pre-reorg cache fallback.
+    """
     data_hash = hashlib.md5(section_data.encode()).hexdigest()
     path = _cache_path(section_name, data_hash)
-    cached = _load_cache(path)
+    cached = _load_cache_with_aliases(section_name, data_hash)
     if cached:
         return cached
 
-    regime_str = ", ".join(regime_flags) if regime_flags else "No active regime flags"
-    focus = SECTION_FOCUS.get(section_name, "key signals and portfolio implications")
+    regime_str = ", ".join(regime_flags) if regime_flags else "none"
     positions_ctx = _get_positions_context()
 
-    prompt = f"""{FRAMEWORK}
+    monitoring_str = ""
+    if monitoring_items:
+        active = [i for i in monitoring_items if i.get("priority") in ("high", "medium")][:5]
+        if active:
+            monitoring_str = "\nACTIVE MONITORING:\n" + "\n".join(
+                f'[{i["ticker"]}] {i["item"][:60]} ({i.get("age_days", 0)}d)' for i in active
+            )
 
-Current regime: {regime_str}
+    prompt = f"""{FRAMEWORK}
+Regime: {regime_str}
 
 {positions_ctx}
+{monitoring_str}
 
-{section_name.upper()} DATA:
-{section_data}
+DATA:
+{section_data[:2000]}
 
-Provide a concise synthesis focused on {focus}. Structure as:
+Respond in EXACTLY this format — no additions, no narrative prose:
 
-SUMMARY (2-3 sentences max): The single most important signal in this data right now.
+SIGNAL: [1 sentence — most important thing right now, specific]
 
-PORTFOLIO IMPLICATIONS (2-3 bullets max): Direct, material implications for current positions or watchlist only. Name the ticker. Skip if no direct implication.
+POSITIONS AFFECTED:
+[TICKER] [↑/↓/→] [specific reason ≤10 words] [WATCH/ACT/HOLD]
+(3-4 lines max — only material impacts, omit if none)
 
-SUGGESTIONS (1-2 bullets max): The most plausible actionable suggestion given this data and regime. Name the ticker and action if relevant. If nothing is clearly actionable, say so.
+ACTION: [specific ticker + action] OR "no action warranted"
+Condition: [what would change this]
 
-IMPORTANT constraints for SUGGESTIONS:
-- For existing positions already showing significant unrealized gains (>20%), do NOT suggest adding. Suggest hold/trim assessment instead.
-- For positions at 52W or multi-year highs, flag the entry risk explicitly rather than suggesting addition.
-- Only suggest adding to a position if it is in the dislocation zone (down 10-50% from highs) AND RSI is confirming a turn.
-- Suggestions should be specific but acknowledge uncertainty — avoid language like "add on this session" which implies high confidence.
-- If a suggestion conflicts with the four-question framework (e.g. suggesting adding to something not in the dislocation zone), flag the conflict rather than making the suggestion.
+<<<NEW_MONITORING_ITEMS>>>
+[TICKER] | [specific measurable condition] | [high/medium/low]
+(1-3 items max, or NONE)
+<<<END_MONITORING_ITEMS>>>
 
-Be direct and specific. Avoid generic observations. If a signal is ambiguous, say so.
-Under 200 words total."""
+Every line must be specific. No generic observations.
+If unsure, write less not more."""
 
     try:
-        r = client.messages.create(model=MODEL, max_tokens=400, messages=[{"role": "user", "content": prompt}])
+        r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
         result = _extract_text(r, f"Section synthesis ({section_name})")
         _save_cache(path, result)
         return result
@@ -683,56 +755,68 @@ def _parse_and_persist_monitoring(synthesis_text: str, source: str = "synthesis"
         logger.warning("_parse_and_persist_monitoring: failed to persist items: %s", exc)
 
 
-def synthesize_full_brief(all_sections_text: str, regime_flags: list[str] | None = None) -> str:
-    """End-of-brief synthesis covering the full morning data. Cached `SYNTHESIS_CACHE_HOURS` hours by content hash."""
+def synthesize_full_brief(
+    all_sections_text: str,
+    regime_flags: list[str] | None = None,
+    monitoring_items: list[dict] | None = None,
+    max_tokens: int = 700,
+) -> str:
+    """Closing synthesis for the full 5-section brief, same structured-density
+    format as `synthesize_section()` (see `SYNTHESIS_MAX_TOKENS`).
+
+    `monitoring_items` and `max_tokens` are caller-controlled — build_morning_brief()
+    passes the full brief's accumulated monitoring list here since this call sees
+    the whole morning's data, not just one section's. Cached `SYNTHESIS_CACHE_HOURS`
+    hours by content hash.
+    """
     data_hash = hashlib.md5(all_sections_text.encode()).hexdigest()
     path = _cache_path("full_brief", data_hash)
     cached = _load_cache(path)
     if cached:
         return cached
 
-    regime_str = ", ".join(regime_flags) if regime_flags else "No active regime flags"
+    regime_str = ", ".join(regime_flags) if regime_flags else "none"
     positions_ctx = _get_positions_context()
 
-    prompt = f"""{FRAMEWORK}
+    monitoring_str = ""
+    if monitoring_items:
+        active = [i for i in monitoring_items if i.get("priority") in ("high", "medium")][:5]
+        if active:
+            monitoring_str = "\nACTIVE MONITORING:\n" + "\n".join(
+                f'[{i["ticker"]}] {i["item"][:60]} ({i.get("age_days", 0)}d)' for i in active
+            )
 
-Current regime: {regime_str}
+    prompt = f"""{FRAMEWORK}
+Regime: {regime_str}
 
 {positions_ctx}
+{monitoring_str}
 
-FULL BRIEF DATA (truncated to 3000 chars):
-{all_sections_text[:3000]}
+BRIEF DATA (last 2500 chars):
+{all_sections_text[-2500:]}
 
-Provide a closing synthesis of the full morning brief. Structure as:
+Respond in EXACTLY this format:
 
-OVERALL ASSESSMENT (2-3 sentences): The single most important thing to know this morning. The dominant theme across all sections.
+OVERALL: [2 sentences — dominant theme and most important cross-section signal]
 
-TOP 3 PORTFOLIO IMPLICATIONS (3 bullets max): The most material cross-section implications for current positions. Prioritize by urgency and magnitude. Name the ticker.
+TOP IMPLICATIONS:
+[TICKER] — [specific implication ≤12 words]
+[TICKER] — [specific implication ≤12 words]
+[TICKER] — [specific implication ≤12 words]
 
-When assessing these, consider:
-- Cross-asset confirmation/contradiction: do futures, vol, credit, and international indices tell the same story or different stories?
-- If VIX/VVIX elevated: which speculative positions face the most compression risk?
-- If yield moves are significant: TLT thesis status and duration exposure across the book.
-- If FX moves are significant: SMFG (JPY), BYDDY/EWW/TSM (CNH), FCX/commodities (DXY).
-- If copper/gold ratio moving: FCX, CAT, industrials thesis implications.
-- If crypto moving significantly: risk appetite signal relevant to RDDT, PLTR positioning.
-The most actionable implications often come from CONTRADICTIONS between asset classes, not confirmations. Flag these explicitly when present.
+TODAY'S FOCUS:
+Position: [ticker + specific action]
+Monitor: [ticker/signal + specific condition]
 
-TODAY'S FOCUS (1-2 bullets): If you had to focus on one position decision and one thing to monitor today — what are they? Be specific.
+RISK: [1 sentence — single biggest portfolio risk right now]
 
-IMPORTANT constraints for the position decision in TODAY'S FOCUS:
-- For existing positions already showing significant unrealized gains (>20%), do NOT suggest adding. Suggest hold/trim assessment instead.
-- For positions at 52W or multi-year highs, flag the entry risk explicitly rather than suggesting addition.
-- Only suggest adding to a position if it is in the dislocation zone (down 10-50% from highs) AND RSI is confirming a turn.
-- Be specific but acknowledge uncertainty — avoid language like "add on this session" which implies high confidence.
-- If the decision conflicts with the four-question framework (e.g. suggesting adding to something not in the dislocation zone), flag the conflict rather than making the suggestion.
-
-RISK TO WATCH (1 sentence): The single biggest risk to the current portfolio surfaced by this morning's data.
-
-Direct, specific, prioritized. Under 250 words."""
+<<<NEW_MONITORING_ITEMS>>>
+[TICKER] | [specific measurable condition] | [high/medium/low]
+(1-3 items, or NONE)
+<<<END_MONITORING_ITEMS>>>"""
 
     try:
-        r = client.messages.create(model=MODEL, max_tokens=500, messages=[{"role": "user", "content": prompt}])
+        r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
         result = _extract_text(r, "Full brief synthesis")
         _save_cache(path, result)
         return result

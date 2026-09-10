@@ -1,25 +1,27 @@
-"""Assembles the full daily morning brief from every brief/portfolio/screener module.
+"""Assembles the daily morning brief from every brief/portfolio/screener module.
 
-`build_morning_brief()` calls each section's fetch + format pair in
-sequence (market snapshot, eco calendar, portfolio monitor, performance
-tracker, earnings calendar, sector monitor, news triage, screener),
-interleaving an AI synthesis (`brief_synthesizer.synthesize_section()`)
-after the sections richest in cross-asset signal, and returns a list of
-`(text, keyboard)` pairs rather than one big string — each pair is sent as
-its own Telegram message by `equity.telegram.bot.send_brief()`/
-`scheduled_morning_brief()`, so alert-relevant sections can carry their
-own action buttons (discuss a mover, read a thesis-breaking article, page
-through a ticker's full headline list).
+`build_morning_brief()` assembles 5 self-contained sections — Global
+Markets, Economic Calendar, Portfolio Status, News & Signals, and a
+closing Morning Synthesis — each consolidating what used to be several
+separate sub-sections (see each `_format_sectionN_*()` below), with one
+AI synthesis call per section (`brief_synthesizer.synthesize_section()`)
+instead of one per sub-section. The economic calendar is data-only — no
+synthesis, it's self-explanatory. Returns a list of `(text, keyboard)`
+pairs rather than one big string — each pair is sent as its own Telegram
+message by `equity.telegram.bot.send_brief()`/`scheduled_morning_brief()`,
+so alert-relevant sections can carry their own action buttons (discuss a
+mover, read a thesis-breaking article, page through a ticker's full
+headline list).
 
 Each section is wrapped independently in try/except — one broken data
 source degrades to an error placeholder for that section, never takes
 down the whole brief.
 
-Performance/earnings/sector sit after portfolio monitor and before news
-triage: they extend the same holdings-focused picture portfolio monitor
-starts (price action -> benchmark-relative performance -> upcoming
-earnings -> correlation/concentration risk) before the brief moves on to
-qualitative news and then new-idea screening.
+`_run_section()`/`_run_synthesis()`/`_fetch_performance_data()` are the
+older per-sub-section helpers `build_morning_brief()` used before the
+5-section reorg. Kept (unused by the current assembly) rather than
+deleted — nothing else in the codebase calls them, but they're small and
+this module's job is exactly this kind of glue.
 
 `get_regime_adjusted_screener_params()` is a separate utility (not part of
 the assembly above): it fetches the current market regime and looks up
@@ -40,10 +42,9 @@ from telegram import InlineKeyboardMarkup
 
 from equity.brief import earnings_monitor, eco_calendar, market_snapshot, performance_tracker, sector_monitor
 from equity.brief.brief_synthesizer import (
+    SYNTHESIS_MAX_TOKENS,
     _parse_and_persist_monitoring,
     synthesize_full_brief,
-    synthesize_global_signals,
-    synthesize_performance,
     synthesize_section,
 )
 from equity.config import positions, settings
@@ -56,6 +57,7 @@ from equity.telegram.formatters import make_article_keyboard, make_main_menu, ma
 logger = logging.getLogger(__name__)
 
 _DIVIDER_HEAVY = "════════════════════════════════"
+_DIVIDER_LIGHT = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
 _BRIEFS_DIR = Path(__file__).resolve().parents[1] / "data" / "briefs"
 
@@ -105,185 +107,218 @@ def _fetch_performance_data() -> tuple[dict, dict, dict, dict]:
     return benchmark_data, portfolio_data, relative_data, spot_data
 
 
-def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
-    """Assemble the full morning brief as a list of (text, keyboard) message pairs.
+def _format_section1_global_markets(snapshot: dict, global_signals: dict) -> str:
+    """Combines market_snapshot + global_signals into Section 1.
 
-    Header, market snapshot (+ synthesis), eco calendar, portfolio monitor,
-    performance tracker (+ synthesis), earnings calendar, sector monitor
-    (+ synthesis), news triage (+ headline-pagination nav + synthesis),
-    screener, a full-brief synthesis, and a footer — in that order, each
-    section independently fault-tolerant (see module docstring).
+    No new logic — just restructuring: calls the existing
+    `format_market_snapshot()` (rates/FX/commodities/equity futures) and
+    `format_global_signals()` (vol/crypto/international/credit/cross-asset
+    ratios) and concatenates their output with a clear divider.
+    """
+    parts = [
+        "🌍 GLOBAL MARKETS",
+        _DIVIDER_LIGHT,
+        market_snapshot.format_market_snapshot(snapshot),
+        "",
+        market_snapshot.format_global_signals(global_signals),
+    ]
+    return "\n".join(parts)
+
+
+def _format_section2_eco_calendar(cal: dict, earnings: dict) -> str:
+    """Eco calendar + earnings for held positions only. No synthesis — data only."""
+    parts = [
+        "📅 ECONOMIC CALENDAR",
+        _DIVIDER_LIGHT,
+        eco_calendar.format_eco_calendar(cal),
+    ]
+    earnings_text = earnings_monitor.format_earnings_section(earnings)
+    if earnings_text and "no upcoming" not in earnings_text.lower():
+        parts.extend(["", earnings_text])
+    return "\n".join(parts)
+
+
+def _format_section3_portfolio_status(monitor_data, perf_data, rel_data, spot_data, port_data, sector_data) -> str:
+    """Portfolio monitor + benchmarks + sectors + concentration. Calls existing format functions."""
+    parts = [
+        "💼 PORTFOLIO STATUS",
+        _DIVIDER_LIGHT,
+        monitor.format_portfolio_monitor(monitor_data),
+        "",
+        performance_tracker.format_performance_section(perf_data, port_data, rel_data, spot_data),
+        "",
+        sector_monitor.format_sector_section(sector_data),
+    ]
+    return "\n".join(parts)
+
+
+def _format_section4_news_signals(triage: dict, df_screener) -> str:
+    """News triage + screener results."""
+    parts = [
+        "📰 NEWS & SIGNALS",
+        _DIVIDER_LIGHT,
+        news_triage.format_news_triage(triage),
+    ]
+    if df_screener is not None and len(df_screener) > 0:
+        parts.extend(["", "📊 SCREENER", screener.format_screener_output(df_screener)])
+    else:
+        parts.append("\n📊 SCREENER: No names passed all filters today.")
+    return "\n".join(parts)
+
+
+def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
+    """Assemble the 5-section morning brief as a list of (text, keyboard) message pairs.
+
+    Header, then:
+      1. Global Markets    — market snapshot + global signals, one synthesis
+      2. Economic Calendar — week view + FOMC proximity + held-position earnings, no synthesis
+      3. Portfolio Status  — monitor + benchmarks + sectors, one synthesis
+      4. News & Signals    — news triage + screener, one synthesis
+      5. Morning Synthesis — full-brief synthesis with cross-section awareness
+    and a footer. Each section is independently fault-tolerant: an
+    exception degrades to a warning placeholder for that section only and
+    never takes down the rest of the brief. Synthesis is called once per
+    section (see `SYNTHESIS_MAX_TOKENS` for each section's token budget)
+    rather than once per sub-section, per the reorg — see module docstring.
     """
     sections: list[tuple[str, InlineKeyboardMarkup | None]] = []
-    all_text_for_synthesis: list[str] = []
+    all_text: list[str] = []
+    regime_flags: list[str] = []
 
-    # Header
+    # ── HEADER ──────────────────────────────────────────────────
     sections.append((format_morning_brief_header(), None))
 
-    # Market snapshot
-    _t0 = time.time()
+    # ── SECTION 1: GLOBAL MARKETS ───────────────────────────────
+    # Consolidates: market snapshot (rates/FX/commodities/equity futures)
+    # + global signals (volatility/crypto/international/credit/cross-asset).
     try:
         snapshot = market_snapshot.fetch_market_snapshot()
-        snap_text = market_snapshot.format_market_snapshot(snapshot)
-        logger.info("Brief section [Market snapshot] completed in %.1fs", time.time() - _t0)
-    except Exception as exc:
-        logger.error("Brief section [Market snapshot] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
-        snapshot = {}
-        snap_text = f"⚠️ Market snapshot unavailable: {exc}"
-    regime_flags = snapshot.get("regime_flags", [])
-    sections.append((snap_text, None))
-    sections.append((f"💡 *Snapshot*\n{_run_synthesis('market_snapshot', snap_text, regime_flags)}", None))
-    all_text_for_synthesis.append(snap_text)
+        regime_flags = snapshot.get("regime_flags", [])
+        global_signals = market_snapshot.fetch_global_signals()
 
-    # Global signals — equity futures, crypto, volatility, international
-    # indices, credit proxies, cross-asset ratios. Dedicated synthesizer
-    # (synthesize_global_signals(), same pattern as performance/sector),
-    # with the persistent monitoring list folded in — cross-asset reads
-    # are exactly the kind of thing worth tracking across sessions.
-    global_text = _run_section("Global signals", market_snapshot.fetch_global_signals, market_snapshot.format_global_signals)
-    sections.append((global_text, None))
-    all_text_for_synthesis.append(global_text)
+        s1_text = _format_section1_global_markets(snapshot, global_signals)
+        sections.append((s1_text, None))
+        all_text.append(s1_text)
 
-    try:
-        global_synthesis = synthesize_global_signals(
-            section_data=global_text,
-            regime_flags=regime_flags,
-            monitoring_items=load_monitoring(),
+        s1_synth = synthesize_section(
+            "global_markets", s1_text, regime_flags,
+            max_tokens=SYNTHESIS_MAX_TOKENS["global_markets"],
         )
+        sections.append((f"💡 *Global Markets*\n{s1_synth}", None))
+        _parse_and_persist_monitoring(s1_synth, source="global_markets")
     except Exception as exc:
-        logger.exception("Global signals synthesis failed")
-        global_synthesis = f"[Global signals synthesis unavailable: {exc}]"
+        logger.error("Section 1 (Global Markets) FAILED: %s", exc, exc_info=True)
+        sections.append((f"⚠️ Global markets data unavailable: {exc}", None))
 
-    _parse_and_persist_monitoring(global_synthesis, source="global_signals_synthesis")
-    sections.append((f"💡 *Global Signals*\n{global_synthesis}", None))
+    # ── SECTION 2: ECONOMIC CALENDAR ────────────────────────────
+    # No synthesis — data only, self-explanatory.
+    try:
+        cal = eco_calendar.fetch_eco_calendar(days_ahead=7)
+        earnings = earnings_monitor.fetch_earnings_calendar(days_ahead=14)
+        s2_text = _format_section2_eco_calendar(cal, earnings)
+        sections.append((s2_text, None))
+        all_text.append(s2_text)
+    except Exception as exc:
+        logger.error("Section 2 (Economic Calendar) FAILED: %s", exc, exc_info=True)
+        sections.append((f"⚠️ Economic calendar unavailable: {exc}", None))
 
-    # Eco calendar
-    cal_text = _run_section("Eco calendar", lambda: eco_calendar.fetch_eco_calendar(days_ahead=7), eco_calendar.format_eco_calendar)
-    sections.append((cal_text, None))
-    all_text_for_synthesis.append(cal_text)
-
-    # Portfolio monitor
-    _t0 = time.time()
+    # ── SECTION 3: PORTFOLIO STATUS ──────────────────────────────
+    # Consolidates: portfolio monitor + benchmark/relative performance +
+    # sector exposure/concentration.
     try:
         monitor_data = monitor.run_portfolio_monitor()
-        mon_text = monitor.format_portfolio_monitor(monitor_data)
-        logger.info("Brief section [Portfolio monitor] completed in %.1fs", time.time() - _t0)
-    except Exception as exc:
-        logger.error("Brief section [Portfolio monitor] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
-        monitor_data = {}
-        mon_text = f"⚠️ Portfolio monitor unavailable: {exc}"
-    alert_tickers = [
-        t for t, d in monitor_data.get("positions", {}).items() if d.get("move_flag") in ("LARGE_UP", "LARGE_DOWN")
-    ]
-    mon_kb = make_tickers_keyboard(alert_tickers) if alert_tickers else None
-    sections.append((mon_text, mon_kb))
-    all_text_for_synthesis.append(mon_text)
+        perf_data = performance_tracker.fetch_benchmark_performance()
+        rel_data = performance_tracker.fetch_position_relative_performance(perf_data)
+        spot_data = performance_tracker.fetch_spot_prices(perf_data)
+        port_data = performance_tracker.fetch_portfolio_performance()
+        sector_data = sector_monitor.fetch_sector_data()
 
-    # Performance — dedicated synthesizer (synthesize_performance(), richer
-    # prompt than synthesize_section()) with the persistent monitoring list
-    # and cross-section context folded in. Cross-section context is limited
-    # to what's already been computed at this point in the build order —
-    # market snapshot and portfolio monitor; news triage runs later (see
-    # module docstring), so it isn't available here.
-    perf_text = _run_section("Performance tracker", _fetch_performance_data, lambda data: performance_tracker.format_performance_section(*data))
-    sections.append((perf_text, None))
-
-    monitoring_items = load_monitoring()
-    cross_ctx_parts = [f"MARKET SNAPSHOT SUMMARY:\n{snap_text[:500]}"]
-    if mon_text:
-        cross_ctx_parts.append(f"PORTFOLIO MONITOR:\n{mon_text[:500]}")
-    cross_ctx = "\n\n".join(cross_ctx_parts)
-
-    try:
-        perf_synthesis = synthesize_performance(
-            section_data=perf_text,
-            regime_flags=regime_flags,
-            monitoring_items=monitoring_items,
-            cross_thread_context=cross_ctx,
+        s3_text = _format_section3_portfolio_status(
+            monitor_data, perf_data, rel_data, spot_data, port_data, sector_data
         )
+        alert_tickers = [
+            t for t, d in monitor_data.get("positions", {}).items()
+            if d.get("move_flag") in ("LARGE_UP", "LARGE_DOWN")
+        ]
+        s3_kb = make_tickers_keyboard(alert_tickers) if alert_tickers else None
+        sections.append((s3_text, s3_kb))
+        all_text.append(s3_text)
+
+        monitoring_items = load_monitoring()
+        s3_synth = synthesize_section(
+            "portfolio_status", s3_text, regime_flags,
+            monitoring_items=monitoring_items,
+            max_tokens=SYNTHESIS_MAX_TOKENS["portfolio_status"],
+        )
+        sections.append((f"💡 *Portfolio Status*\n{s3_synth}", None))
+        _parse_and_persist_monitoring(s3_synth, source="portfolio_status")
     except Exception as exc:
-        logger.exception("Performance synthesis failed")
-        perf_synthesis = f"[Performance synthesis unavailable: {exc}]"
+        logger.error("Section 3 (Portfolio Status) FAILED: %s", exc, exc_info=True)
+        sections.append((f"⚠️ Portfolio status unavailable: {exc}", None))
 
-    # Persist any new monitoring items the synthesis surfaced — never raises
-    # (see _parse_and_persist_monitoring()'s own docstring), so this can't
-    # take down the rest of the brief.
-    _parse_and_persist_monitoring(perf_synthesis, source="performance_synthesis")
-
-    sections.append((f"💡 *Performance*\n{perf_synthesis}", None))
-    all_text_for_synthesis.append(perf_text)
-
-    # Earnings
-    earn_text = _run_section("Earnings calendar", lambda: earnings_monitor.fetch_earnings_calendar(days_ahead=7), earnings_monitor.format_earnings_section)
-    sections.append((earn_text, None))
-    all_text_for_synthesis.append(earn_text)
-
-    # Sector monitor
-    sector_text = _run_section("Sector monitor", sector_monitor.fetch_sector_data, sector_monitor.format_sector_section)
-    sections.append((sector_text, None))
-    sections.append((f"💡 *Sectors*\n{_run_synthesis('sector', sector_text, regime_flags)}", None))
-    all_text_for_synthesis.append(sector_text)
-
-    # News triage
-    _t0 = time.time()
+    # ── SECTION 4: NEWS & SIGNALS ────────────────────────────────
+    # Consolidates: news triage + screener.
     try:
         triage = news_triage.run_news_triage(positions.get_all_tickers())
-        triage_text = news_triage.format_news_triage(triage)
-        logger.info("Brief section [News triage] completed in %.1fs", time.time() - _t0)
+        df_screener = screener.run_screener()
+
+        s4_text = _format_section4_news_signals(triage, df_screener)
+
+        thesis_alert_tickers = [t for t, d in triage.items() if d.get("has_thesis_alert")]
+        thesis_articles = [
+            {"url": h.get("url", ""), "ticker": t}
+            for t, d in triage.items()
+            for h in d.get("headlines", [])
+            if h.get("thesis_breaker_match")
+        ]
+        all_news_tickers = [t for t, d in triage.items() if d.get("headlines")]
+        screener_tickers = (
+            df_screener["ticker"].tolist()[:6] if df_screener is not None and len(df_screener) > 0 else []
+        )
+
+        article_kb = make_article_keyboard(thesis_articles) if thesis_articles else None
+        news_nav_kb = make_news_actions(thesis_alert_tickers, all_news_tickers)
+        screener_kb = make_tickers_keyboard(screener_tickers) if screener_tickers else None
+
+        sections.append((s4_text, article_kb))
+        if news_nav_kb:
+            sections.append(("", news_nav_kb))
+        if screener_kb:
+            sections.append(("", screener_kb))
+        all_text.append(s4_text)
+
+        s4_synth = synthesize_section(
+            "news_signals", s4_text, regime_flags,
+            max_tokens=SYNTHESIS_MAX_TOKENS["news_signals"],
+        )
+        sections.append((f"💡 *News & Signals*\n{s4_synth}", None))
+        _parse_and_persist_monitoring(s4_synth, source="news_signals")
     except Exception as exc:
-        logger.error("Brief section [News triage] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
-        triage = {}
-        triage_text = f"⚠️ News triage unavailable: {exc}"
-    thesis_alert_tickers = [t for t, d in triage.items() if d.get("has_thesis_alert")]
-    thesis_articles = [
-        {"url": h.get("url", ""), "ticker": ticker}
-        for ticker, data in triage.items()
-        for h in data.get("headlines", [])
-        if h.get("thesis_breaker_match")
-    ]
-    article_kb = make_article_keyboard(thesis_articles) if thesis_articles else None
-    sections.append((triage_text, article_kb))
+        logger.error("Section 4 (News & Signals) FAILED: %s", exc, exc_info=True)
+        sections.append((f"⚠️ News & signals unavailable: {exc}", None))
 
-    all_news_tickers = [t for t, d in triage.items() if d.get("headlines")]
-    news_nav_kb = make_news_actions(thesis_alert_tickers, all_news_tickers)
-    if news_nav_kb:
-        sections.append(("News navigation:", news_nav_kb))
-    sections.append((f"💡 *News*\n{_run_synthesis('news', triage_text, regime_flags)}", None))
-    all_text_for_synthesis.append(triage_text)
-
-    # Screener
-    _t0 = time.time()
+    # ── SECTION 5: MORNING SYNTHESIS ────────────────────────────
     try:
-        df = screener.run_screener()
-        screener_text = screener.format_screener_output(df)
-        screener_tickers = df["ticker"].tolist() if df is not None and len(df) > 0 else []
-        logger.info("Brief section [Screener] completed in %.1fs", time.time() - _t0)
+        monitoring_items = load_monitoring()
+        full_synth = synthesize_full_brief(
+            "\n\n".join(all_text), regime_flags,
+            monitoring_items=monitoring_items,
+            max_tokens=SYNTHESIS_MAX_TOKENS["full_brief"],
+        )
+        sections.append((
+            f"{_DIVIDER_HEAVY}\n🎯 MORNING SYNTHESIS\n{_DIVIDER_HEAVY}\n{full_synth}",
+            None,
+        ))
+        _parse_and_persist_monitoring(full_synth, source="full_brief")
     except Exception as exc:
-        logger.error("Brief section [Screener] FAILED after %.1fs: %s", time.time() - _t0, exc, exc_info=True)
-        screener_text = f"⚠️ Screener unavailable: {exc}"
-        screener_tickers = []
-    screen_kb = make_tickers_keyboard(screener_tickers[:6]) if screener_tickers else None
-    sections.append((screener_text, screen_kb))
-    all_text_for_synthesis.append(screener_text)
-
-    # Full brief synthesis
-    try:
-        full_synth = synthesize_full_brief("\n\n".join(all_text_for_synthesis), regime_flags)
-    except Exception as exc:
-        logger.exception("Full-brief synthesis failed")
-        full_synth = f"[Full brief synthesis unavailable: {exc}]"
-    sections.append((
-        f"════════════════════════════════\n"
-        f"🎯 MORNING SYNTHESIS\n"
-        f"════════════════════════════════\n{full_synth}",
-        None,
-    ))
+        logger.error("Section 5 (Morning Synthesis) FAILED: %s", exc, exc_info=True)
+        sections.append((f"⚠️ Morning synthesis unavailable: {exc}", None))
 
     # Footer
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    sections.append((f"Generated {ts}\nReply /discuss TICKER for a deep dive.", make_main_menu()))
+    sections.append((f"Generated {ts}", make_main_menu()))
 
-    return sections
+    return [s for s in sections if s[0] or s[1]]
 
 
 def save_brief_to_thread(sections: list[tuple[str, "InlineKeyboardMarkup | None"]], thread_manager) -> None:

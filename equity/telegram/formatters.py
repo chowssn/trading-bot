@@ -136,22 +136,33 @@ async def send_in_parts(
 # ---------------------------------------------------------------------------
 
 def make_main_menu() -> InlineKeyboardMarkup:
+    """Main menu, laid out around the 5-section brief structure
+    (equity/brief/brief_builder.py's build_morning_brief()): Markets/Calendar/
+    Portfolio mirror sections 1-3, News/Screener/Monitoring mirror section 4
+    plus the persistent monitoring list, and Threads/Status/Menu round out
+    navigation. /watchlist, /performance, and /sectors remain available as
+    commands even though this menu no longer has dedicated buttons for them.
+    """
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("🌅 Brief", callback_data="cmd_brief"),
-                InlineKeyboardButton("📊 Screener", callback_data="cmd_screener"),
-                InlineKeyboardButton("📁 Portfolio", callback_data="cmd_portfolio"),
+                InlineKeyboardButton("💬 Discuss...", callback_data="cmd_discuss_menu"),
+            ],
+            [
+                InlineKeyboardButton("🌍 Markets", callback_data="cmd_prices"),
+                InlineKeyboardButton("📅 Calendar", callback_data="cmd_calendar"),
+                InlineKeyboardButton("💼 Portfolio", callback_data="cmd_portfolio"),
             ],
             [
                 InlineKeyboardButton("📰 News", callback_data="cmd_news"),
-                InlineKeyboardButton("💬 Discuss...", callback_data="cmd_discuss_menu"),
-                InlineKeyboardButton("🧵 Threads", callback_data="cmd_threads"),
+                InlineKeyboardButton("🔍 Screener", callback_data="cmd_screener"),
+                InlineKeyboardButton("📋 Monitoring", callback_data="cmd_monitoring"),
             ],
             [
-                InlineKeyboardButton("📋 Watchlist", callback_data="cmd_watchlist"),
-                InlineKeyboardButton("📈 Performance", callback_data="cmd_performance"),
-                InlineKeyboardButton("🏭 Sectors", callback_data="cmd_sectors"),
+                InlineKeyboardButton("🧵 Threads", callback_data="cmd_threads"),
+                InlineKeyboardButton("📊 Status", callback_data="cmd_status"),
+                InlineKeyboardButton("🏠 Menu", callback_data="cmd_main_menu"),
             ],
         ]
     )

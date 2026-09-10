@@ -42,7 +42,14 @@ _BOT_START_TIME = time.time()  # for /status uptime
 
 logger = logging.getLogger(__name__)
 
-from equity.brief.brief_builder import build_morning_brief, get_last_brief_synthesis, save_brief_to_thread
+from equity.brief.brief_builder import (
+    _format_section2_eco_calendar,
+    build_morning_brief,
+    get_last_brief_synthesis,
+    save_brief_to_thread,
+)
+from equity.brief.earnings_monitor import fetch_earnings_calendar
+from equity.brief.eco_calendar import fetch_eco_calendar
 from equity.brief.market_snapshot import _get_market_session_status, fetch_market_snapshot
 from equity.brief.performance_tracker import (
     fetch_benchmark_performance,
@@ -1133,6 +1140,7 @@ async def send_status(update, context):
     count.
     /status
     """
+    import re
     from pathlib import Path
 
     lines = ["🖥️ *SYSTEM STATUS*", ""]
@@ -1143,15 +1151,44 @@ async def send_status(update, context):
     minutes = int((uptime_seconds % 3600) // 60)
     lines.append(f"⏱ Uptime: {hours}h {minutes}m")
 
-    # Last brief
+    # Last brief — cross-checked against brief.log's completion marker
+    # (see scheduled_morning_brief()), not just the saved-brief file's
+    # mtime: if a brief fails partway through, a partial file can still
+    # land with a timestamp that looks like a clean run. Whichever source
+    # is more recent wins; if they disagree by more than a few minutes,
+    # that itself indicates a partial failure worth surfacing.
     briefs_dir = Path("equity/data/briefs")
     brief_files = sorted(briefs_dir.glob("brief_*.txt")) if briefs_dir.exists() else []
-    if brief_files:
-        latest = brief_files[-1]
-        mtime = datetime.fromtimestamp(latest.stat().st_mtime)
-        age_hours = (datetime.now() - mtime).total_seconds() / 3600
+    file_mtime = datetime.fromtimestamp(brief_files[-1].stat().st_mtime) if brief_files else None
+
+    last_brief_from_log = None
+    try:
+        with open("equity/data/logs/brief.log", encoding="utf-8") as f:
+            log_content = f.read()
+        log_matches = re.findall(
+            r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?(?:Generated|[Bb]rief.*complete)",
+            log_content,
+        )
+        if log_matches:
+            last_brief_from_log = datetime.strptime(log_matches[-1], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    candidates = [t for t in (file_mtime, last_brief_from_log) if t is not None]
+    if candidates:
+        latest = max(candidates)
+        age_hours = (datetime.now() - latest).total_seconds() / 3600
         age_str = f"{age_hours:.1f}h ago" if age_hours < 24 else f"{age_hours / 24:.1f}d ago"
-        lines.append(f"📊 Last brief: {mtime.strftime('%Y-%m-%d %H:%M')} ({age_str})")
+        lines.append(f"📊 Last brief: {latest.strftime('%Y-%m-%d %H:%M')} ({age_str})")
+        if (
+            file_mtime and last_brief_from_log
+            and abs((file_mtime - last_brief_from_log).total_seconds()) > 300
+        ):
+            lines.append(
+                f"   ⚠️ file mtime {file_mtime.strftime('%Y-%m-%d %H:%M')} vs "
+                f"log completion {last_brief_from_log.strftime('%Y-%m-%d %H:%M')} "
+                f"— possible partial failure"
+            )
     else:
         lines.append("📊 Last brief: never run")
 
@@ -1487,6 +1524,15 @@ async def handle_callback(update, context):
         sector_data = await run_in_executor(fetch_sector_data)
         text = format_sector_section(sector_data)
         await send_in_parts(context.bot, chat_id, text, reply_markup=make_main_menu())
+    elif data == "cmd_calendar":
+        cal = await run_in_executor(fetch_eco_calendar, 7)
+        earnings = await run_in_executor(fetch_earnings_calendar, 14)
+        text = _format_section2_eco_calendar(cal, earnings)
+        await send_in_parts(context.bot, chat_id, text, reply_markup=make_main_menu())
+    elif data == "cmd_status":
+        await send_status(update, context)
+    elif data == "cmd_monitoring":
+        await send_monitoring(update, context)
     elif data == "cmd_discuss_menu":
         await query.message.reply_text(
             "Choose a ticker:", reply_markup=make_discuss_menu(POSITIONS, WATCHLIST)
@@ -1871,6 +1917,13 @@ async def scheduled_morning_brief(context):
             if text and text.strip():
                 await send_safe(context.bot, TELEGRAM_USER_ID, text, reply_markup=keyboard)
                 await asyncio.sleep(0.3)
+        # Completion marker for send_status()'s "last brief" check — logged
+        # under the "equity.brief" namespace (not this module's own logger)
+        # so it actually lands in brief.log rather than advisor.log; see
+        # equity/config/logging_config.py's per-subsystem file routing.
+        logging.getLogger("equity.brief.brief_builder").info(
+            "Morning brief complete — %d sections delivered", len(sections)
+        )
     except Exception as e:
         await context.bot.send_message(
             chat_id=TELEGRAM_USER_ID,
