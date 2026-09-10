@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -42,7 +43,7 @@ _BOT_START_TIME = time.time()  # for /status uptime
 logger = logging.getLogger(__name__)
 
 from equity.brief.brief_builder import build_morning_brief, get_last_brief_synthesis, save_brief_to_thread
-from equity.brief.market_snapshot import fetch_market_snapshot
+from equity.brief.market_snapshot import _get_market_session_status, fetch_market_snapshot
 from equity.brief.performance_tracker import (
     fetch_benchmark_performance,
     fetch_portfolio_performance,
@@ -55,18 +56,32 @@ from equity.config import config_manager
 from equity.config import positions as positions_module
 from equity.config.market_config import (
     COMMODITY_ALERT_PCT,
+    COMMODITY_TICKERS_EXTENDED,
+    CREDIT_TICKERS,
+    CROSS_ASSET_RATIOS,
+    CRYPTO_ALERT_PCT,
+    CRYPTO_TICKERS,
+    EQUITY_FUTURES,
     FX_ALERT_PCT,
+    FX_TICKERS,
+    INTERNATIONAL_INDICES,
+    INTL_ALERT_PCT,
     LARGE_MOVE_THRESHOLD_PCT,
     NEWS_HEADLINE_PAGE_SIZE,
+    VOLATILITY_ALERT,
+    VOLATILITY_TICKERS,
     YIELD_ALERT_BP,
     YIELD_LEVEL_ALERTS,
 )
+from equity.data.price_cache import TENOR_TO_CACHE_KEY, price_cache
 from equity.portfolio.monitor import format_portfolio_monitor, run_portfolio_monitor
 from equity.portfolio.news_triage import format_news_triage, run_news_triage
 from equity.screener.quality_scorer import score_ticker
 from equity.screener.screener import format_screener_output, run_screener
 from equity.telegram import config_commands
+from equity.telegram.advisor import MODEL as ADVISOR_MODEL
 from equity.telegram.advisor import Advisor
+from equity.telegram.advisor import _is_valid_ticker
 from equity.telegram.auth import AuthManager
 from equity.telegram.formatters import (
     format_headline_page,
@@ -81,7 +96,6 @@ from equity.telegram.formatters import (
     make_suggestions_keyboard,
     make_thread_list_keyboard,
     make_ticker_actions,
-    make_tickers_keyboard,
     send_in_parts,
     send_safe,
 )
@@ -261,7 +275,8 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
         if thread_type == "ticker":
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"🔍 Researching {ticker}..."
+                text=f"🔍 Researching {ticker} — fetching live fundamentals, "
+                     f"analyst consensus, recent events... (~20s)"
             )
             context_str = await run_in_executor(
                 advisor.get_ticker_context, ticker
@@ -690,38 +705,303 @@ async def send_macro(update, context):
     await start_or_resume_discussion("MACRO", update, context, thread_type="topic")
 
 
+_PRICE_FILTERS = {
+    "all", "yields", "fx", "commodities", "positions",
+    "futures", "crypto", "vol", "volatility", "intl", "international", "credit",
+}
+
+
+def _session_suffix(data: dict, show_session: bool = True) -> str:
+    """The ' | 3min ago (2026-09-07 14:35 ET)'-style tail `_format_price_line()`
+    and the yields section both append — factored out since yields don't fit
+    `_format_price_line()`'s $-price/percent-change shape but still carry
+    the same fields (see price_cache.py's `_get_session_context()` and
+    `_fetch_fred_yields()`).
+
+    Prefers the always-exact `exact_timestamp` (full date + ET time for an
+    intraday bar, weekday + calendar date for a daily one) over the vaguer
+    `session_label`/`condition_note` bucketing ("Fri close", "3d ago") —
+    a viewer should never have to guess which session a price is from.
+    `data_lag_minutes` (intraday bars only) leads as the relative "how
+    stale" figure when available, in minutes rather than the coarser hour
+    buckets; a daily bar (`data_lag_minutes` is None) shows just the exact
+    timestamp on its own, since a day's-worth of age isn't meaningful in
+    minutes anyway.
+    """
+    if not show_session:
+        return ""
+    exact_ts = data.get("exact_timestamp", "")
+    lag_min = data.get("data_lag_minutes")
+    if lag_min is not None:
+        if lag_min < 1:
+            label = "<1min ago"
+        elif lag_min < 60:
+            label = f"{int(lag_min)}min ago"
+        else:
+            label = f"{int(lag_min // 60)}h {int(lag_min % 60)}min ago"
+        suffix = f" | {label}"
+        if exact_ts:
+            suffix += f" ({exact_ts})"
+        return suffix
+
+    if exact_ts:
+        return f" | {exact_ts}"
+
+    # Neither field present (e.g. a hand-built dict in a test/caller that
+    # predates exact_timestamp) — fall back to the coarser session_label.
+    session_label = data.get("session_label", "")
+    if not session_label:
+        return ""
+    condition_note = data.get("condition_note", "")
+    suffix = f" | {session_label}"
+    if condition_note and condition_note != session_label:
+        suffix += f" ({condition_note})"
+    return suffix
+
+
+def _fmt_price_value(price: float) -> str:
+    """The magnitude-scaled numeric formatting `_format_price_line()` uses
+    for both its headline price and (when present) the AH price — pulled
+    out so the two don't drift apart."""
+    if price > 10000:
+        return f"{price:,.0f}"
+    elif price > 100:
+        return f"{price:,.2f}"
+    elif price > 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:.6f}"
+
+
+def _format_price_line(label: str, data: dict, show_session: bool = True) -> str:
+    """Formats one price_cache entry as a display line: emoji, price, 1D
+    change, a ⚠️ STALE flag when `is_stale`, an after-hours/pre-market
+    supplement when one's available, and (unless `show_session` is False)
+    session/data-age context.
+
+    The headline price/change prefer `official_close`/`change_1d_pct` — the
+    regular-session close and its move off the prior close — over the raw
+    `price` field, which becomes an after-hours or pre-market print once
+    price_cache has one (see price_cache.py's module docstring). Tickers
+    with no `official_close` (crypto/futures/commodities — no cash-session
+    concept to split out) just show `price` as before.
+
+    Format examples:
+      Intraday (5m bar): 🟢 MSFT: $420.10 (+0.30%) | 3min ago (2026-09-07 14:35 ET)
+      Daily close:       🟢 Gold: $4,476.60 (+1.06%) | Fri 2026-09-04 close
+      After-hours:        🔴 TSLA: 368.16 (-0.05%) | 🔴 AH: 366.42 (-0.49%) | Wed 2026-09-09 close
+      Stale:              🔴 ES Futures: 5,720.00 (+0.00%) ⚠️ STALE | Fri 2026-09-04 close
+    """
+    official_close = data.get("official_close")
+    price = official_close if official_close is not None else (data.get("price", 0) or 0)
+    chg = data.get("change_1d_pct", 0) or 0
+    stale_flag = " ⚠️ STALE" if data.get("is_stale", False) else ""
+    emoji = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
+
+    price_str = _fmt_price_value(price)
+
+    ah_str = ""
+    afterhours_price = data.get("afterhours_price")
+    # Only worth a line when it differs meaningfully from the close it's
+    # being compared to — a flat after-hours print would just repeat the
+    # headline number with an extra 0.00% tacked on.
+    if afterhours_price and official_close and abs(afterhours_price - official_close) > 0.01:
+        ah_chg = (afterhours_price / official_close - 1) * 100
+        ah_emoji = "🟢" if ah_chg > 0 else "🔴" if ah_chg < 0 else "⚪"
+        ah_label = "AH" if data.get("session_type") == "afterhours" else "PM"
+        ah_str = f" | {ah_emoji} {ah_label}: {_fmt_price_value(afterhours_price)} ({ah_chg:+.2f}%)"
+
+    return f"  {emoji} {label}: {price_str} ({chg:+.2f}%){stale_flag}{ah_str}{_session_suffix(data, show_session)}"
+
+
 @authorized_only
-async def send_yields(update, context):
+async def send_prices(update, context):
     """
-    /yields — on-demand live macro snapshot: Treasury yields, key FX
-    pairs, key commodities. Useful when you need current yield levels
-    mid-discussion, without opening a MACRO discussion thread (/macro).
+    /prices — live snapshot of every tracked security, read straight from
+    the shared price_cache: Treasury yields, FX, commodities, positions,
+    equity futures, crypto, volatility, international indices, and credit
+    proxies.
 
-    Forces a fresh fetch rather than reusing advisor.get_live_macro_snapshot()'s
-    normal 15-minute chat-context cache — the entire point of asking on
-    demand is "what's the level right now" (same private-cache-reset
-    pattern positions.reload() already uses on _portfolio_context_cache).
+    Optional filter: /prices yields | fx | commodities | positions |
+    futures | crypto | vol | intl | credit
+
+    Forces a fresh price_cache refresh rather than waiting for its normal
+    15/60-minute TTL — the entire point of asking on demand is "what's the
+    level right now."
     """
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="📡 Fetching live macro data..."
-    )
-
-    import equity.telegram.advisor as advisor_module
-    advisor_module._macro_snapshot_cache["timestamp"] = 0
-
-    snapshot = await run_in_executor(advisor.get_live_macro_snapshot)
-    if not snapshot:
+    arg = context.args[0].lower() if context.args else "all"
+    if arg not in _PRICE_FILTERS:
         await reply(
             update, context,
-            "⚠️ Could not fetch live macro data. Check /logs errors.",
+            f"Unknown filter '{arg}'. Try: yields, fx, commodities, positions, "
+            f"futures, crypto, vol, intl, credit — or no argument for everything.",
             reply_markup=make_main_menu(),
         )
         return
 
-    await send_safe(
-        context.bot, update.effective_chat.id,
-        f"📡 *Live Macro Snapshot*\n\n{snapshot}", reply_markup=make_main_menu(),
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, text="📡 Fetching live prices..."
     )
+
+    from equity.config.positions import POSITIONS, get_position
+
+    await run_in_executor(price_cache.refresh, True)
+    lines = [f'📡 *Live Prices* — {datetime.now().strftime("%H:%M ET")}', ""]
+
+    # Stale-data banner — a viewer scanning fast should see this before any
+    # individual ⚠️ STALE tag further down.
+    all_prices = price_cache.get_prices()
+    stale_tickers = [t for t, d in all_prices.items() if d.get("is_stale", False)]
+    if stale_tickers:
+        stale_by_type: dict[str, list[str]] = {}
+        for t in stale_tickers:
+            stale_by_type.setdefault(all_prices[t].get("instrument_type", "other"), []).append(t)
+        lines.append("⚠️ *Stale data detected:*")
+        for itype, tickers in stale_by_type.items():
+            more = f" +{len(tickers) - 5} more" if len(tickers) > 5 else ""
+            lines.append(f"  {itype}: {', '.join(tickers[:5])}{more}")
+        lines.append("_Stale = older than expected for instrument type. Do not action these prices without verification._")
+        lines.append("")
+
+    if arg in ("all", "yields"):
+        lines.append("*Treasury Yields*")
+        for tenor in ("3M", "2Y", "5Y", "10Y", "20Y", "30Y"):
+            data = price_cache.get_yield(tenor)
+            if data:
+                stale_flag = " ⚠️ STALE" if data.get("is_stale", False) else ""
+                lines.append(
+                    f'  {tenor}: {data["price"]:.3f}% ({data["change_1d_bps"]:+.1f}bp){stale_flag}{_session_suffix(data)}'
+                )
+        lines.append("")
+
+    if arg in ("all", "fx"):
+        lines.append("*FX*")
+        for ticker, label in FX_TICKERS.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "commodities"):
+        lines.append("*Commodities*")
+        for ticker, label in COMMODITY_TICKERS_EXTENDED.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "futures"):
+        lines.append("*Equity Futures*")
+        for ticker, label in EQUITY_FUTURES.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "crypto"):
+        lines.append("*Crypto*")
+        for ticker, label in CRYPTO_TICKERS.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "vol", "volatility"):
+        lines.append("*Volatility*")
+        for ticker, label in VOLATILITY_TICKERS.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "intl", "international"):
+        lines.append("*International Indices*")
+        for ticker, label in INTERNATIONAL_INDICES.items():
+            data = price_cache.get(ticker)
+            if data:
+                session = _get_market_session_status(ticker)
+                lines.append(f"{_format_price_line(label, data)}{session}")
+        lines.append("")
+
+    if arg in ("all", "credit"):
+        lines.append("*Credit Proxies*")
+        for ticker, label in CREDIT_TICKERS.items():
+            data = price_cache.get(ticker)
+            if data:
+                lines.append(_format_price_line(label, data))
+        lines.append("")
+
+    if arg in ("all", "positions"):
+        lines.append("*Positions (1D move)*")
+        # After the cash session closes, the 1D move shown is the official
+        # close vs prior close — not a live quote — with an after-hours
+        # print appended where price_cache has one. Worth a one-line
+        # reminder so a post-close read isn't mistaken for a live tape.
+        import pytz
+
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        if now_et.weekday() < 5 and now_et.hour >= 16:
+            lines.append(
+                "_Showing official closes; after-hours prices shown where available._\n"
+                "_Connect IBKR (Module 4) for real-time position prices._\n"
+            )
+        pos_data = price_cache.get_prices(list(POSITIONS.keys()))
+        sorted_pos = sorted(
+            pos_data.items(), key=lambda kv: abs(kv[1].get("change_1d_pct", 0) or 0), reverse=True
+        )
+        for ticker, data in sorted_pos:
+            line = _format_price_line(ticker, data)
+            pos_config = get_position(ticker)
+            avg_cost = pos_config.get("avg_cost") if pos_config else None
+            if avg_cost and avg_cost > 0 and data.get("price"):
+                pnl = (data["price"] / avg_cost - 1) * 100
+                line += f" | cost ${avg_cost:.2f} P&L {pnl:+.1f}%"
+            lines.append(line)
+        lines.append("")
+
+    await send_safe(
+        context.bot, update.effective_chat.id, "\n".join(lines), reply_markup=make_main_menu(),
+    )
+
+    # Full-snapshot synthesis — only for the unfiltered /prices, not a
+    # filtered one (/prices fx), which is a quick single-section look-up
+    # rather than a "what does the whole board say" moment worth a Claude
+    # call over.
+    if arg == "all":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, text="💡 Generating market synthesis..."
+        )
+        try:
+            from equity.brief.brief_synthesizer import (
+                _parse_and_persist_monitoring,
+                synthesize_global_signals,
+            )
+            from equity.brief.market_snapshot import fetch_market_snapshot
+            from equity.data.monitoring import load_monitoring
+
+            # fetch_market_snapshot() does its own multi-ticker + 5Y-history
+            # + FRED fetch (see that module) — route it through the executor
+            # like the price_cache refresh above rather than blocking the
+            # event loop for everyone else while it runs.
+            snapshot = await run_in_executor(fetch_market_snapshot)
+            regime_flags = snapshot.get("regime_flags", [])
+            monitoring_items = load_monitoring()
+
+            price_text = "\n".join(lines)
+            recent_alert_context = _get_recent_alert_context()
+            if recent_alert_context:
+                price_text += f"\n\nRECENT ALERTS:\n{recent_alert_context}"
+
+            synthesis = await run_in_executor(
+                synthesize_global_signals, price_text, regime_flags, monitoring_items,
+            )
+            _parse_and_persist_monitoring(synthesis, source="prices_synthesis")
+            await send_safe(
+                context.bot, update.effective_chat.id,
+                f"💡 *Market Synthesis*\n\n{synthesis}", reply_markup=make_main_menu(),
+            )
+        except Exception as e:
+            logger.warning(f"send_prices synthesis failed: {e}")
 
 
 @authorized_only
@@ -898,6 +1178,9 @@ async def send_status(update, context):
 
     # Positions loaded
     lines.append(f"📋 Positions: {len(POSITIONS)} held | {len(WATCHLIST)} watchlist")
+    stale_count = sum(1 for d in price_cache.get_prices().values() if d.get("is_stale", False))
+    stale_warning = f" | ⚠️ {stale_count} stale" if stale_count > 0 else ""
+    lines.append(f"💹 {price_cache.coverage_report()}{stale_warning}")
 
     # Data source health checks
     lines.append("")
@@ -956,6 +1239,70 @@ async def send_status(update, context):
         context.bot, update.effective_chat.id,
         "\n".join(lines), reply_markup=make_main_menu()
     )
+
+
+@require_email_auth(lambda u, c: "Restart bot process")
+@authorized_only
+@register_command
+async def send_restart(update, context):
+    """
+    /restart — replaces the running process with a fresh one via os.execv.
+    Requires email 2FA since it interrupts service.
+
+    Re-execs as `python -m equity.telegram.bot` explicitly — this file's
+    own documented invocation (see the "Run with:" note at the top) —
+    rather than replaying sys.argv. After a `-m` launch, sys.argv[0] is
+    the resolved absolute path to *this file*, not "-m equity.telegram.bot"
+    — so `os.execv(sys.executable, [sys.executable] + sys.argv)` doesn't
+    restart the same way it was started: it re-launches as a direct
+    script instead of a module. That changes what lands on sys.path[0]
+    (this file's own directory, equity/telegram/, instead of the repo
+    root that CWD supplies to a `-m` launch), and every `from equity.x
+    import y` absolute import in the codebase — nearly all of them —
+    fails immediately on the new process's startup. Hardcoding the
+    correct module path sidesteps that rather than trying to detect and
+    reconstruct whatever invocation form the original launch used.
+
+    os.execv replaces the current process image in place (same PID, same
+    CWD, same environment — there's nothing else to reconstruct) — this
+    works identically whether the bot is running under systemd/a process
+    supervisor or as a bare foreground process; no supervisor
+    coordination needed, and there's nothing for a supervisor to detect
+    or restart because the process never actually exits. That in-place
+    swap also means there's never a moment with two processes racing
+    Telegram's getUpdates long-poll for the same bot token, which a
+    fork-then-exit (spawn the new process, then exit the old one)
+    approach would risk during its handover window.
+    """
+    await reply(update, context, "🔄 Restarting bot... will be back in ~10 seconds.")
+    security_logger.warning("WRITE_OP | restart")
+    logger.info("Bot restart requested via /restart command")
+
+    await asyncio.sleep(1)  # give Telegram time to deliver the message
+    os.execv(sys.executable, [sys.executable, "-m", "equity.telegram.bot"])
+
+
+@require_email_auth(lambda u, c: "Kill bot process")
+@authorized_only
+@register_command
+async def send_kill(update, context):
+    """
+    /kill — stops the bot process entirely, no restart. For when /restart
+    itself isn't working and the bot needs to be brought back up manually
+    (SSH + supervisor restart, or a fresh `python -m equity.telegram.bot`).
+    Requires email 2FA since it interrupts service.
+
+    os._exit(0) — an immediate process exit with no Python-level cleanup
+    (no atexit handlers, no flushing anything not already flushed). That's
+    the point: a plain `sys.exit()` inside a handler wouldn't reliably tear
+    down the asyncio event loop the bot is running under.
+    """
+    await reply(update, context, "🛑 Stopping bot process.")
+    security_logger.warning("WRITE_OP | kill")
+    logger.info("Bot kill requested via /kill command")
+
+    await asyncio.sleep(1)  # give Telegram time to deliver the message
+    os._exit(0)
 
 
 def _execute_pending_change(change: dict) -> str:
@@ -1153,6 +1500,8 @@ async def handle_callback(update, context):
         )
     elif data == "cmd_macro":
         await start_or_resume_discussion("MACRO", update, context, thread_type="topic")
+    elif data == "cmd_prices":
+        await send_prices(update, context)
     elif data == "cmd_portfolio_review":
         await start_or_resume_discussion("PORTFOLIO", update, context, thread_type="topic")
     elif data == "cmd_other_ticker":
@@ -1169,11 +1518,21 @@ async def handle_callback(update, context):
         await _send_switch_confirmation(update, context, thread_id, subject)
     elif data.startswith("ticker_news_"):
         ticker = data[len("ticker_news_"):]
+        if not _is_valid_ticker(ticker):
+            await query.message.reply_text(
+                f"{ticker} is a monitoring subject, not a tradable ticker — no news to fetch."
+            )
+            return
         triage = await run_in_executor(run_news_triage, [ticker])
         text = format_news_triage(triage)
         await send_in_parts(context.bot, chat_id, text, reply_markup=make_ticker_actions(ticker))
     elif data.startswith("ticker_metrics_"):
         ticker = data[len("ticker_metrics_"):]
+        if not _is_valid_ticker(ticker):
+            await query.message.reply_text(
+                f"{ticker} is a monitoring subject, not a tradable ticker — no quality metrics to fetch."
+            )
+            return
         score = await run_in_executor(score_ticker, ticker, os.getenv("FMP_API_KEY"))
         lines = [
             f"📊 *{ticker} Quality Metrics*",
@@ -1475,11 +1834,11 @@ async def handle_message(update, context):
 
 
 KNOWN_COMMANDS = [
-    "discuss", "macro", "yields", "portfolio", "portfolio_review",
+    "discuss", "macro", "prices", "portfolio", "portfolio_review",
     "screener", "news", "brief", "watchlist", "threads",
     "switch", "add", "remove", "update", "set", "save", "framework",
     "confirm", "cancel", "done", "audit", "logs", "status", "logout",
-    "start", "help", "monitoring", "dismiss"
+    "start", "help", "monitoring", "dismiss", "restart", "kill",
 ]
 
 
@@ -1559,6 +1918,42 @@ async def handle_error(update, context) -> None:
 
 _alerted_today: dict[str, bool] = {}  # {alert_key: True}; reset when the date rolls over
 
+# How long after startup intraday_alert_job() suppresses all alerts —
+# see its docstring. _BOT_START_TIME already exists (module top, for
+# /status uptime); reused here rather than duplicated.
+ALERT_STARTUP_GRACE_SECONDS = 300  # 5 minutes
+
+# Trailing window of sent alerts, in-memory only (cleared on restart — see
+# /restart above) — feeds /prices' "RECENT ALERTS" synthesis context
+# (`_get_recent_alert_context()`) with a bit of what's already fired today,
+# not a persisted audit log (that's `security_logger`/logs/ for writes;
+# alerts aren't writes).
+_recent_alerts: list[dict] = []
+MAX_RECENT_ALERTS = 20
+
+
+def _record_alert(alert: dict) -> None:
+    """Records a just-sent alert to the trailing in-memory history."""
+    _recent_alerts.append({
+        "ticker": alert.get("ticker"),
+        "type": alert.get("type"),
+        "message": alert.get("message", "")[:100],
+        "timestamp": datetime.now().isoformat(),
+    })
+    if len(_recent_alerts) > MAX_RECENT_ALERTS:
+        _recent_alerts.pop(0)
+
+
+def _get_recent_alert_context() -> str:
+    """Last 10 recorded alerts as text, for /prices' synthesis prompt."""
+    if not _recent_alerts:
+        return ""
+    lines = []
+    for a in _recent_alerts[-10:]:
+        ts = a.get("timestamp", "")[:16]  # YYYY-MM-DDTHH:MM
+        lines.append(f'[{ts}] {a["ticker"]}: {a["message"]}')
+    return "\n".join(lines)
+
 
 def _get_market_hours_now() -> bool:
     """True if the current time is within US market hours (9:30am-4:00pm ET, Mon-Fri)."""
@@ -1614,49 +2009,71 @@ def _commodity_context_note(ticker: str, move_pct: float) -> str:
     return notes.get(ticker, f'{"Rising" if move_pct > 0 else "Falling"} — check portfolio exposure')
 
 
+def _data_date_key(entry: dict | None, fallback: str) -> str:
+    """The YYYY-MM-DD date the price_cache entry `entry` is actually from,
+    for keying alert dedup (`_alerted_today`) to the underlying data bar
+    rather than the date the job happened to run.
+
+    `_alerted_today` is in-memory only and gets wiped on every restart —
+    without this, a restart (e.g. Monday morning, still showing Friday's
+    close) resets `today`'s keys to Monday's date, so a move already
+    alerted on before the restart doesn't match its old key and fires
+    again. Keying off the bar's own date instead means the same bar can
+    never generate the same alert twice, restart or not.
+
+    Reads `entry["last_update"]` (`"YYYY-MM-DD HH:MM UTC"`), not
+    `exact_timestamp`: `exact_timestamp` is `"YYYY-MM-DD HH:MM ET"` for an
+    intraday bar but `"Weekday YYYY-MM-DD close"` for a daily one (see
+    `_get_session_context()`) — slicing *that* string's first 10
+    characters would silently collide same-weekday bars a week apart
+    (e.g. two different Wednesdays both truncating to `"Wed 2026-0"`).
+    `last_update` doesn't have that daily/intraday format split — it's
+    always UTC-dated first, both cases — so slicing it is safe.
+
+    Falls back to `fallback` (the run date) when `entry` is missing or
+    carries no timestamp, same as before this existed.
+    """
+    if not entry:
+        return fallback
+    last_update = entry.get("last_update") or ""
+    return last_update[:10] if last_update else fallback
+
+
 def _check_macro_alerts(today: str) -> list[dict]:
-    """Checks Treasury yields, FX rates, and commodities for intraday alerts.
+    """Checks Treasury yields, FX, commodities, volatility, crypto,
+    international indices, and cross-asset ratios for intraday alerts.
 
     Returns a list of alert dicts in the same shape `intraday_alert_job()`
-    already expects. Called in executor — no async, and does its own
-    (synchronous) data fetch rather than taking a pre-fetched snapshot.
+    already expects, each carrying a `magnitude` field (absolute move —
+    % for most types, bp for yields) that `_should_enrich()` compares
+    against `ENRICH_THRESHOLDS`.
 
-    Built on `market_snapshot.fetch_market_snapshot()` — already imported
-    in this module for the morning brief — rather than a second yfinance/
-    FRED fetch of its own: that function already covers every tenor in
-    `YIELD_ALERT_BP` (2Y/20Y come from FRED; yfinance alone doesn't carry
-    them — see `market_config.TREASURY_FRED_SERIES`) and every FX/commodity
-    ticker below, each already paired with its move vs prior close. 'DXY'
-    isn't an FX_TICKERS pair — it resolves to the DX-Y.NYB dollar index in
-    `snapshot['commodities']`, the same one `market_snapshot` already
-    fetches for its own regime inputs, rather than a separate ETF proxy.
+    Called in executor — no async. Reads the shared `equity.data.price_cache`
+    rather than doing its own fetch — see that module's docstring. 'DXY'
+    isn't an FX_TICKERS pair — it resolves to the DX-Y.NYB dollar index,
+    also in price_cache, rather than a separate ETF proxy.
     """
     alerts = []
 
-    try:
-        snapshot = fetch_market_snapshot()
-    except Exception as e:
-        logger.warning(f"_check_macro_alerts: snapshot fetch failed: {e}")
-        return alerts
-
     # --- Treasury yields ---
-    treasury_curve = snapshot.get("treasury_curve", {})
     for tenor, threshold_bp in YIELD_ALERT_BP.items():
-        entry = treasury_curve.get(tenor)
+        entry = price_cache.get_yield(tenor)
         if entry is None:
             continue
-        curr = entry.get("yield_pct")
+        curr = entry.get("price")
         move_bp = entry.get("change_1d_bps")
         if curr is None or move_bp is None:
             continue
         prev = curr - move_bp / 100
 
-        alert_key = f"yield_{tenor}_{today}"
+        alert_key = f"yield_{tenor}_{_data_date_key(entry, today)}"
         if abs(move_bp) >= threshold_bp and alert_key not in _alerted_today:
             direction = "📈" if move_bp > 0 else "📉"
             alerts.append({
                 "ticker": f"{tenor} Treasury",
+                "raw_ticker": TENOR_TO_CACHE_KEY.get(tenor),
                 "type": "macro_yield",
+                "magnitude": abs(move_bp),
                 "message": (
                     f"{direction} *{tenor} Treasury yield* "
                     f"{move_bp:+.1f}bp intraday → {curr:.2f}%\n"
@@ -1666,14 +2083,16 @@ def _check_macro_alerts(today: str) -> list[dict]:
             })
 
         for level in YIELD_LEVEL_ALERTS.get(tenor, []):
-            level_key = f"yield_{tenor}_level_{level}_{today}"
+            level_key = f"yield_{tenor}_level_{level}_{_data_date_key(entry, today)}"
             if level_key in _alerted_today or not _level_crossed(prev, curr, level):
                 continue
             direction = "broke above" if curr > prev else "broke below"
             emoji = "⚠️" if curr > prev else "✅"
             alerts.append({
                 "ticker": f"{tenor} Treasury",
+                "raw_ticker": TENOR_TO_CACHE_KEY.get(tenor),
                 "type": "macro_yield_level",
+                "magnitude": 0,
                 "message": (
                     f"{emoji} *{tenor} yield {direction} {level:.2f}%*\n"
                     f"Current: {curr:.3f}% | Prior close: {prev:.3f}%\n"
@@ -1683,52 +2102,466 @@ def _check_macro_alerts(today: str) -> list[dict]:
             })
 
     # --- FX rates ---
-    fx_data = snapshot.get("fx", {})
-    dxy_entry = snapshot.get("commodities", {}).get("DX-Y.NYB")
+    dxy_entry = price_cache.get("DX-Y.NYB")
     for fx_ticker, threshold in FX_ALERT_PCT.items():
         if fx_ticker == "DXY":
             entry, label = dxy_entry, "DXY Dollar Index"
         else:
-            entry = fx_data.get(fx_ticker)
-            label = entry.get("label", fx_ticker) if entry else fx_ticker
+            entry = price_cache.get(fx_ticker)
+            label = FX_TICKERS.get(fx_ticker, fx_ticker)
         if entry is None:
             continue
         move_pct = entry.get("change_1d_pct")
         if move_pct is None:
             continue
 
-        alert_key = f"fx_{fx_ticker}_{today}"
+        alert_key = f"fx_{fx_ticker}_{_data_date_key(entry, today)}"
         if abs(move_pct) >= threshold and alert_key not in _alerted_today:
             direction = "📈" if move_pct > 0 else "📉"
             alerts.append({
                 "ticker": label,
+                "raw_ticker": "DX-Y.NYB" if fx_ticker == "DXY" else fx_ticker,
                 "type": "macro_fx",
+                "magnitude": abs(move_pct),
                 "message": f"{direction} *{label}* {move_pct:+.2f}% intraday\n{_fx_context_note(fx_ticker, move_pct)}",
                 "key": alert_key,
             })
 
     # --- Commodities ---
-    commodities_ext = snapshot.get("commodities_extended", {})
     for comm_ticker, threshold in COMMODITY_ALERT_PCT.items():
-        entry = commodities_ext.get(comm_ticker)
+        entry = price_cache.get(comm_ticker)
         if entry is None:
             continue
         move_pct = entry.get("change_1d_pct")
         if move_pct is None:
             continue
-        label = entry.get("label", comm_ticker)
+        label = COMMODITY_TICKERS_EXTENDED.get(comm_ticker, comm_ticker)
 
-        alert_key = f"commodity_{comm_ticker}_{today}"
+        alert_key = f"commodity_{comm_ticker}_{_data_date_key(entry, today)}"
         if abs(move_pct) >= threshold and alert_key not in _alerted_today:
             direction = "📈" if move_pct > 0 else "📉"
             alerts.append({
                 "ticker": label,
+                "raw_ticker": comm_ticker,
                 "type": "macro_commodity",
+                "magnitude": abs(move_pct),
                 "message": f"{direction} *{label}* {move_pct:+.2f}% intraday\n{_commodity_context_note(comm_ticker, move_pct)}",
                 "key": alert_key,
             })
 
+    # --- Volatility (VIX, VVIX — point moves, not %) ---
+    for vol_ticker, threshold_pts in VOLATILITY_ALERT.items():
+        entry = price_cache.get(vol_ticker)
+        if entry is None:
+            continue
+        curr = entry.get("price")
+        prev = entry.get("prev_close")
+        if curr is None or prev is None:
+            continue
+        move_pts = curr - prev
+        label = VOLATILITY_TICKERS.get(vol_ticker, vol_ticker)
+
+        alert_key = f"vol_{vol_ticker}_{_data_date_key(entry, today)}"
+        if abs(move_pts) >= threshold_pts and alert_key not in _alerted_today:
+            direction = "📈" if move_pts > 0 else "📉"
+            alerts.append({
+                "ticker": label,
+                "raw_ticker": vol_ticker,
+                "type": "volatility",
+                "magnitude": abs(move_pts),
+                "message": f"{direction} *{label}* {move_pts:+.1f}pts intraday → {curr:.1f}",
+                "key": alert_key,
+            })
+
+    # --- Crypto ---
+    for crypto_ticker, threshold in CRYPTO_ALERT_PCT.items():
+        entry = price_cache.get(crypto_ticker)
+        if entry is None:
+            continue
+        move_pct = entry.get("change_1d_pct")
+        if move_pct is None:
+            continue
+        label = CRYPTO_TICKERS.get(crypto_ticker, crypto_ticker)
+
+        alert_key = f"crypto_{crypto_ticker}_{_data_date_key(entry, today)}"
+        if abs(move_pct) >= threshold and alert_key not in _alerted_today:
+            direction = "📈" if move_pct > 0 else "📉"
+            alerts.append({
+                "ticker": label,
+                "raw_ticker": crypto_ticker,
+                "type": "crypto",
+                "magnitude": abs(move_pct),
+                "message": f"{direction} *{label}* {move_pct:+.1f}% intraday",
+                "key": alert_key,
+            })
+
+    # --- International indices ---
+    for intl_ticker, threshold in INTL_ALERT_PCT.items():
+        entry = price_cache.get(intl_ticker)
+        if entry is None:
+            continue
+        move_pct = entry.get("change_1d_pct")
+        if move_pct is None:
+            continue
+        label = INTERNATIONAL_INDICES.get(intl_ticker, intl_ticker)
+
+        alert_key = f"intl_{intl_ticker}_{_data_date_key(entry, today)}"
+        if abs(move_pct) >= threshold and alert_key not in _alerted_today:
+            direction = "📈" if move_pct > 0 else "📉"
+            alerts.append({
+                "ticker": label,
+                "raw_ticker": intl_ticker,
+                "type": "international",
+                "magnitude": abs(move_pct),
+                "message": f"{direction} *{label}* {move_pct:+.2f}% intraday",
+                "key": alert_key,
+            })
+
+    # --- Cross-asset ratio alerts ---
+    ratio_alert_configs = {
+        "copper_gold": {
+            "move_threshold_pct": 1.5,
+            "description": "Copper/Gold ratio",
+            "portfolio_note": "Growth signal — affects FCX, CAT, industrials thesis",
+        },
+        "vix_vvix": {
+            "level_threshold": 0.30,
+            "description": "VIX/VVIX ratio",
+            "portfolio_note": "Elevated = options market pricing tail risk",
+        },
+        "silver_gold": {
+            "move_threshold_pct": 2.0,
+            "description": "Silver/Gold ratio",
+            "portfolio_note": "Risk appetite signal — affects PPLT, precious metals thesis",
+        },
+    }
+    for ratio_name, config in ratio_alert_configs.items():
+        if ratio_name not in CROSS_ASSET_RATIOS:
+            continue
+        t1, t2, _desc = CROSS_ASSET_RATIOS[ratio_name]
+        d1 = price_cache.get(t1)
+        d2 = price_cache.get(t2)
+        if not d1 or not d2 or not d2.get("price"):
+            continue
+
+        curr_ratio = d1["price"] / d2["price"]
+        if d1.get("prev_close") and d2.get("prev_close"):
+            prev_ratio = d1["prev_close"] / d2["prev_close"]
+            ratio_move_pct = (curr_ratio / prev_ratio - 1) * 100 if prev_ratio else 0
+        else:
+            ratio_move_pct = 0
+
+        # Keyed to the run date (today), not _data_date_key(): a ratio is
+        # computed fresh from two other tickers' prices each run, not
+        # fetched as its own bar with its own timestamp — there's no
+        # single underlying "data date" to key it to instead.
+        alert_key = f"ratio_{ratio_name}_{today}"
+        should_alert = False
+        alert_note = ""
+
+        if "move_threshold_pct" in config and abs(ratio_move_pct) >= config["move_threshold_pct"]:
+            should_alert = True
+            direction = "↑" if ratio_move_pct > 0 else "↓"
+            alert_note = f'{direction} {ratio_move_pct:+.2f}% today → {config["portfolio_note"]}'
+
+        if "level_threshold" in config and curr_ratio > config["level_threshold"]:
+            should_alert = True
+            alert_note = f'Ratio at {curr_ratio:.3f} (threshold: {config["level_threshold"]}) → {config["portfolio_note"]}'
+
+        if should_alert and alert_key not in _alerted_today:
+            alerts.append({
+                "ticker": config["description"],
+                "type": "ratio",
+                "magnitude": abs(ratio_move_pct),
+                "message": (
+                    f'📊 *{config["description"]}* alert\n'
+                    f"Current: {curr_ratio:.4f}\n"
+                    f"{alert_note}"
+                ),
+                "key": alert_key,
+            })
+
     return alerts
+
+
+# ---------------------------------------------------------------------------
+# Alert enrichment (web search via Claude) — only for significant alerts
+# ---------------------------------------------------------------------------
+
+# Significance threshold — only enrich alerts at or above this magnitude
+# (% for most types, bp for yields, points for VIX/VVIX). 0 means "always
+# enrich"; a type with no entry here is never enriched.
+ENRICH_THRESHOLDS = {
+    "price":             5.0,   # >5% equity move → enrich
+    "news":              0,     # all thesis alerts → enrich
+    "macro_yield":       12,    # >12bp yield move → enrich
+    "macro_yield_level": 0,     # all level breaks → enrich
+    "macro_fx":          0.8,   # >0.8% FX move → enrich
+    "macro_commodity":   3.0,   # >3% commodity move → enrich
+    "volatility":        0,     # all VIX/VVIX alerts → enrich
+    "crypto":            7.0,   # >7% crypto move → enrich
+    "international":     2.0,   # >2% international index → enrich
+}
+
+
+def _should_enrich(alert: dict) -> bool:
+    """True if `alert` is significant enough to warrant web-search enrichment."""
+    threshold = ENRICH_THRESHOLDS.get(alert.get("type", ""))
+    if threshold is None:
+        return False
+    if threshold == 0:
+        return True
+    return abs(alert.get("magnitude", 0)) >= threshold
+
+
+def _build_enrichment_prompt(alert: dict) -> str | None:
+    """The web-search prompt for `alert`, or None if its type isn't enrichable."""
+    alert_type = alert.get("type", "")
+    ticker = alert.get("ticker", "")
+    message = alert.get("message", "")
+
+    if alert_type in ("price", "news"):
+        from equity.config.positions import POSITIONS
+
+        pos_data = POSITIONS.get(ticker, {})
+        thesis = (pos_data.get("thesis", "") or "")[:200]
+        thesis_breakers = (pos_data.get("thesis_breakers", []) or [])[:3]
+        return (
+            f"Search for the latest news about {ticker} stock today. "
+            f"Focus on: earnings, guidance, analyst actions, sector news, "
+            f"any company-specific catalyst explaining today's price move. "
+            f"Current move: {message}\n"
+            f"Position thesis context: {thesis}\n"
+            f'Thesis-breakers to watch: {"; ".join(thesis_breakers)}\n\n'
+            f"Return a 3-5 sentence briefing: (1) most likely catalyst for the move, "
+            f"(2) whether any thesis-breaker conditions are triggered or proximate, "
+            f"(3) recommended immediate action: monitor/discuss/act. "
+            f"Be direct and specific. If no clear catalyst found, say so."
+        )
+    if alert_type in ("macro_yield", "macro_yield_level"):
+        return (
+            f"Search for today's news explaining the following Treasury yield move: {message}\n"
+            f"Focus on: Fed speakers, economic data releases, auction results, "
+            f"geopolitical events, or technical level breaks.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver of the move, "
+            f"(2) implications for duration positioning (TLT) and rate-sensitive equities, "
+            f"(3) whether this changes the rate trajectory thesis. "
+            f"Be direct. If no clear driver found, say so."
+        )
+    if alert_type == "macro_fx":
+        return (
+            f"Search for today's news explaining this FX move: {message}\n"
+            f"Focus on: central bank statements, economic data, political events, "
+            f"intervention signals, or carry trade unwinds.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver, "
+            f"(2) portfolio implications (BYDDY/EWW for CNH, SMFG for JPY, etc.), "
+            f"(3) whether this is a regime shift or single-day noise."
+        )
+    if alert_type == "macro_commodity":
+        return (
+            f"Search for today's news explaining this commodity move: {message}\n"
+            f"Focus on: supply/demand news, geopolitical events, inventory data, "
+            f"dollar moves, or sector-specific catalysts.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver, "
+            f"(2) implications for relevant portfolio positions (CCJ/CEG for uranium, "
+            f"FCX for copper, etc.), "
+            f"(3) whether this is consistent with or contradicts current macro thesis."
+        )
+    if alert_type == "volatility":
+        return (
+            f"Search for today's news explaining this volatility move: {message}\n"
+            f"Focus on: market stress catalysts, options positioning, macro data "
+            f"surprises, or geopolitical events.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver, "
+            f"(2) portfolio risk implications, "
+            f"(3) whether this is a genuine regime shift or single-day noise."
+        )
+    if alert_type == "crypto":
+        return (
+            f"Search for today's news explaining this crypto move: {message}\n"
+            f"Focus on: regulatory news, ETF flows, macro liquidity conditions, "
+            f"exchange or network-specific events.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver, "
+            f"(2) whether this reflects broader risk sentiment relevant to the "
+            f"equity portfolio, (3) monitor/discuss/act recommendation."
+        )
+    if alert_type == "international":
+        return (
+            f"Search for today's news explaining this international index move: {message}\n"
+            f"Focus on: local central bank action, political events, trade/tariff "
+            f"news, or earnings-season effects specific to that market.\n\n"
+            f"Return a 3-sentence briefing: (1) most likely driver, "
+            f"(2) read-through for US markets and portfolio exposure "
+            f"(BYDDY/TSM/EWW/EEM), (3) whether this is contained or could spread."
+        )
+    return None
+
+
+def _enrich_alert_with_context(alert: dict) -> str:
+    """For significant alerts, fetches news/macro context via Claude with web search.
+
+    Returns enriched alert text; falls back to the plain message on any
+    failure, on a missing thesis/prompt mapping, or when the existing
+    hourly Claude budget (`check_claude_rate_limit()` — the same guard
+    `handle_message`'s chat calls go through) is exhausted, so alert
+    enrichment can never itself blow through that budget unnoticed.
+
+    Synchronous and blocking (the web-search-augmented call can take
+    several seconds) — call via `run_in_executor()`, not directly from
+    an async context.
+    """
+    message = alert.get("message", "")
+    ticker = alert.get("ticker", "")
+
+    search_prompt = _build_enrichment_prompt(alert)
+    if search_prompt is None:
+        return message
+
+    if not check_claude_rate_limit():
+        logger.warning("_enrich_alert_with_context: Claude rate limit reached — skipping enrichment for %s", ticker)
+        return message
+
+    try:
+        response = advisor.client.messages.create(
+            model=ADVISOR_MODEL,
+            max_tokens=400,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": search_prompt}],
+        )
+        text_parts = [block.text for block in response.content if hasattr(block, "text") and block.text]
+        enriched = "\n".join(text_parts).strip()
+        if enriched:
+            return f"{message}\n\n📰 *Context:*\n{enriched}"
+    except Exception as e:
+        logger.warning(f"_enrich_alert_with_context failed for {ticker}: {e}")
+
+    return message
+
+
+# Alert-specific freshness thresholds — much tighter than price_cache's own
+# display `is_stale` thresholds (up to 75h for equities, sized to cover a
+# full weekend/holiday gap without mislabeling a Monday-morning read as
+# stale — see price_cache.py's _get_session_context()). Display staleness
+# answers "is this too old to even show"; this answers "is this fresh
+# enough that a move computed off it is actually worth pinging about right
+# now" — a materially tighter bar. Values are hours.
+ALERT_MAX_AGE_HOURS = {
+    "equity": 4,        # only alert during/shortly after the current session
+    "index": 4,         # VIX/VVIX — same
+    "futures": 2,       # trade nearly 24/7 — no excuse for a stale read
+    "crypto": 1,        # 24/7 — tightest of all
+    "fx": 2,             # runs Sun 5pm ET - Fri 5pm ET
+    "intl_index": 4,    # only during/shortly after their own local session
+    "yield": 6,          # daily-publish cadence — see docstring caveat below
+    "default": 4,
+}
+
+
+def _is_alert_data_fresh(alert: dict) -> bool:
+    """False if the price data underlying `alert` is too old for the move
+    to still be worth alerting on — tight, alert-specific thresholds
+    (`ALERT_MAX_AGE_HOURS`), not price_cache's much wider display-staleness
+    `is_stale` (see that constant's comment for why the two need to differ).
+
+    `raw_ticker` (the actual price_cache key — see where each alert type
+    is built in `_check_macro_alerts()`) is missing for alert types not
+    tied to a single price reading (news, ratio) — those pass through
+    unchecked, matching how `_should_enrich()` treats unmapped types.
+
+    Checks `data_lag_minutes` (intraday bars — 5m/1h, see price_cache.py)
+    when present, else `data_age_hours` (daily bars, which is where every
+    `yield` reading and any equity/futures/commodity read outside its
+    fetch window falls), else falls back to price_cache's own `is_stale`
+    flag if somehow neither is available (see the fallback's own comment).
+    Known caveat for `yield`: FRED's 2Y/20Y series
+    (`_fetch_fred_yields()`) publish roughly once a day and carry no
+    intraday reading at all, so `data_age_hours` for those two tenors
+    climbs past the 6h threshold for most of the day even on a fully
+    current observation — a real gap between "6h is generous" intent and
+    what a daily-cadence series can actually deliver, not something the
+    threshold number alone fixes. Verify against a live run before relying
+    on 2Y/20Y move/level alerts firing reliably.
+    """
+    ticker = alert.get("raw_ticker")
+    if not ticker:
+        return True
+    data = price_cache.get(ticker)
+    if not data:
+        return False
+
+    instrument_type = data.get("instrument_type", "default")
+    max_age_hours = ALERT_MAX_AGE_HOURS.get(instrument_type, ALERT_MAX_AGE_HOURS["default"])
+
+    lag_min = data.get("data_lag_minutes")
+    if lag_min is not None:
+        if lag_min / 60 > max_age_hours:
+            logger.info(
+                f"Alert suppressed for {ticker}: data is {lag_min:.0f}min old "
+                f"(max {max_age_hours * 60:.0f}min for {instrument_type})"
+            )
+            return False
+        return True
+
+    age_hours = data.get("data_age_hours")
+    if age_hours is not None:
+        if age_hours > max_age_hours:
+            logger.info(
+                f"Alert suppressed for {ticker}: daily bar is {age_hours:.1f}h old "
+                f"(max {max_age_hours}h for {instrument_type})"
+            )
+            return False
+        return True
+
+    # Neither field present — real price_cache entries always carry at
+    # least data_age_hours once a timestamp exists, so this only happens
+    # when the timestamp itself was unavailable (_get_session_context()'s
+    # `last_bar_time is None` branch), which is exactly what its own
+    # is_stale=True already flags. Fall back to that rather than default
+    # to "fresh" on data we can't actually measure the age of.
+    if data.get("is_stale", False):
+        logger.info(f"Alert suppressed for {ticker}: no age data and cache marks it stale")
+        return False
+    return True
+
+
+def _format_alert_message(alert: dict) -> str:
+    """Formats an alert for sending: its own message plus an exact
+    timestamp/session-context line straight from price_cache — no web
+    search, no Claude call, so this always fires immediately and for free.
+
+    `intraday_alert_job()`'s formatting step — replaces the old
+    `_should_enrich()`/`_enrich_alert_with_context()` web-search pass
+    there (kept, just unused by the job now — TestShouldEnrich/
+    TestBuildEnrichmentPrompt in test_bot_macro_alerts.py still cover
+    them, and a future call site may want enrichment for a specific
+    alert type again without redoing that work).
+
+    Plain sync — nothing here does I/O beyond a `price_cache.get()` dict
+    lookup (same as `_is_alert_data_fresh()`, called the same way from
+    the same loop), so there's no need for callers to route it through
+    `run_in_executor()`.
+    """
+    ticker = alert.get("raw_ticker") or alert.get("ticker", "")
+    data = price_cache.get(ticker) if ticker else None
+    data = data or {}
+
+    exact_ts = data.get("exact_timestamp", "")
+    instrument_type = data.get("instrument_type", "")
+    lag = data.get("data_lag_minutes")
+
+    if lag is not None and lag < 10:
+        session_ctx = f"🕐 {exact_ts} ({int(lag)}min ago)"
+    elif exact_ts:
+        session_ctx = f"🕐 {exact_ts}"
+    else:
+        session_ctx = ""
+    if instrument_type:
+        session_ctx = f"{session_ctx} | {instrument_type}" if session_ctx else instrument_type
+
+    parts = [alert.get("message", "")]
+    if session_ctx:
+        parts.append(session_ctx)
+    return "\n".join(parts)
 
 
 async def intraday_alert_job(context) -> None:
@@ -1737,8 +2570,24 @@ async def intraday_alert_job(context) -> None:
     setup). Checks all positions for a large price move
     (>LARGE_MOVE_THRESHOLD_PCT in either direction) or thesis-breaker news,
     and alerts TELEGRAM_USER_ID with a [💬 Discuss] button. Deduplicates:
-    at most one alert per ticker per alert type per day.
+    at most one alert per ticker per alert type per data date (see
+    `_data_date_key()` — not the run date, so a restart replaying the same
+    still-latest bar doesn't re-fire an alert already sent for it).
     """
+    # The first job run after a (re)start sees whatever the price cache
+    # was just warmed with — which, right after a restart, can be a stale
+    # prior-session close before the cache has had a real chance to
+    # refresh against live data. `_is_alert_data_fresh()`'s tight
+    # thresholds already suppress genuinely stale reads, but this grace
+    # period additionally avoids a burst of alerts landing all at once the
+    # moment the bot comes back up, restart included.
+    if time.time() - _BOT_START_TIME < ALERT_STARTUP_GRACE_SECONDS:
+        logger.info(
+            f"intraday_alert_job: startup grace period active "
+            f"({ALERT_STARTUP_GRACE_SECONDS}s) — skipping this run"
+        )
+        return
+
     if not _get_market_hours_now():
         return
 
@@ -1771,12 +2620,18 @@ async def intraday_alert_job(context) -> None:
             curr_price = closes.iloc[-1]
             change_pct = (curr_price / prev_close - 1) * 100
 
-            alert_key = f"{ticker}_price_{today}"
+            # This block fetches its own yf.download() bars rather than
+            # reading price_cache, so unlike _check_macro_alerts()'s alert
+            # types there's no already-fetched price_cache `entry` in
+            # scope to pass to _data_date_key() — look it up explicitly.
+            alert_key = f"{ticker}_price_{_data_date_key(price_cache.get(ticker), today)}"
             if abs(change_pct) >= LARGE_MOVE_THRESHOLD_PCT and alert_key not in _alerted_today:
                 direction = "🚀" if change_pct > 0 else "🔴"
                 alerts.append({
                     "ticker": ticker,
+                    "raw_ticker": ticker,
                     "type": "price",
+                    "magnitude": abs(change_pct),
                     "message": f"{direction} *{ticker}* {change_pct:+.1f}% (${curr_price:.2f})",
                     "key": alert_key,
                 })
@@ -1788,12 +2643,17 @@ async def intraday_alert_job(context) -> None:
         triage = await run_in_executor(run_news_triage, tickers)
         for ticker, tdata in triage.items():
             if tdata.get("has_thesis_alert"):
+                # Kept on the run date, not _data_date_key(): a thesis
+                # alert comes from run_news_triage()'s live re-check of
+                # today's news against thesis-breakers, not a price bar —
+                # there's no price_cache timestamp it's "from".
                 alert_key = f"{ticker}_news_{today}"
                 if alert_key not in _alerted_today:
                     matched = tdata.get("thesis_alerts", [])
                     alerts.append({
                         "ticker": ticker,
                         "type": "news",
+                        "magnitude": 0,
                         "message": (
                             f"⚠️ *{ticker}* thesis alert\n"
                             f"Matched: {matched[0][:80] if matched else 'unknown'}"
@@ -1811,24 +2671,42 @@ async def intraday_alert_job(context) -> None:
         logger.warning(f"intraday_alert_job: macro check failed: {e}")
 
     # Send alerts
-    for alert in alerts:
-        ticker = alert["ticker"]
-        if alert["type"].startswith("macro_"):
-            # Macro alerts' "ticker" is a display label ("10Y Treasury", "DXY
-            # Dollar Index"), not a real discussable symbol — route Discuss
-            # to the existing MACRO topic thread (same callback as /macro's
-            # menu button) rather than make_tickers_keyboard(), which would
-            # build a ticker_<label> thread for a symbol that doesn't exist.
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Discuss Macro", callback_data="cmd_macro")]])
+    for alert in alerts:
+        if not _is_alert_data_fresh(alert):
+            continue
+
+        ticker = alert["ticker"]
+        alert_type = alert.get("type", "price")
+
+        # Alerts whose "ticker" is a display label ("10Y Treasury", "DXY
+        # Dollar Index", "Copper/Gold ratio"), not a real discussable
+        # symbol, route Discuss to the existing MACRO topic thread (same
+        # callback as /macro's menu button) rather than
+        # make_tickers_keyboard(), which would build a ticker_<label>
+        # thread for a symbol that doesn't exist.
+        if alert_type.startswith("macro_") or alert_type in ("volatility", "international", "ratio"):
+            discuss_label = "💬 Discuss Macro"
+            discuss_button = InlineKeyboardButton(discuss_label, callback_data="cmd_macro")
+        elif alert_type == "crypto":
+            discuss_button = InlineKeyboardButton("💬 Discuss Crypto/Macro", callback_data="cmd_macro")
         else:
-            kb = make_tickers_keyboard([ticker], label="💬 Discuss")
+            discuss_button = InlineKeyboardButton(f"💬 Discuss {ticker}", callback_data=f"discuss_{ticker}")
+
+        kb = InlineKeyboardMarkup([[
+            discuss_button,
+            InlineKeyboardButton("📰 /prices", callback_data="cmd_prices"),
+        ]])
+
+        formatted_message = _format_alert_message(alert)
+
         try:
             await send_safe(context.bot, TELEGRAM_USER_ID,
-                             f"🔔 *INTRADAY ALERT*\n\n{alert['message']}", reply_markup=kb)
+                             f"🔔 *ALERT*\n\n{formatted_message}", reply_markup=kb)
             _alerted_today[alert["key"]] = True
-            logger.info(f"intraday_alert_job: sent {alert['type']} alert for {ticker}")
+            _record_alert(alert)
+            logger.info(f"intraday_alert_job: sent {alert_type} alert for {ticker}")
         except Exception as e:
             logger.error(f"intraday_alert_job: failed to send alert for {ticker}: {e}")
 
@@ -1887,6 +2765,40 @@ async def backup_advisor_db(context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daily thread summarization
+# ---------------------------------------------------------------------------
+
+async def daily_thread_summarization(context) -> None:
+    """
+    Daily job: summarizes exchanges older than 3 days across all active
+    threads (see __main__ job_queue setup — runs at 3:00 AM UTC, an hour
+    before the morning brief). Complements ThreadManager.auto_summarize_thread()'s
+    message-count trigger with a time-based one, so a low-traffic thread
+    still gets a compact summary for Advisor._get_cross_thread_context()
+    instead of running verbatim-only forever. topic_BRIEF is skipped — its
+    history is brief_builder's saved-briefs mechanism, not chat exchanges.
+    """
+    try:
+        all_threads = thread_manager.list_threads()
+        summarized_count = 0
+        for thread in all_threads:
+            thread_id = thread["thread_id"]
+            if thread_id == "topic_BRIEF":
+                continue
+            try:
+                await run_in_executor(
+                    thread_manager.summarize_old_exchanges, thread_id, advisor.summarize_messages, 3
+                )
+                summarized_count += 1
+            except Exception as e:
+                logger.warning(f"daily_thread_summarization: {thread_id} failed: {e}")
+
+        logger.info(f"daily_thread_summarization: processed {summarized_count} threads")
+    except Exception as e:
+        logger.error(f"daily_thread_summarization failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # post_init and __main__
 # ---------------------------------------------------------------------------
 
@@ -1896,7 +2808,7 @@ async def post_init(application):
         BotCommand("brief", "Full morning brief"),
         BotCommand("discuss", "Discuss a ticker: /discuss APP"),
         BotCommand("macro", "Macro and regime discussion"),
-        BotCommand("yields", "Live yields, FX and commodity prices"),
+        BotCommand("prices", "Live prices — yields, FX, commodities, positions"),
         BotCommand("portfolio", "Portfolio price action"),
         BotCommand("portfolio_review", "In-depth portfolio review"),
         BotCommand("screener", "Run equity screener"),
@@ -1918,8 +2830,20 @@ async def post_init(application):
         BotCommand("audit", "Recent config changes and operations"),
         BotCommand("logs", "View logs: /logs errors | brief | advisor | screener"),
         BotCommand("status", "System health and data source status"),
+        BotCommand("restart", "Restart the bot process"),
+        BotCommand("kill", "Stop the bot process (use if /restart fails)"),
         BotCommand("help", "All commands with examples"),
     ])
+
+    # Warm the shared price cache immediately rather than waiting for the
+    # first read to trigger it (the first portfolio monitor / macro alert
+    # / /prices call would otherwise eat that fetch's latency).
+    try:
+        await run_in_executor(price_cache.refresh, True)
+        logger.info(f"Startup: {price_cache.coverage_report()}")
+    except Exception as e:
+        logger.warning(f"Price cache warmup failed: {e}")
+
     await application.bot.send_message(
         chat_id=TELEGRAM_USER_ID,
         text="Portfolio Advisor online. Good morning. 🌅",
@@ -1930,6 +2854,12 @@ async def post_init(application):
 if __name__ == "__main__":
     from equity.config.logging_config import setup_logging
     setup_logging()
+
+    # Logged for /restart debugging — confirms the actual invocation this
+    # process started with (sys.executable/argv/cwd) independent of
+    # whatever /restart itself does (see send_restart()'s docstring on
+    # why it doesn't just replay sys.argv).
+    logger.info(f"Bot started: {sys.executable} {sys.argv} cwd={os.getcwd()}")
 
     import subprocess
     import sys
@@ -1977,7 +2907,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threads", send_threads))
     app.add_handler(CommandHandler("discuss", send_discuss))
     app.add_handler(CommandHandler("macro", send_macro))
-    app.add_handler(CommandHandler("yields", send_yields))
+    app.add_handler(CommandHandler("prices", send_prices))
     app.add_handler(CommandHandler("portfolio_review", send_portfolio_review))
     app.add_handler(CommandHandler("switch", send_switch))
     app.add_handler(CommandHandler("done", send_done))
@@ -1988,6 +2918,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("audit", send_audit))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("status", send_status))
+    app.add_handler(CommandHandler("restart", send_restart))
+    app.add_handler(CommandHandler("kill", send_kill))
     app.add_handler(CommandHandler("add", send_add))
     app.add_handler(CommandHandler("remove", send_remove))
     app.add_handler(CommandHandler("update", send_update))
@@ -2021,6 +2953,11 @@ if __name__ == "__main__":
         backup_advisor_db,
         time=dt.time(2, 0, 0, tzinfo=pytz.utc),
         name="db_backup"
+    )
+    app.job_queue.run_daily(
+        daily_thread_summarization,
+        time=dt.time(3, 0, 0, tzinfo=pytz.utc),
+        name="thread_summarization"
     )
 
     print("Portfolio Advisor bot started. Press Ctrl+C to stop.")

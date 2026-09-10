@@ -34,6 +34,19 @@ their FRED series id ('DGS2'/'DGS20'), same `is_yield=True` shape. Don't
 look these up by tenor name directly — use `get_yield(tenor)`, which maps
 '2Y'/'5Y'/etc. to whichever cache key actually holds it.
 
+After-hours pricing: for standard (non-crypto/futures/commodity) tickers,
+`refresh()` now fetches the intraday 5m bars with `prepost=True` across a
+4 AM-8 PM ET window (`_is_extended_hours_window()`), not just the 9:30-16:00
+cash session — see `refresh()`'s docstring. Each cache entry's `price` is
+still "most recent available" (so it becomes an after-hours/pre-market
+print once one exists), but two extra fields keep the regular session
+visible separately: `official_close` (the 4pm print, or the prior close
+before today's open — never an extended-hours price) and
+`afterhours_price`/`session_type` ('premarket'/'afterhours', else None)
+for the extended-hours print itself, when the most recent bar is one.
+`change_1d_pct` is computed off `official_close`, not `price`, so it stays
+a regular-session move rather than silently including an after-hours swing.
+
 What this cache doesn't replace:
 - `market_snapshot.py`'s treasury-curve/FX/commodities fetch — those need
   ~5 years of daily history for `compute_ma_flags()` (SMA200 proximity,
@@ -51,7 +64,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -150,6 +163,84 @@ DAILY_ONLY_TICKERS = {
 }
 
 _WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# yfinance's extended-hours data windows (ET), used with `prepost=True` on
+# the standard-ticker intraday fetch — see refresh(). Pre-market bars run
+# 4:00-9:30, the regular session 9:30-16:00, after-hours 16:00-20:00.
+_PREMARKET_START = dt_time(4, 0)
+_REGULAR_START = dt_time(9, 30)
+_REGULAR_END = dt_time(16, 0)
+_AFTERHOURS_END = dt_time(20, 0)
+
+
+def _to_et(ts) -> pd.Timestamp:
+    """Normalizes a bar timestamp (tz-aware or naive) to America/New_York."""
+    ts = pd.Timestamp(ts)
+    et_tz = pytz.timezone("America/New_York")
+    return ts.tz_convert(et_tz) if ts.tzinfo else et_tz.localize(ts)
+
+
+def _bar_session_type(bar_et: pd.Timestamp) -> str:
+    """Classifies one ET-localized intraday bar into 'premarket' | 'regular'
+    | 'afterhours' | 'outside' using yfinance's extended-hours windows (see
+    module-level constants above). 'outside' covers anything before 4 AM or
+    after 8 PM ET — shouldn't occur with `prepost=True`, but yfinance's
+    exact cutoffs aren't contractually documented, so this doesn't assume
+    one of the other three always applies.
+    """
+    t = bar_et.time()
+    if _REGULAR_START <= t < _REGULAR_END:
+        return "regular"
+    if _PREMARKET_START <= t < _REGULAR_START:
+        return "premarket"
+    if _REGULAR_END <= t < _AFTERHOURS_END:
+        return "afterhours"
+    return "outside"
+
+
+def _is_extended_hours_window(now_et: datetime) -> bool:
+    """True during yfinance's extended-hours data window (4:00 AM-8:00 PM
+    ET, Mon-Fri) — wider than the 9:30-16:00 cash-session check `_get_ttl()`
+    uses, so the standard-ticker intraday fetch (`prepost=True`) actually
+    has pre/post-market bars to return instead of coming back empty outside
+    9:30-16:00 and burning yf_download()'s 4-retry/10s-20s backoff on every
+    ticker for nothing (see DAILY_ONLY_TICKERS's docstring for why that
+    backoff cost matters).
+    """
+    if now_et.weekday() >= 5:
+        return False
+    return _PREMARKET_START <= now_et.time() < _AFTERHOURS_END
+
+
+def _regular_session_bars(intraday_close: pd.Series) -> pd.Series:
+    """Filters a `prepost=True` intraday series down to just its 09:30-16:00
+    ET bars, dropping any pre-market/after-hours bars fetched alongside
+    them. Feeding this (rather than the raw series) to
+    `_get_current_price_and_bar_time()` derives `official_close` — the 4pm
+    print — independent of whichever extended-hours bar happens to be most
+    recent.
+    """
+    if intraday_close is None or len(intraday_close) == 0:
+        return pd.Series(dtype=float)
+    is_regular = [_bar_session_type(_to_et(ts)) == "regular" for ts in intraday_close.index]
+    return intraday_close[is_regular]
+
+
+def _latest_extended_hours_bar(intraday_close: pd.Series) -> tuple[Optional[float], Optional[str]]:
+    """The most recent bar's (price, session_type) if — and only if — that
+    single most-recent bar is itself pre-market or after-hours. During the
+    regular session the newest bar is always 'regular' (even if an earlier
+    premarket bar from the same morning sits earlier in the series), so
+    this correctly returns (None, None) then rather than resurfacing a
+    stale premarket print once the regular session has bars of its own.
+    """
+    if intraday_close is None or len(intraday_close) == 0:
+        return None, None
+    last_ts = intraday_close.index[-1]
+    session = _bar_session_type(_to_et(last_ts))
+    if session in ("premarket", "afterhours"):
+        return float(intraday_close.iloc[-1]), session
+    return None, None
 
 
 def _extract_close(df: pd.DataFrame | None, ticker: str) -> pd.Series:
@@ -582,6 +673,22 @@ class PriceCache:
         get an intraday price during market hours rather than falling all
         the way back to yesterday's daily close.
 
+        Both the standard and extended intraday fetches pass `prepost=True`,
+        so a standard ticker's `intraday_standard`/`intraday_fallback` carry
+        pre-market (4:00-9:30 ET) and after-hours (16:00-20:00 ET) bars
+        alongside the regular session, not just regular-session bars. That
+        window is wider than the 9:30-16:00 cash session `is_market_hours`
+        gates everything else on, so the standard fetch is gated on
+        `_is_extended_hours_window()` instead — 4 AM-8 PM ET — rather than
+        skipped outright once the cash session ends. Without this, a read
+        after the 4 PM close fell all the way back to the daily bar (a
+        session behind) until the next morning's fetch, even though the
+        instrument was still trading after-hours; see
+        `_get_current_price_and_bar_time()` and the per-ticker processing
+        below (`official_close`/`afterhours_price`/`session_type`) for how
+        the resulting bars are split back into a stable regular-session
+        close plus a separate extended-hours print.
+
         Crypto/futures/commodities (`_EXTENDED_INTRADAY_SET`) get a THIRD,
         separate intraday fetch — `intraday_extended` — that runs every
         refresh cycle regardless of `is_market_hours`, with a 5-day window
@@ -591,10 +698,14 @@ class PriceCache:
         for gold, oil, ES futures, BTC, etc. even while they were actively
         trading. The wider 5-day window is a safety net against yfinance
         itself having a gap right at the edge of a 1-day window (e.g. the
-        morning after a holiday).
+        morning after a holiday). `prepost=True` is passed here too for
+        consistency, though it's a no-op for instruments with no cash-
+        session concept to begin with.
         """
         ttl = self._get_ttl()
         is_market_hours = ttl == self.MARKET_HOURS_TTL
+        now_et = datetime.now(pytz.timezone("America/New_York"))
+        is_extended_hours = _is_extended_hours_window(now_et)
         now = time.time()
 
         with self._lock:
@@ -613,13 +724,14 @@ class PriceCache:
 
                 intraday_standard = None
                 intraday_fallback = None
-                if is_market_hours:
+                if is_extended_hours:
                     standard_tickers = [
                         t for t in tickers
                         if t not in _EXTENDED_INTRADAY_SET and t not in DAILY_ONLY_TICKERS
                     ]
                     intraday_standard = yf_download(
-                        standard_tickers, period="1d", interval="5m", auto_adjust=True, progress=False,
+                        standard_tickers, period="1d", interval="5m", auto_adjust=True,
+                        prepost=True, progress=False,
                     ) if standard_tickers else pd.DataFrame()
                     if intraday_standard.empty:
                         intraday_standard = None
@@ -634,7 +746,8 @@ class PriceCache:
                         ]
                         if missing_5m:
                             intraday_fallback = yf_download(
-                                missing_5m, period="2d", interval="1h", auto_adjust=True, progress=False,
+                                missing_5m, period="2d", interval="1h", auto_adjust=True,
+                                prepost=True, progress=False,
                             )
                             if intraday_fallback.empty:
                                 intraday_fallback = None
@@ -646,7 +759,8 @@ class PriceCache:
                     if t in _EXTENDED_INTRADAY_SET and t not in DAILY_ONLY_TICKERS
                 ]
                 intraday_extended = yf_download(
-                    extended_tickers, period="5d", interval="5m", auto_adjust=True, progress=False,
+                    extended_tickers, period="5d", interval="5m", auto_adjust=True,
+                    prepost=True, progress=False,
                 ) if extended_tickers else pd.DataFrame()
                 if intraday_extended.empty:
                     intraday_extended = None
@@ -726,14 +840,52 @@ class PriceCache:
                             ticker, daily_close, intraday_close, naive_prior_close,
                         )
 
+                        # official_close/afterhours_price split (standard
+                        # tickers only — crypto/futures/commodities have no
+                        # cash-session concept for "after-hours" to mean
+                        # anything). official_close is derived by feeding
+                        # ONLY the regular-session bars back through the
+                        # same helper used for curr_price above, so it gets
+                        # the same intraday-sanity-check/daily-fallback
+                        # treatment rather than a separately-maintained copy
+                        # of that logic — it's what curr_price would be if
+                        # `intraday_close` had never picked up extended-hours
+                        # bars at all. See _regular_session_bars() and
+                        # _latest_extended_hours_bar().
+                        official_close = None
+                        afterhours_price = None
+                        session_type = None
+                        if ticker not in _EXTENDED_INTRADAY_SET and ticker not in _YIELD_SCALE:
+                            if len(intraday_close) == 0:
+                                # No intraday data at all this cycle — the
+                                # regular-session split would be empty too,
+                                # making official_close identical to
+                                # curr_price (both fall to the same daily-
+                                # bar branch). Reuse it rather than calling
+                                # _get_current_price_and_bar_time() again,
+                                # which would log its too-old-daily-bar
+                                # warning a second time for nothing.
+                                official_close = curr_price
+                            else:
+                                official_close, _, _ = _get_current_price_and_bar_time(
+                                    ticker, daily_close, _regular_session_bars(intraday_close), naive_prior_close,
+                                )
+                            afterhours_price, session_type = _latest_extended_hours_bar(intraday_close)
+
                         # Real prior_close for the cached change% — guards
                         # against a stale/duplicate settlement bar sitting
                         # at iloc[-2] (e.g. a thin-holiday commodity bar
                         # that just carries the prior session's value
-                        # forward). See _get_prior_close().
-                        prior_close = _get_prior_close(daily_close, curr_price)
+                        # forward). See _get_prior_close(). Anchored on
+                        # official_close (not curr_price) so change_1d_pct
+                        # stays an apples-to-apples regular-session move
+                        # even once curr_price/price has picked up an
+                        # after-hours print — the after-hours delta is
+                        # reported separately via afterhours_price.
+                        change_anchor = official_close if official_close is not None else curr_price
+                        prior_close = _get_prior_close(daily_close, change_anchor)
 
-                        change_1d_pct = (curr_price / prior_close - 1) * 100 if prior_close else 0.0
+                        change_1d_pct = (change_anchor / prior_close - 1) * 100 if prior_close else 0.0
                         vol_today = float(volume.iloc[-1]) if len(volume) >= 1 else None
                         vol_avg = float(volume.iloc[-5:].mean()) if len(volume) >= 5 else None
 
@@ -757,6 +909,9 @@ class PriceCache:
                             "price": curr_price,
                             "prev_close": prior_close,
                             "change_1d_pct": round(change_1d_pct, 3),
+                            "official_close": official_close,
+                            "afterhours_price": afterhours_price,
+                            "session_type": session_type,
                             "volume_today": vol_today,
                             "volume_5d_avg": vol_avg,
                             "as_of": datetime.now().isoformat(),
