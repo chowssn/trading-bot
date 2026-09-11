@@ -734,23 +734,42 @@ class PriceCache:
                         prepost=True, progress=False,
                     ) if standard_tickers else pd.DataFrame()
                     if intraday_standard.empty:
+                        # A totally-empty yfinance response has no columns
+                        # at all (not a MultiIndex with all-NaN rows) — normalize
+                        # to None *before* the _extract_close() calls below,
+                        # which handle None safely (empty series) but would
+                        # otherwise KeyError on a column-less DataFrame.
                         intraday_standard = None
-                    else:
-                        # Yield tickers never use intraday data (see the
-                        # `_YIELD_SCALE` branch below) — skip them here so
-                        # the fallback fetch isn't wasted on data that will
-                        # just be discarded.
-                        missing_5m = [
-                            t for t in standard_tickers
-                            if t not in _YIELD_SCALE and len(_extract_close(intraday_standard, t)) == 0
-                        ]
-                        if missing_5m:
-                            intraday_fallback = yf_download(
-                                missing_5m, period="2d", interval="1h", auto_adjust=True,
-                                prepost=True, progress=False,
-                            )
-                            if intraday_fallback.empty:
-                                intraday_fallback = None
+
+                    # Yield tickers never use intraday data (see the
+                    # `_YIELD_SCALE` branch below) — skip them here so the
+                    # fallback fetch isn't wasted on data that will just be
+                    # discarded. Computed unconditionally — whether the 5m
+                    # batch came back partially empty (some tickers) or
+                    # *entirely* empty (intraday_standard is None above),
+                    # which happens routinely pre-market (this window is
+                    # gated on `_is_extended_hours_window()`, 4 AM-8 PM ET,
+                    # not the 9:30 cash open — before the open, thin/rate
+                    # tickers like ^TNX/^IRX/^TYX/^FVX/LQD/HYG/TIP have no 5m
+                    # bar yet and the whole batch comes back empty). This
+                    # used to only run in an `else` branch guarded on a
+                    # *non-empty* intraday_standard, so none of those
+                    # entirely-empty-batch tickers ever got the interval="1h"
+                    # fallback fetch that's meant to catch exactly this case
+                    # — they'd log a "no price data found" error and still
+                    # degrade correctly to the daily bar, but pointlessly,
+                    # since an hourly bar was available.
+                    missing_5m = [
+                        t for t in standard_tickers
+                        if t not in _YIELD_SCALE and len(_extract_close(intraday_standard, t)) == 0
+                    ]
+                    if missing_5m:
+                        intraday_fallback = yf_download(
+                            missing_5m, period="2d", interval="1h", auto_adjust=True,
+                            prepost=True, progress=False,
+                        )
+                        if intraday_fallback.empty:
+                            intraday_fallback = None
 
                 # Crypto/futures/commodities — always fetched, not gated by
                 # is_market_hours. See refresh()'s docstring.

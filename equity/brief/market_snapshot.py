@@ -38,9 +38,12 @@ import json
 import logging
 import operator
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import anthropic
 import pandas as pd
 from dotenv import load_dotenv
 from fredapi import Fred
@@ -73,6 +76,7 @@ from equity.config.market_config import (
     VIX_HIGH,
     VOLATILITY_TICKERS,
 )
+from equity.config.positions import POSITIONS
 from equity.data.price_cache import price_cache
 from equity.data.yfinance_utils import yf_download
 
@@ -82,12 +86,33 @@ logger = logging.getLogger(__name__)
 
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
+# Same model string as brief_synthesizer.MODEL / telegram.advisor.MODEL —
+# defined locally rather than imported from either so this module's only
+# hard dependency for its own data-fetch functions (fetch_market_snapshot,
+# fetch_global_signals, ...) stays fredapi/yfinance/pandas; a missing
+# ANTHROPIC_API_KEY should never block those from importing or running.
+_MACRO_INTEL_MODEL = "claude-sonnet-4-6"
+
 _DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
 _CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
 _FED_FUNDS_CACHE_PATH = _CACHE_DIR / "fed_funds.json"
 FED_FUNDS_CACHE_HOURS = 24
 FRED_SERIES_CACHE_HOURS = 24
+
+_MACRO_INTEL_CACHE_PATH = _CACHE_DIR / "macro_intel.json"
+MACRO_INTEL_CACHE_HOURS = 6
+
+# Hourly cap on *cold* (cache-miss) macro-intel fetches — each cold fetch is
+# 5 searches x 2 Claude calls (search + grounded-extraction) = 10 calls.
+# The 6h cache already bounds this to ~4 cold fetches/day under normal use,
+# but both build_morning_brief() and send_prices('all') can hit a cold
+# cache independently (a fresh brief, then /prices before it's cached) —
+# same failure shape advisor.py's WEB_FUNDAMENTALS_MAX_PER_HOUR guards
+# against for _fetch_web_fundamentals(). This is the same kind of guard,
+# scaled for one shared module-level cache instead of one per ticker.
+MACRO_INTEL_MAX_PER_HOUR = 4
+_macro_intel_call_times: list[float] = []
 
 VIX_TICKER = "^VIX"
 TREASURY_5Y_PERIOD = "5y"
@@ -1064,6 +1089,334 @@ def format_global_signals(signals: dict) -> str:
         lines.append("")
 
     lines.append(_DIVIDER)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Macro intelligence — the web-searched narrative layer for Section 1.
+#
+# Complements (doesn't duplicate) eco_calendar.py's FRED-sourced release
+# *dates*: this adds the consensus/prior/"what a beat means" color FRED's
+# release calendar doesn't carry, plus geopolitical/central-bank/overnight-
+# session/analyst-action context that has no quantitative source at all in
+# this module. Same _search-then-extract shape as
+# equity.telegram.advisor._web_search_and_extract() (search grounded in
+# live results, then a second grounded-extraction pass that refuses to
+# state anything not literally in the source).
+# ---------------------------------------------------------------------------
+
+_macro_intel_client: "anthropic.Anthropic | None" = None
+
+
+def _get_macro_intel_client() -> "anthropic.Anthropic | None":
+    """Lazily builds the Anthropic client — never at import time, so a
+    missing ANTHROPIC_API_KEY can't break importing this module's (much
+    more commonly used) plain data-fetch functions. Returns None if unset.
+    """
+    global _macro_intel_client
+    if _macro_intel_client is not None:
+        return _macro_intel_client
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    _macro_intel_client = anthropic.Anthropic(api_key=api_key)
+    return _macro_intel_client
+
+
+def _load_macro_intel_cache() -> dict | None:
+    """None on any miss (absent/corrupt/stale file) — same fetched_at +
+    payload shape and age-check as _load_fed_funds_cache().
+    """
+    if not _MACRO_INTEL_CACHE_PATH.exists():
+        return None
+    try:
+        with open(_MACRO_INTEL_CACHE_PATH) as f:
+            cache = json.load(f)
+        fetched_at = datetime.fromisoformat(cache["fetched_at"])
+        results = dict(cache["results"])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning("macro_intel.json cache unreadable, ignoring: %s", exc)
+        return None
+
+    if (datetime.now() - fetched_at).total_seconds() > MACRO_INTEL_CACHE_HOURS * 3600:
+        return None
+    results["_fetched_at"] = cache["fetched_at"]
+    return results
+
+
+def _write_macro_intel_cache(results: dict, fetched_at_iso: str) -> None:
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_MACRO_INTEL_CACHE_PATH, "w") as f:
+            json.dump({"fetched_at": fetched_at_iso, "results": results}, f, indent=2)
+    except OSError as exc:
+        logger.warning("Failed to write macro_intel.json cache: %s", exc)
+
+
+def _macro_intel_budget_ok() -> bool:
+    """Hourly cap on *cold* (cache-miss) fetches — see MACRO_INTEL_MAX_PER_HOUR."""
+    now = time.time()
+    _macro_intel_call_times[:] = [t for t in _macro_intel_call_times if now - t < 3600]
+    if len(_macro_intel_call_times) >= MACRO_INTEL_MAX_PER_HOUR:
+        return False
+    _macro_intel_call_times.append(now)
+    return True
+
+
+def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int = 400) -> str:
+    """One web search + grounded-extraction pass. Never raises — returns
+    '' on any failure (no client configured, search error, empty result)
+    so one search failing doesn't take the others down with it.
+    """
+    client = _get_macro_intel_client()
+    if client is None:
+        return ""
+    try:
+        raw = client.messages.create(
+            model=_MACRO_INTEL_MODEL,
+            max_tokens=max_tokens,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": query}],
+        )
+        raw_text = "\n".join(b.text for b in raw.content if hasattr(b, "text") and b.text).strip()
+        if not raw_text:
+            return ""
+
+        extraction = client.messages.create(
+            model=_MACRO_INTEL_MODEL,
+            max_tokens=max_tokens,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"{extract_prompt}\n\nSource:\n{raw_text}\n\n"
+                    f'Rules: Only state facts in source. If absent write "not found". '
+                    f"Include source name for each fact."
+                ),
+            }],
+        )
+        text_parts = [b.text for b in extraction.content if hasattr(b, "text") and b.text]
+        return "\n".join(text_parts).strip()
+    except Exception as exc:
+        logger.warning("fetch_macro_intelligence search failed: %s", exc)
+        return ""
+
+
+def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
+    """Five targeted web searches surfacing geopolitical, central-bank,
+    economic-release, overnight-session, and analyst-action narrative
+    context — the narrative layer for Section 1 (Global Markets),
+    alongside fetch_market_snapshot()/fetch_global_signals()'s
+    quantitative data.
+
+    Cached MACRO_INTEL_CACHE_HOURS (6) hours in one shared file, keyed by
+    fetched_at rather than a wall-clock bucket, so build_morning_brief()
+    and send_prices('all') hitting this within the same window share one
+    fetch instead of each maintaining their own (buggier) notion of "this
+    hour". The 5 searches run concurrently, not sequentially — each is a
+    search-then-extract pair (2 blocking Claude calls), so doing all 5
+    back to back would be 10 serial calls and push a cold fetch to a
+    minute or more.
+
+    Returns {} — never raises — if ANTHROPIC_API_KEY is unset, the hourly
+    cold-fetch budget (MACRO_INTEL_MAX_PER_HOUR) is exhausted, or every
+    search fails. Callers treat an empty/falsy result as "no macro intel
+    layer this time" via format_macro_intelligence()'s content check.
+    An empty/skipped result is never cached, so the next call (this
+    hour's budget or key permitting) tries again rather than waiting out
+    the full cache window for what wasn't actually fetched.
+    """
+    cached = _load_macro_intel_cache()
+    if cached is not None:
+        return cached
+
+    if _get_macro_intel_client() is None:
+        logger.warning("fetch_macro_intelligence: ANTHROPIC_API_KEY not set — skipping")
+        return {}
+
+    if not _macro_intel_budget_ok():
+        logger.warning(
+            "fetch_macro_intelligence: hourly cold-fetch budget (%d/hr) exhausted — skipping",
+            MACRO_INTEL_MAX_PER_HOUR,
+        )
+        return {}
+
+    today = datetime.now().strftime("%B %d, %Y")
+    regime_str = ", ".join(regime_flags) if regime_flags else "none"
+    held_tickers = " ".join(list(POSITIONS.keys())[:10])  # top 10 by dict order
+
+    # key -> (query, extract_prompt, max_tokens)
+    searches: dict[str, tuple[str, str, int]] = {
+        "geopolitical": (
+            f"market moving geopolitical events overnight {today} "
+            f"OPEC oil supply central bank meeting G7 G20 trade "
+            f"sanctions military conflict commodity supply disruption",
+            f"Extract geopolitical and policy events from {today} that are "
+            f"moving markets (current regime: {regime_str}):\n"
+            f"- Any named meetings scheduled (OPEC, GCC, G7, G20, bilateral)\n"
+            f"- Military/conflict developments affecting energy or trade routes\n"
+            f"- Sanctions, tariffs, or trade policy announcements\n"
+            f"- Supply disruption events (pipeline, shipping, port)\n"
+            f"- For each: what is the market impact direction and which assets\n"
+            f"Format: [Event] — [Market impact] — [Source]\n"
+            f"Only events from last 24 hours. Max 4 events.",
+            400,
+        ),
+        "central_banks": (
+            f"Federal Reserve ECB BOJ Bank of England central bank "
+            f"{today} meeting decision preview rate hike cut "
+            f"governor speech statement overnight",
+            f"Extract central bank intelligence from {today} "
+            f"(current regime: {regime_str}):\n"
+            f"- Next scheduled meeting date for Fed, ECB, BOJ, BOE\n"
+            f"- Current market probability for each (hike/hold/cut)\n"
+            f"- Any overnight speeches or statements with key quotes\n"
+            f"- Any consensus surveys or analyst previews published\n"
+            f"- Implied rate path changes from overnight sessions\n"
+            f"Format: [Bank] — [Next meeting: date] — [Market pricing] — [Key development]\n"
+            f"Only developments from last 24 hours.",
+            400,
+        ),
+        "eco_releases": (
+            f"economic data release today {today} CPI PPI NFP GDP "
+            f"retail sales jobs report preview consensus estimate "
+            f"what to expect market impact",
+            f"Extract today's scheduled economic releases with context:\n"
+            f"- Release name, time (ET), and consensus estimate\n"
+            f"- Prior reading and trend\n"
+            f"- What a beat vs miss would mean for markets\n"
+            f"- Any specific thresholds the market is watching\n"
+            f"- Named analyst previews if available\n"
+            f"Format: [Release] [Time ET] — Consensus: [X] — Prior: [Y] — Watch: [threshold]\n"
+            f"Only releases scheduled for today.",
+            400,
+        ),
+        "overnight_session": (
+            f"Asia Europe markets overnight {today} Nikkei Hang Seng "
+            f"DAX FTSE key movers earnings central bank bond yields "
+            f"currency moves what happened",
+            f"Extract overnight session highlights:\n"
+            f"- Asia session: key index moves with specific % and driver\n"
+            f"- Europe open: key index moves with specific % and driver\n"
+            f"- Overnight bond moves: 10Y UST, JGB, Bund yield changes in bp\n"
+            f"- Any major earnings or corporate announcements overnight\n"
+            f"- Single most important thing that happened overnight\n"
+            f"Format: [Region] [Index] [move%] — [Driver in ≤8 words]\n"
+            f"Be specific. Only from last 12 hours.",
+            350,
+        ),
+        "analyst_notes": (
+            f"analyst upgrade downgrade price target {held_tickers} "
+            f"{today} Goldman Sachs Morgan Stanley JPMorgan "
+            f"Bank of America Citi research note",
+            f"Extract analyst actions for held positions from {today}:\n"
+            f"- Firm name, ticker, action (upgrade/downgrade/initiate/reiterate)\n"
+            f"- Old rating → New rating\n"
+            f"- Old target → New target\n"
+            f"- One-line rationale\n"
+            f"Format: [Firm] [TICKER] [action] [old→new rating] [old→new target] — [rationale]\n"
+            # "not found" (not a bespoke phrase) so format_macro_intelligence()'s
+            # shared not-found filter actually hides this section when empty.
+            f'Only actions from today. If none found, write "not found".',
+            350,
+        ),
+    }
+
+    results: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(searches)) as pool:
+        future_to_key = {
+            pool.submit(_macro_search_and_extract, query, extract_prompt, max_tokens): key
+            for key, (query, extract_prompt, max_tokens) in searches.items()
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as exc:
+                logger.warning("fetch_macro_intelligence: %s search failed: %s", key, exc)
+                results[key] = ""
+
+    fetched_at_iso = datetime.now().isoformat()
+    _write_macro_intel_cache(results, fetched_at_iso)
+    results = dict(results)
+    results["_fetched_at"] = fetched_at_iso
+    return results
+
+
+def _is_not_found_placeholder(text: str) -> bool:
+    """True only when `text` *is* the extractor's "not found"/"no ...
+    today" fallback — a short whole-response placeholder — not merely
+    when it *contains* that phrase.
+
+    The extract prompts ask for one "not found" per missing *field* inside
+    an otherwise multi-field markdown answer (e.g. eco_releases: "Prior:
+    Not found" for one release, real data for three others) — a substring
+    check there would wrongly drop the whole section. Checked by length
+    (a real multi-field answer is always much longer than the placeholder
+    itself) rather than an exact-string match, so a placeholder followed
+    by trailing punctuation/whitespace still counts.
+    """
+    if not text:
+        return True
+    return len(text.strip()) < 40 and "not found" in text.lower()
+
+
+def format_macro_intelligence(intel: dict) -> str:
+    """Formats macro intelligence into brief section text.
+
+    A section is omitted (not padded with a "nothing found" line) when its
+    search found nothing or returned only the extractor's "not found"
+    placeholder (see `_is_not_found_placeholder()`). `intel`'s
+    "_fetched_at" key (see fetch_macro_intelligence()) is metadata, not a
+    section — excluded from both the emptiness check and the section loop.
+    """
+    section_values = [v for k, v in intel.items() if not k.startswith("_")]
+    if not any(not _is_not_found_placeholder(v) for v in section_values):
+        return ""
+
+    lines = ["\U0001F4E1 MACRO INTELLIGENCE (web-sourced)", ""]
+
+    section_labels = {
+        "geopolitical": "\U0001F310 Geopolitical",
+        "central_banks": "\U0001F3E6 Central Banks",
+        "eco_releases": "\U0001F4CA Today's Releases",
+        "overnight_session": "\U0001F319 Overnight Session",
+        "analyst_notes": "\U0001F4CB Analyst Actions",
+    }
+
+    # The extract prompts ask for a short bulleted/tabular format, but a
+    # web-search-grounded extraction routinely comes back as a full
+    # markdown writeup (headers, horizontal rules) several times that
+    # length regardless — observed live: ~800-1200 chars/section. Hard
+    # capped per section so 5 sections can't crowd out the quantitative
+    # data both synthesize_section() and synthesize_global_signals()
+    # truncate this whole block alongside (see their `section_data[:...]`),
+    # and so the brief itself stays dense rather than narrative.
+    _MAX_SECTION_CHARS = 450
+
+    for key, label in section_labels.items():
+        content = intel.get(key, "")
+        if not _is_not_found_placeholder(content):
+            if len(content) > _MAX_SECTION_CHARS:
+                content = content[:_MAX_SECTION_CHARS].rsplit(" ", 1)[0] + "…"
+            lines.append(f"*{label}*")
+            lines.append(content)
+            lines.append("")
+
+    footer = "_Source: web search — verify time-sensitive facts_"
+    fetched_at = intel.get("_fetched_at")
+    if fetched_at:
+        try:
+            age_minutes = (datetime.now() - datetime.fromisoformat(fetched_at)).total_seconds() / 60
+            if age_minutes < 5:
+                age_str = "fresh"
+            elif age_minutes < 60:
+                age_str = f"{int(age_minutes)}min ago"
+            else:
+                age_str = f"{int(age_minutes / 60)}h ago"
+            footer = f"_Fetched {age_str} — web search, verify time-sensitive facts_"
+        except ValueError:
+            pass
+    lines.append(footer)
     return "\n".join(lines)
 
 

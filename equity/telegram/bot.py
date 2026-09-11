@@ -1065,7 +1065,11 @@ async def send_prices(update, context):
                 _parse_and_persist_monitoring,
                 synthesize_global_signals,
             )
-            from equity.brief.market_snapshot import fetch_market_snapshot
+            from equity.brief.market_snapshot import (
+                fetch_macro_intelligence,
+                fetch_market_snapshot,
+                format_macro_intelligence,
+            )
             from equity.data.monitoring import load_monitoring
 
             # fetch_market_snapshot() does its own multi-ticker + 5Y-history
@@ -1080,6 +1084,24 @@ async def send_prices(update, context):
             recent_alert_context = _get_recent_alert_context()
             if recent_alert_context:
                 price_text += f"\n\nRECENT ALERTS:\n{recent_alert_context}"
+
+            # Same macro intelligence layer as the morning brief's Section 1
+            # (see market_snapshot.fetch_macro_intelligence()), shared via its
+            # own 6h cache — instant if /brief already ran this window, ~20s
+            # of concurrent web search on a cold cache otherwise. Appended
+            # *after* price_text/recent_alert_context (not before) so
+            # synthesize_global_signals()'s DATA truncation, if it has to cut
+            # anything, cuts this rather than the price data the synthesis
+            # actually keys off. Isolated in its own try/except — a web-search
+            # or Claude outage here should cost the synthesis its narrative
+            # layer, not the whole /prices command.
+            try:
+                intel = await run_in_executor(fetch_macro_intelligence, regime_flags)
+                intel_text = format_macro_intelligence(intel)
+                if intel_text:
+                    price_text += f"\n\nMACRO INTELLIGENCE:\n{intel_text}"
+            except Exception as intel_exc:
+                logger.warning(f"send_prices macro intelligence fetch failed: {intel_exc}")
 
             synthesis = await run_in_executor(
                 synthesize_global_signals, price_text, regime_flags, monitoring_items,

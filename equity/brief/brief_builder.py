@@ -108,13 +108,26 @@ def _fetch_performance_data() -> tuple[dict, dict, dict, dict]:
 
 
 def _format_section1_global_markets(snapshot: dict, global_signals: dict) -> str:
-    """Combines market_snapshot + global_signals into Section 1.
+    """Combines market_snapshot + global_signals into Section 1, plus the
+    web-searched macro intelligence narrative layer (geopolitical/central
+    bank/economic release/overnight session/analyst action context).
 
-    No new logic — just restructuring: calls the existing
-    `format_market_snapshot()` (rates/FX/commodities/equity futures) and
-    `format_global_signals()` (vol/crypto/international/credit/cross-asset
-    ratios) and concatenates their output with a clear divider.
+    `fetch_macro_intelligence()` is isolated in its own try/except here,
+    separate from build_morning_brief()'s outer per-section try/except —
+    a web-search or Claude outage should cost the brief its narrative
+    overlay, not the quantitative snapshot underneath it. The macro intel
+    block is appended *after* the quantitative data (not before it) so
+    `synthesize_section()`'s `section_data[:...]` truncation, if it has to
+    cut anything, cuts the newer narrative addition rather than the
+    numbers the SIGNAL/POSITIONS AFFECTED synthesis actually depends on.
     """
+    intel_text = ""
+    try:
+        intel = market_snapshot.fetch_macro_intelligence(regime_flags=snapshot.get("regime_flags", []))
+        intel_text = market_snapshot.format_macro_intelligence(intel)
+    except Exception:
+        logger.exception("Section 1: fetch_macro_intelligence failed — continuing without it")
+
     parts = [
         "🌍 GLOBAL MARKETS",
         _DIVIDER_LIGHT,
@@ -122,6 +135,8 @@ def _format_section1_global_markets(snapshot: dict, global_signals: dict) -> str
         "",
         market_snapshot.format_global_signals(global_signals),
     ]
+    if intel_text:
+        parts.extend(["", intel_text])
     return "\n".join(parts)
 
 

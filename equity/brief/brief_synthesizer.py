@@ -238,14 +238,30 @@ def synthesize_section(
                 f'[{i["ticker"]}] {i["item"][:60]} ({i.get("age_days", 0)}d)' for i in active
             )
 
+    # global_markets' DATA can carry market_snapshot.fetch_macro_intelligence()'s
+    # web-searched narrative (geopolitical/central bank/economic release/
+    # overnight session context), appended after the quantitative snapshot
+    # by _format_section1_global_markets() — see format_macro_intelligence().
+    # When present, ask explicitly for the narrative connection rather than
+    # letting the model treat it as a second, unrelated block to summarize.
+    narrative_instruction = ""
+    if section_name == "global_markets" and "MACRO INTELLIGENCE" in section_data:
+        narrative_instruction = (
+            "\nThe DATA below includes a MACRO INTELLIGENCE block (web-searched "
+            "geopolitical/central bank/economic release/overnight session "
+            "context) after the quantitative snapshot. Use it to name the "
+            "event or driver behind the quantitative moves where one is given — "
+            "connect data to catalyst, don't just restate them separately.\n"
+        )
+
     prompt = f"""{FRAMEWORK}
 Regime: {regime_str}
 
 {positions_ctx}
 {monitoring_str}
-
+{narrative_instruction}
 DATA:
-{section_data[:2000]}
+{section_data[:3200]}
 
 Respond in EXACTLY this format — no additions, no narrative prose:
 
@@ -404,14 +420,27 @@ def synthesize_global_signals(
                 f'(priority: {item.get("priority", "medium")}, age: {item.get("age_days", 0)}d)\n'
             )
 
+    # section_data can carry a MACRO INTELLIGENCE block appended by
+    # send_prices('all') — see market_snapshot.format_macro_intelligence()
+    # and brief_synthesizer.synthesize_section()'s matching instruction.
+    narrative_instruction = ""
+    if "MACRO INTELLIGENCE" in section_data:
+        narrative_instruction = (
+            "\nThe DATA below includes a MACRO INTELLIGENCE block (web-searched "
+            "geopolitical/central bank/economic release/overnight session "
+            "context) appended after the price data. Use it to name the event "
+            "or driver behind a price move where one is given — connect data "
+            "to catalyst, don't just restate them separately.\n"
+        )
+
     prompt = f"""{FRAMEWORK}
 Regime: {", ".join(regime_flags) if regime_flags else "none"}
 
 {_get_positions_context()}
 {monitoring_str}
-
+{narrative_instruction}
 GLOBAL SIGNALS DATA:
-{section_data[:2000]}
+{section_data[:3200]}
 
 Respond in EXACTLY this format — no markdown headers, no narrative prose:
 
