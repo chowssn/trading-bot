@@ -49,7 +49,7 @@ from equity.brief.brief_synthesizer import (
 )
 from equity.config import positions, settings
 from equity.config.market_config import REGIME_SCREENER_ADJUSTMENTS
-from equity.data.monitoring import load_monitoring
+from equity.data.monitoring import deduplicate_monitoring, load_monitoring
 from equity.portfolio import monitor, news_triage
 from equity.screener import screener
 from equity.telegram.formatters import make_article_keyboard, make_main_menu, make_news_actions, make_tickers_keyboard
@@ -166,6 +166,51 @@ def _format_section4_news_signals(triage: dict, df_screener) -> str:
     return "\n".join(parts)
 
 
+def _auto_cleanup_monitoring() -> int:
+    """Resolves stale active monitoring items at the start of each brief run:
+    low priority items older than 7 days, medium priority older than 21
+    days. High priority items never auto-expire — they wait for an explicit
+    `/dismiss` or a synthesis-driven supersession (see
+    `equity.data.monitoring._supersedes()`).
+
+    Returns count of items resolved.
+    """
+    from equity.data.monitoring import _load_all, _save_all
+
+    data = _load_all()
+    today = date.today()
+    resolved = 0
+
+    stale_thresholds = {"low": 7, "medium": 21, "high": None}
+
+    for item in data.get("items", []):
+        if item.get("status") != "active":
+            continue
+
+        threshold_days = stale_thresholds.get(item.get("priority", "medium"))
+        if threshold_days is None:
+            continue
+
+        try:
+            added = date.fromisoformat(item.get("added_date", str(today)))
+        except ValueError:
+            continue
+
+        if (today - added).days >= threshold_days:
+            item["status"] = "resolved"
+            item.setdefault("notes", []).append(
+                f"Auto-resolved {today}: exceeded {threshold_days}d auto-expiry "
+                f'for {item.get("priority", "medium")} priority'
+            )
+            resolved += 1
+
+    if resolved > 0:
+        _save_all(data)
+        logger.info("_auto_cleanup_monitoring: auto-resolved %d stale items", resolved)
+
+    return resolved
+
+
 def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     """Assemble the 5-section morning brief as a list of (text, keyboard) message pairs.
 
@@ -184,6 +229,20 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     sections: list[tuple[str, InlineKeyboardMarkup | None]] = []
     all_text: list[str] = []
     regime_flags: list[str] = []
+
+    # ── MONITORING HOUSEKEEPING ──────────────────────────────────
+    # Resolve stale items and merge duplicates before anything below reads
+    # `load_monitoring()`, so stale/duplicate items never leak into a
+    # section's ACTIVE MONITORING context or the monitoring keyboard.
+    try:
+        cleaned = _auto_cleanup_monitoring()
+        if cleaned > 0:
+            logger.info("Morning brief: auto-cleaned %d stale monitoring items", cleaned)
+        deduped = deduplicate_monitoring()
+        if deduped > 0:
+            logger.info("Morning brief: deduplicated %d monitoring items", deduped)
+    except Exception:
+        logger.exception("Morning brief: monitoring housekeeping failed — continuing with brief")
 
     # ── HEADER ──────────────────────────────────────────────────
     sections.append((format_morning_brief_header(), None))

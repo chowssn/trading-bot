@@ -1382,6 +1382,29 @@ class Advisor:
         )
 
     def summarize_messages(self, messages: list[dict]) -> str:
+        """Summarizes a list of {role, content} messages via a single-turn Claude call.
+
+        `messages` is replayed conversation history from `ThreadManager`
+        (`auto_summarize_thread()` / `summarize_old_exchanges()`), so it can
+        end on either role. Passing it straight through as `messages=` used
+        to fail every time it happened to end on `assistant` — "This model
+        does not support assistant message prefill. The conversation must
+        end with a user message." (see equity/data/logs/errors.log,
+        2026-09-10) — because that's replay, not a real multi-turn
+        conversation. Fix: flatten it into the content of one fresh `user`
+        turn instead of passing it as conversation history.
+        """
+        if not messages:
+            return ""
+
+        convo_text = "\n".join(
+            f'{m["role"].upper()}: {m["content"][:300]}'
+            for m in messages
+            if m.get("role") and m.get("content")
+        )
+        if not convo_text:
+            return ""
+
         try:
             response = self.client.messages.create(
                 model=MODEL,
@@ -1391,7 +1414,7 @@ class Advisor:
                     "conclusions, thesis developments, and any decisions made. "
                     "Be concise."
                 ),
-                messages=messages,
+                messages=[{"role": "user", "content": f"Discussion:\n{convo_text}"}],
             )
             return next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:

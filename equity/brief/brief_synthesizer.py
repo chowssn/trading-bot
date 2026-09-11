@@ -619,6 +619,8 @@ def _parse_and_persist_monitoring(synthesis_text: str, source: str = "synthesis"
         pattern[:50], len(block),
     )
 
+    from equity.data.monitoring import _extract_ticker
+
     new_items = []
     for line in block.split("\n"):
         line = line.strip().lstrip("- •*").strip()
@@ -632,13 +634,25 @@ def _parse_and_persist_monitoring(synthesis_text: str, source: str = "synthesis"
         parts = [p.strip() for p in line.strip("|").split("|")]
         if len(parts) < 2:
             continue
-        ticker = parts[0].upper().strip("*_")
-        item_text = parts[1]
-        if ticker.lower() in _TABLE_HEADER_TOKENS:
+        if parts[0].strip("*_[]() \t").lower() in _TABLE_HEADER_TOKENS:
             continue
+        item_text = parts[1]
         priority = parts[2].lower().strip("*_ ") if len(parts) > 2 else "medium"
         priority = priority if priority in ("high", "medium", "low") else "medium"
-        if ticker and item_text:
+        if not item_text:
+            continue
+
+        tickers = _extract_ticker(parts[0])
+        if not tickers:
+            logger.debug(
+                "_parse_and_persist_monitoring: could not extract ticker from %r (source=%s)",
+                parts[0], source,
+            )
+            continue
+
+        # A merged cell ("CCJ/CEG", "FCX, CAT") becomes one item per
+        # ticker, sharing the same condition text — see _extract_ticker().
+        for ticker in tickers:
             new_items.append({
                 "ticker": ticker,
                 "item": item_text,
