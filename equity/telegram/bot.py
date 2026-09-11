@@ -331,11 +331,29 @@ async def start_or_resume_discussion(subject: str, update, context, thread_type:
             text=f"Resuming *{ticker}* ({msg_count} messages, last active {last_active})",
             parse_mode="Markdown"
         )
-        resume_message = (
-            f"We are resuming our {ticker} discussion. "
-            f"Briefly recap where we left off and note anything "
-            f"that may have changed since then."
-        )
+        if thread_type == "ticker":
+            from equity.data.monitoring import get_monitoring_for_ticker
+
+            mon_items = get_monitoring_for_ticker(ticker)
+            if mon_items:
+                mon_summary = "; ".join(f'{m["item"][:50]}' for m in mon_items[:3])
+                resume_message = (
+                    f"We are resuming our {ticker} discussion. "
+                    f"Active monitoring: {mon_summary}. "
+                    f"Briefly recap where we left off and check in on each monitoring item."
+                )
+            else:
+                resume_message = (
+                    f"We are resuming our {ticker} discussion. "
+                    f"Briefly recap where we left off and note anything "
+                    f"that may have changed since then."
+                )
+        else:
+            resume_message = (
+                f"We are resuming our {ticker} discussion. "
+                f"Briefly recap where we left off and note anything "
+                f"that may have changed since then."
+            )
         if not check_claude_rate_limit():
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -607,53 +625,117 @@ async def send_framework(update, context):
                          "\n".join(lines), reply_markup=make_main_menu())
 
 
+def _is_macro_monitoring_item(ticker: str) -> bool:
+    """True when a monitoring item's `ticker` is a thematic/macro subject
+    (e.g. USDJPY, COPPER, DXY — brief_synthesizer's NEW MONITORING ITEMS
+    parser stores these as if they were tickers) rather than one of our
+    actual position or watchlist tickers.
+
+    Mirrors intraday_alert_job()'s alert_type-based routing: a macro/
+    thematic item's [💬 Discuss] button below goes to the shared MACRO
+    topic thread (cmd_macro) instead of a per-ticker thread that would
+    never resolve to a real, discussable symbol.
+    """
+    ticker = ticker.upper()
+    return ticker not in POSITIONS and ticker not in WATCHLIST
+
+
 @authorized_only
 async def send_monitoring(update, context):
     """
-    /monitoring — shows all active monitoring items across the portfolio.
+    /monitoring — shows all active monitoring items, grouped by ticker.
     /monitoring TICKER — shows items for a specific ticker.
 
-    Each item gets inline [💬 Discuss] / [✕ Dismiss] buttons so an item can
-    be cleared straight from the list — see the "dismiss_item_" branch in
-    handle_callback() — without typing /dismiss TICKER and picking through
-    a selection menu.
+    Tickers are sorted by their highest-priority item, then by recency;
+    items within a ticker are sorted the same way. Each ticker gets one
+    [💬 Discuss] / [✕ Dismiss TICKER] row (capped at 8 tickers to avoid
+    keyboard overflow) rather than a button per item — dismissing (or
+    resolving) a single item is still available via `/dismiss ID`, using
+    the ID printed under each item.
     """
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
     from equity.data.monitoring import load_monitoring
 
     ticker_filter = context.args[0].upper() if context.args else None
-    items = load_monitoring()
+    all_items = load_monitoring()
 
     if ticker_filter:
-        items = [i for i in items if i.get("ticker") == ticker_filter]
+        all_items = [i for i in all_items if i.get("ticker") == ticker_filter]
 
-    if not items:
+    if not all_items:
         msg = f'No active monitoring items{f" for {ticker_filter}" if ticker_filter else ""}.'
         await reply(update, context, msg, reply_markup=make_main_menu())
         return
 
-    # Sort by priority then age (oldest first within a priority tier).
-    priority_order = {"high": 0, "medium": 1, "low": 2}
-    items.sort(key=lambda x: (priority_order.get(x.get("priority"), 1), -x.get("age_days", 0)))
+    # Group by ticker.
+    grouped = defaultdict(list)
+    for item in all_items:
+        grouped[item["ticker"]].append(item)
 
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+
+    # Sort tickers: highest-priority tickers first, then most recent item.
+    def ticker_sort_key(ticker):
+        items = grouped[ticker]
+        top_priority = min(priority_order.get(i.get("priority", "medium"), 1) for i in items)
+        newest_age = min(i.get("age_days", 0) for i in items)
+        return (top_priority, newest_age)
+
+    sorted_tickers = sorted(grouped.keys(), key=ticker_sort_key)
+
+    lines = [f"📋 *MONITORING — {len(all_items)} items across {len(sorted_tickers)} names*", ""]
     priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-    lines = ["📋 *ACTIVE MONITORING*", ""]
-    item_buttons = []
-    for item in items:
-        emoji = priority_emoji.get(item.get("priority"), "⚪")
-        age = item.get("age_days", 0)
-        age_str = "today" if age == 0 else f"{age}d ago"
-        lines.append(f'{emoji} *{item["ticker"]}* ({age_str})\n  {item["item"]}')
+
+    for ticker in sorted_tickers:
+        items = grouped[ticker]
+        # Sort items within ticker: high priority first, then most recent.
+        items.sort(key=lambda x: (priority_order.get(x.get("priority", "medium"), 1), x.get("age_days", 0)))
+
+        is_macro = _is_macro_monitoring_item(ticker)
+        route_label = "🌍 macro" if is_macro else "📈 position"
+        lines.append(f"*{ticker}* ({route_label})")
+
+        for item in items:
+            emoji = priority_emoji.get(item.get("priority", "medium"), "⚪")
+            age = item.get("age_days", 0)
+            age_str = "today" if age == 0 else f"{age}d ago"
+            source = item.get("added_from", "").replace("_", " ")
+
+            # Truncate at a word boundary rather than mid-word.
+            item_text = item["item"]
+            if len(item_text) > 80:
+                cut = item_text[:80].rfind(" ")
+                item_text = item_text[: cut if cut > 0 else 80] + "…"
+
+            lines.append(f"  {emoji} {item_text}")
+            lines.append(f'     Added: {age_str} via {source} | ID: `{item["id"]}`')
+
         lines.append("")
-        item_buttons.append([
-            InlineKeyboardButton(f'💬 {item["ticker"]}', callback_data=f'discuss_{item["ticker"]}'),
-            InlineKeyboardButton("✕ Dismiss", callback_data=f'dismiss_item_{item["id"]}'),
-        ])
-    item_buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
+
+    lines.append("─────────────────────")
+    lines.append("`/dismiss TICKER` — dismiss all for ticker")
+    lines.append("`/dismiss ID` — dismiss one specific item (ID shown above)")
+
+    kb = _make_monitoring_action_keyboard(sorted_tickers, grouped)
 
     await send_in_parts(context.bot, update.effective_chat.id,
-                         "\n".join(lines), reply_markup=InlineKeyboardMarkup(item_buttons))
+                         "\n".join(lines), reply_markup=kb)
+
+
+def _make_monitoring_action_keyboard(sorted_tickers: list, grouped: dict):
+    """One row per ticker with [💬 Discuss] and [✕ Dismiss] buttons.
+    Capped at 8 tickers to avoid keyboard overflow.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    buttons = []
+    for ticker in sorted_tickers[:8]:
+        discuss_cb = "cmd_macro" if _is_macro_monitoring_item(ticker) else f"discuss_{ticker}"
+        buttons.append([
+            InlineKeyboardButton(f"💬 {ticker}", callback_data=discuss_cb),
+            InlineKeyboardButton(f"✕ Dismiss {ticker}", callback_data=f"dismiss_all_{ticker}"),
+        ])
+    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_main_menu")])
+    return InlineKeyboardMarkup(buttons)
 
 
 async def _send_dismiss_selection(update, context, ticker: str, items: list[dict]) -> None:
@@ -1215,6 +1297,15 @@ async def send_status(update, context):
 
     # Positions loaded
     lines.append(f"📋 Positions: {len(POSITIONS)} held | {len(WATCHLIST)} watchlist")
+
+    from equity.data.monitoring import load_monitoring
+
+    mon_items = load_monitoring()
+    if mon_items:
+        high = sum(1 for i in mon_items if i.get("priority") == "high")
+        med = sum(1 for i in mon_items if i.get("priority") == "medium")
+        lines.append(f"📋 Monitoring: {len(mon_items)} items ({high} high, {med} medium)")
+
     stale_count = sum(1 for d in price_cache.get_prices().values() if d.get("is_stale", False))
     stale_warning = f" | ⚠️ {stale_count} stale" if stale_count > 0 else ""
     lines.append(f"💹 {price_cache.coverage_report()}{stale_warning}")
@@ -1435,7 +1526,8 @@ async def send_dismiss(update, context):
     /dismiss TICKER — if exactly one monitoring item is active for the
     ticker, dismisses it directly. If multiple are active, shows a
     selection keyboard so the user can choose which one (or dismiss all).
-    Requires email 2FA since it modifies persistent state.
+    /dismiss ID — dismisses one specific item by ID (as printed by
+    /monitoring). Requires email 2FA since it modifies persistent state.
 
     Carries @register_command (like send_add/remove/update/set) because it
     goes through @require_email_auth: after the emailed code is verified,
@@ -1446,13 +1538,29 @@ async def send_dismiss(update, context):
 
     if not context.args:
         await reply(update, context,
-            "Usage: /dismiss TICKER\nExample: /dismiss TSLA\n\n"
+            "Usage: /dismiss TICKER or /dismiss ID\nExample: /dismiss TSLA\n\n"
             "Shows active monitoring items for that ticker to dismiss."
         )
         return
 
-    ticker = context.args[0].upper()
-    items = [i for i in load_monitoring() if i.get("ticker", "").upper() == ticker]
+    arg = context.args[0]
+    active = load_monitoring()
+
+    # Item IDs are lowercase "ticker_date_index" strings (see
+    # equity.data.monitoring.add_monitoring_items) and can never collide
+    # with an uppercased ticker filter, so checking for an exact ID match
+    # first is unambiguous.
+    item_by_id = next((i for i in active if i.get("id") == arg), None)
+    if item_by_id:
+        dismiss_monitoring_item(item_by_id["id"], reason="Dismissed via /dismiss command")
+        await reply(update, context,
+            f'✓ Dismissed monitoring item for {item_by_id["ticker"]}:\n_{item_by_id["item"]}_',
+            reply_markup=make_main_menu()
+        )
+        return
+
+    ticker = arg.upper()
+    items = [i for i in active if i.get("ticker", "").upper() == ticker]
 
     if not items:
         await reply(update, context,
@@ -2754,6 +2862,23 @@ async def intraday_alert_job(context) -> None:
 
         formatted_message = _format_alert_message(alert)
 
+        # Surface active high-priority monitoring items for this ticker —
+        # falls back to alert["ticker"] for alert types (news) that don't
+        # set raw_ticker, and is a harmless no-op for macro alert types
+        # whose raw_ticker is a cache-key symbol (e.g. "DX-Y.NYB") rather
+        # than a monitoring "ticker" label.
+        try:
+            from equity.data.monitoring import get_monitoring_for_ticker
+
+            mon_ticker = alert.get("raw_ticker") or ticker
+            mon_items = get_monitoring_for_ticker(mon_ticker) if mon_ticker else []
+            high_items = [m for m in mon_items if m.get("priority") == "high"]
+            if high_items:
+                mon_note = "\n".join(f'📋 {m["item"][:60]}' for m in high_items[:2])
+                formatted_message += f"\n\n*Active monitoring:*\n{mon_note}"
+        except Exception as e:
+            logger.warning(f"intraday_alert_job: monitoring lookup failed for {ticker}: {e}")
+
         try:
             await send_safe(context.bot, TELEGRAM_USER_ID,
                              f"🔔 *ALERT*\n\n{formatted_message}", reply_markup=kb)
@@ -2994,23 +3119,43 @@ if __name__ == "__main__":
     app.job_queue.run_daily(
         scheduled_morning_brief,
         time=dt.time(12, 30, 0, tzinfo=pytz.utc),
-        name="morning_brief"
+        name="morning_brief",
+        job_kwargs={
+            'misfire_grace_time': 300,  # 5 min grace, brief takes time to run
+            'max_instances': 1,
+            'coalesce': True,
+        }
     )
     app.job_queue.run_repeating(
         intraday_alert_job,
         interval=1800,   # every 30 minutes
         first=60,        # first run 60 seconds after bot starts
-        name="intraday_alerts"
+        name="intraday_alerts",
+        job_kwargs={
+            'misfire_grace_time': 120,  # tolerate up to 2 minutes late — suppresses the warning
+            'max_instances': 1,         # never run two instances simultaneously
+            'coalesce': True,           # if multiple runs were missed, only run once
+        }
     )
     app.job_queue.run_daily(
         backup_advisor_db,
         time=dt.time(2, 0, 0, tzinfo=pytz.utc),
-        name="db_backup"
+        name="db_backup",
+        job_kwargs={
+            'misfire_grace_time': 600,  # 10 min grace, low priority
+            'max_instances': 1,
+            'coalesce': True,
+        }
     )
     app.job_queue.run_daily(
         daily_thread_summarization,
         time=dt.time(3, 0, 0, tzinfo=pytz.utc),
-        name="thread_summarization"
+        name="thread_summarization",
+        job_kwargs={
+            'misfire_grace_time': 600,
+            'max_instances': 1,
+            'coalesce': True,
+        }
     )
 
     print("Portfolio Advisor bot started. Press Ctrl+C to stop.")

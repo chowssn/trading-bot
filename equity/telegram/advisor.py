@@ -256,15 +256,18 @@ class Advisor:
             from equity.data.monitoring import load_monitoring
 
             monitoring = load_monitoring()
-            if monitoring:
+            # Include high and medium — low priority items are not urgent
+            # enough to spend system-prompt space on.
+            relevant = [m for m in monitoring if m.get("priority") in ("high", "medium")][:8]
+            if relevant:
                 mon_lines = [
                     "--- ACTIVE MONITORING LIST ---",
                     "These items are being tracked across brief sessions:",
                 ]
-                for item in monitoring[:10]:  # cap at 10 for prompt size
+                for item in relevant:
                     age = item.get("age_days", 0)
                     mon_lines.append(
-                        f'  [{item["ticker"]}] {item["item"]} '
+                        f'  [{item["ticker"]}] {item["item"][:80]} '
                         f'(priority: {item.get("priority", "medium")}, age: {age}d)'
                     )
                 mon_lines.append("")
@@ -1176,6 +1179,32 @@ class Advisor:
         except Exception as exc:
             logger.warning("get_ticker_context: position context failed for %s: %s", ticker, exc)
             sections.append("--- POSITION CONTEXT ---\nPosition context unavailable.")
+
+        # ------------------------------------------------------------
+        # Section 5b — Ticker-specific monitoring items
+        # ------------------------------------------------------------
+        try:
+            from equity.data.monitoring import get_monitoring_for_ticker
+
+            ticker_monitoring = get_monitoring_for_ticker(ticker)
+            if ticker_monitoring:
+                mon_section = ["--- ACTIVE MONITORING FOR THIS TICKER ---"]
+                mon_section.append("These conditions are being tracked — check in on each:")
+                priority_label = {"high": "🔴 HIGH", "medium": "🟡 MED", "low": "🟢 LOW"}
+                for item in ticker_monitoring:
+                    age = item.get("age_days", 0)
+                    label = priority_label.get(item.get("priority", "medium"), "🟡 MED")
+                    mon_section.append(
+                        f'{label} | {item["item"]} '
+                        f'| added {age}d ago (ID: {item["id"]})'
+                    )
+                mon_section.append(
+                    "If any condition has resolved or worsened, note it explicitly. "
+                    "If resolved, suggest /dismiss."
+                )
+                sections.append("\n".join(mon_section))
+        except Exception as exc:
+            logger.warning("get_ticker_context: ticker monitoring failed for %s: %s", ticker, exc)
 
         # ------------------------------------------------------------
         # Section 6 — News headlines

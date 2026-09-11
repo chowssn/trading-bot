@@ -200,8 +200,10 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         sections.append((s1_text, None))
         all_text.append(s1_text)
 
+        monitoring_items = load_monitoring()
         s1_synth = synthesize_section(
             "global_markets", s1_text, regime_flags,
+            monitoring_items=monitoring_items,
             max_tokens=SYNTHESIS_MAX_TOKENS["global_markets"],
         )
         sections.append((f"💡 *Global Markets*\n{s1_synth}", None))
@@ -287,8 +289,10 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
             sections.append(("", screener_kb))
         all_text.append(s4_text)
 
+        monitoring_items = load_monitoring()
         s4_synth = synthesize_section(
             "news_signals", s4_text, regime_flags,
+            monitoring_items=monitoring_items,
             max_tokens=SYNTHESIS_MAX_TOKENS["news_signals"],
         )
         sections.append((f"💡 *News & Signals*\n{s4_synth}", None))
