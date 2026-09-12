@@ -39,19 +39,22 @@ SYNTHESIS_CACHE_HOURS = 6
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Per-section token budget for the 5-section brief (see
-# equity/brief/brief_builder.py's build_morning_brief()). Maxima, not
-# targets — the dense SIGNAL/POSITIONS AFFECTED/ACTION format synthesize_section()
-# and synthesize_full_brief() now use rarely needs the full budget. Replaces the
-# pre-reorg split (market_snapshot 400 + global_signals 1200 + performance 1400 +
-# full_brief 500 =~ 3500, plus a second sector/news synthesize_section() call each
-# at 400) with one call per section, totaling ~3000 tokens across a brief instead
-# of ~6100.
+# Token budgets, keyed by section name. Maxima, not targets — the dense
+# structured formats synthesize_section()/synthesize_full_brief() use rarely
+# need the full budget. `build_morning_brief()` no longer calls
+# synthesize_section() per section (see its module docstring) — those three
+# entries now only back `synthesize_global_signals()` (used by /prices) and
+# the dead `synthesize_performance()`/`_run_synthesis()` helpers.
+# `full_brief` is the one entry build_morning_brief() still uses, raised
+# from 700 to 1800 (700 -> 1200 was still getting truncated mid-response on
+# real brief data) now that the end-of-brief synthesis is the ONLY synthesis
+# call in the brief and has to cover all four sections' material plus their
+# cross-section connections.
 SYNTHESIS_MAX_TOKENS = {
     "global_markets": 800,
     "portfolio_status": 900,
     "news_signals": 600,
-    "full_brief": 700,
+    "full_brief": 1800,
 }
 
 # Pre-reorg section names that used to be synthesized separately, keyed by
@@ -713,15 +716,22 @@ def synthesize_full_brief(
     all_sections_text: str,
     regime_flags: list[str] | None = None,
     monitoring_items: list[dict] | None = None,
-    max_tokens: int = 700,
+    max_tokens: int = 1800,
 ) -> str:
-    """Closing synthesis for the full 5-section brief, same structured-density
-    format as `synthesize_section()` (see `SYNTHESIS_MAX_TOKENS`).
+    """Closing synthesis for the ENTIRE morning brief — the single AI call now
+    covering all four sections (global markets, economic calendar, portfolio
+    status, news/signals) after the per-section `synthesize_section()` calls
+    were removed from `build_morning_brief()`. Explicit section awareness in
+    the prompt below is what replaces those — this call must surface the
+    same material a section-level synthesis would have, plus the
+    cross-section connections a section-scoped call could never see.
 
     `monitoring_items` and `max_tokens` are caller-controlled — build_morning_brief()
     passes the full brief's accumulated monitoring list here since this call sees
-    the whole morning's data, not just one section's. Cached `SYNTHESIS_CACHE_HOURS`
-    hours by content hash.
+    the whole morning's data, not just one section's. `max_tokens` defaults higher
+    than the old per-section budgets (see `SYNTHESIS_MAX_TOKENS`) since this call
+    now does all the synthesis work that used to be spread across four calls.
+    Cached `SYNTHESIS_CACHE_HOURS` hours by content hash.
     """
     data_hash = hashlib.md5(all_sections_text.encode()).hexdigest()
     path = _cache_path("full_brief", data_hash)
@@ -734,10 +744,11 @@ def synthesize_full_brief(
 
     monitoring_str = ""
     if monitoring_items:
-        active = [i for i in monitoring_items if i.get("priority") in ("high", "medium")][:5]
+        active = [i for i in monitoring_items if i.get("priority") in ("high", "medium")][:8]
         if active:
             monitoring_str = "\nACTIVE MONITORING:\n" + "\n".join(
-                f'[{i["ticker"]}] {i["item"][:60]} ({i.get("age_days", 0)}d)' for i in active
+                f'[{i["ticker"]}] {i["item"][:70]} ({i.get("priority")}, {i.get("age_days", 0)}d)'
+                for i in active
             )
 
     prompt = f"""{FRAMEWORK}
@@ -746,28 +757,46 @@ Regime: {regime_str}
 {positions_ctx}
 {monitoring_str}
 
-BRIEF DATA (last 2500 chars):
-{all_sections_text[-2500:]}
+FULL BRIEF DATA (all sections):
+{all_sections_text[-4000:]}
+
+You are writing the SINGLE synthesis for the entire morning brief.
+This replaces per-section summaries — you must cover all four sections:
+global markets, economic calendar, portfolio status, and news/signals.
+Connect them. A geopolitical event in Section 1 that affects a position
+in Section 3 should be explicitly connected here.
 
 Respond in EXACTLY this format:
 
-OVERALL: [2 sentences — dominant theme and most important cross-section signal]
+OVERALL: [2 sentences — dominant theme AND the most important cross-section connection]
 
-TOP IMPLICATIONS:
-[TICKER] — [specific implication ≤12 words]
-[TICKER] — [specific implication ≤12 words]
-[TICKER] — [specific implication ≤12 words]
+GLOBAL MARKETS:
+[2-3 bullets — key macro signals and named events driving them]
+
+PORTFOLIO TODAY:
+[TICKER] [↑/↓/→] [specific reason + cross-section source] [WATCH/ACT/HOLD]
+[TICKER] [↑/↓/→] [specific reason + cross-section source] [WATCH/ACT/HOLD]
+(4-6 lines — only material impacts)
+
+CALENDAR WATCH:
+[Release/Event] [time ET] — [specific threshold that matters] — [portfolio impact]
+(1-3 lines — only releases with direct portfolio relevance)
 
 TODAY'S FOCUS:
-Position: [ticker + specific action]
-Monitor: [ticker/signal + specific condition]
+Position: [ticker + specific action + exact condition]
+Monitor: [ticker/signal + specific level or event]
 
-RISK: [1 sentence — single biggest portfolio risk right now]
+RISK: [1 sentence — single biggest portfolio risk surfaced by today's data]
 
 <<<NEW_MONITORING_ITEMS>>> (use exactly this — include underscores)
 [TICKER] | [specific measurable condition] | [high/medium/low]
-(1-3 items, or NONE)
-<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)"""
+<<<END_MONITORING_ITEMS>>> (use exactly this — include underscores)
+
+Rules:
+- Cross-section connections are the highest value output — name them explicitly
+- Every bullet must be specific (ticker, level, event name)
+- CALENDAR WATCH only if a release directly affects a held position
+- No generic observations"""
 
     try:
         r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])

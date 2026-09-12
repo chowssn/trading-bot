@@ -1,17 +1,26 @@
 """Assembles the daily morning brief from every brief/portfolio/screener module.
 
-`build_morning_brief()` assembles 5 self-contained sections — Global
-Markets, Economic Calendar, Portfolio Status, News & Signals, and a
-closing Morning Synthesis — each consolidating what used to be several
-separate sub-sections (see each `_format_sectionN_*()` below), with one
-AI synthesis call per section (`brief_synthesizer.synthesize_section()`)
-instead of one per sub-section. The economic calendar is data-only — no
-synthesis, it's self-explanatory. Returns a list of `(text, keyboard)`
-pairs rather than one big string — each pair is sent as its own Telegram
-message by `equity.telegram.bot.send_brief()`/`scheduled_morning_brief()`,
-so alert-relevant sections can carry their own action buttons (discuss a
+`build_morning_brief()` assembles 4 self-contained data sections — Global
+Markets, Economic Calendar, Portfolio Status, News & Signals (see each
+`_format_sectionN_*()` below) — plus a single closing Morning Synthesis
+that covers all four (`brief_synthesizer.synthesize_full_brief()`). This
+replaces the earlier per-section synthesis calls (one
+`synthesize_section()` call after sections 1, 3, and 4) with one AI call
+at the end of the brief — cheaper, and the only call with visibility
+across every section, so it's the one place cross-section connections
+(a geopolitical event in Section 1 moving a Section 3 position) can
+actually get made. The economic calendar is data-only either way — no
+synthesis, it's self-explanatory. A table of contents with per-section
+re-send buttons (`make_brief_toc_keyboard()`) follows the header, since
+this section list is now longer to scroll back through than the sections
+themselves.
+
+Returns a list of `(text, keyboard)` pairs rather than one big string —
+each pair is sent as its own Telegram message by
+`equity.telegram.bot.send_brief()`/`scheduled_morning_brief()`, so
+alert-relevant sections can carry their own action buttons (discuss a
 mover, read a thesis-breaking article, page through a ticker's full
-headline list).
+headline list, or re-open a section from the table of contents).
 
 Each section is wrapped independently in try/except — one broken data
 source degrades to an error placeholder for that section, never takes
@@ -42,7 +51,6 @@ from telegram import InlineKeyboardMarkup
 
 from equity.brief import earnings_monitor, eco_calendar, market_snapshot, performance_tracker, sector_monitor
 from equity.brief.brief_synthesizer import (
-    SYNTHESIS_MAX_TOKENS,
     _parse_and_persist_monitoring,
     synthesize_full_brief,
     synthesize_section,
@@ -52,7 +60,13 @@ from equity.config.market_config import REGIME_SCREENER_ADJUSTMENTS
 from equity.data.monitoring import deduplicate_monitoring, load_monitoring
 from equity.portfolio import monitor, news_triage
 from equity.screener import screener
-from equity.telegram.formatters import make_article_keyboard, make_main_menu, make_news_actions, make_tickers_keyboard
+from equity.telegram.formatters import (
+    make_article_keyboard,
+    make_brief_toc_keyboard,
+    make_main_menu,
+    make_news_actions,
+    make_tickers_keyboard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,19 +241,20 @@ def _auto_cleanup_monitoring() -> int:
 
 
 def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
-    """Assemble the 5-section morning brief as a list of (text, keyboard) message pairs.
+    """Assemble the morning brief as a list of (text, keyboard) message pairs.
 
-    Header, then:
-      1. Global Markets    — market snapshot + global signals, one synthesis
+    Header, table of contents, then:
+      1. Global Markets    — market snapshot + global signals, no per-section synthesis
       2. Economic Calendar — week view + FOMC proximity + held-position earnings, no synthesis
-      3. Portfolio Status  — monitor + benchmarks + sectors, one synthesis
-      4. News & Signals    — news triage + screener, one synthesis
-      5. Morning Synthesis — full-brief synthesis with cross-section awareness
+      3. Portfolio Status  — monitor + benchmarks + sectors, no per-section synthesis
+      4. News & Signals    — news triage + screener, no per-section synthesis
+      5. Morning Synthesis — single end-of-brief synthesis covering all four sections above
     and a footer. Each section is independently fault-tolerant: an
     exception degrades to a warning placeholder for that section only and
-    never takes down the rest of the brief. Synthesis is called once per
-    section (see `SYNTHESIS_MAX_TOKENS` for each section's token budget)
-    rather than once per sub-section, per the reorg — see module docstring.
+    never takes down the rest of the brief. Synthesis happens exactly once,
+    at the end (see `brief_synthesizer.SYNTHESIS_MAX_TOKENS["full_brief"]`
+    for its token budget) — see module docstring for why the per-section
+    calls were removed.
     """
     sections: list[tuple[str, InlineKeyboardMarkup | None]] = []
     all_text: list[str] = []
@@ -262,6 +277,16 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     # ── HEADER ──────────────────────────────────────────────────
     sections.append((format_morning_brief_header(), None))
 
+    # ── TABLE OF CONTENTS ────────────────────────────────────────
+    # Private chats can't use message links, so this is a callback-driven
+    # re-send (see equity.telegram.bot._send_brief_section()) rather than a
+    # jump-to-message.
+    toc_text = (
+        f"📋 *Morning Brief — {datetime.now().strftime('%a %b %d, %Y')}*\n"
+        f"Tap any section to view it again:"
+    )
+    sections.append((toc_text, make_brief_toc_keyboard()))
+
     # ── SECTION 1: GLOBAL MARKETS ───────────────────────────────
     # Consolidates: market snapshot (rates/FX/commodities/equity futures)
     # + global signals (volatility/crypto/international/credit/cross-asset).
@@ -273,15 +298,6 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         s1_text = _format_section1_global_markets(snapshot, global_signals)
         sections.append((s1_text, None))
         all_text.append(s1_text)
-
-        monitoring_items = load_monitoring()
-        s1_synth = synthesize_section(
-            "global_markets", s1_text, regime_flags,
-            monitoring_items=monitoring_items,
-            max_tokens=SYNTHESIS_MAX_TOKENS["global_markets"],
-        )
-        sections.append((f"💡 *Global Markets*\n{s1_synth}", None))
-        _parse_and_persist_monitoring(s1_synth, source="global_markets")
     except Exception as exc:
         logger.error("Section 1 (Global Markets) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ Global markets data unavailable: {exc}", None))
@@ -319,15 +335,6 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         s3_kb = make_tickers_keyboard(alert_tickers) if alert_tickers else None
         sections.append((s3_text, s3_kb))
         all_text.append(s3_text)
-
-        monitoring_items = load_monitoring()
-        s3_synth = synthesize_section(
-            "portfolio_status", s3_text, regime_flags,
-            monitoring_items=monitoring_items,
-            max_tokens=SYNTHESIS_MAX_TOKENS["portfolio_status"],
-        )
-        sections.append((f"💡 *Portfolio Status*\n{s3_synth}", None))
-        _parse_and_persist_monitoring(s3_synth, source="portfolio_status")
     except Exception as exc:
         logger.error("Section 3 (Portfolio Status) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ Portfolio status unavailable: {exc}", None))
@@ -362,39 +369,34 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         if screener_kb:
             sections.append(("", screener_kb))
         all_text.append(s4_text)
-
-        monitoring_items = load_monitoring()
-        s4_synth = synthesize_section(
-            "news_signals", s4_text, regime_flags,
-            monitoring_items=monitoring_items,
-            max_tokens=SYNTHESIS_MAX_TOKENS["news_signals"],
-        )
-        sections.append((f"💡 *News & Signals*\n{s4_synth}", None))
-        _parse_and_persist_monitoring(s4_synth, source="news_signals")
     except Exception as exc:
         logger.error("Section 4 (News & Signals) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ News & signals unavailable: {exc}", None))
 
     # ── SECTION 5: MORNING SYNTHESIS ────────────────────────────
+    # The only AI synthesis call in the brief — see module docstring for why
+    # the per-section calls were removed. Sees every section's text, so it's
+    # the one place cross-section connections can be made explicit.
     try:
         monitoring_items = load_monitoring()
         full_synth = synthesize_full_brief(
-            "\n\n".join(all_text), regime_flags,
+            all_sections_text="\n\n---SECTION BREAK---\n\n".join(all_text),
+            regime_flags=regime_flags,
             monitoring_items=monitoring_items,
-            max_tokens=SYNTHESIS_MAX_TOKENS["full_brief"],
+            max_tokens=1800,  # raised from 1200 — that still truncated on real brief data
         )
         sections.append((
             f"{_DIVIDER_HEAVY}\n🎯 MORNING SYNTHESIS\n{_DIVIDER_HEAVY}\n{full_synth}",
-            None,
+            make_main_menu(),
         ))
         _parse_and_persist_monitoring(full_synth, source="full_brief")
     except Exception as exc:
         logger.error("Section 5 (Morning Synthesis) FAILED: %s", exc, exc_info=True)
-        sections.append((f"⚠️ Morning synthesis unavailable: {exc}", None))
+        sections.append((f"⚠️ Morning synthesis unavailable: {exc}", make_main_menu()))
 
     # Footer
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    sections.append((f"Generated {ts}", make_main_menu()))
+    sections.append((f"Generated {ts}", None))
 
     return [s for s in sections if s[0] or s[1]]
 
@@ -405,10 +407,11 @@ def save_brief_to_thread(sections: list[tuple[str, "InlineKeyboardMarkup | None"
     This is what lets `Advisor._get_cross_thread_context()` (see
     equity.telegram.advisor) surface the morning brief in every
     conversation — ticker, macro, portfolio, general — not just a
-    `/discuss` about the brief itself. Only the 💡-prefixed per-section
-    syntheses and the final 🎯 full-brief synthesis are saved; the raw
-    data sections (screener output, eco calendar, etc.) are already
-    available live elsewhere and would just bloat this thread's history.
+    `/discuss` about the brief itself. Only the 🎯 full-brief synthesis is
+    saved (there's no longer a per-section 💡 synthesis to also match — see
+    module docstring); the raw data sections (screener output, eco
+    calendar, etc.) are already available live elsewhere and would just
+    bloat this thread's history.
 
     Content always starts with "Morning Brief — <date>" — the advisor
     relies on that exact prefix to find the actual brief save even if the
