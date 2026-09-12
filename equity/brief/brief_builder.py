@@ -1,19 +1,28 @@
 """Assembles the daily morning brief from every brief/portfolio/screener module.
 
-`build_morning_brief()` assembles 4 self-contained data sections — Global
-Markets, Economic Calendar, Portfolio Status, News & Signals (see each
-`_format_sectionN_*()` below) — plus a single closing Morning Synthesis
-that covers all four (`brief_synthesizer.synthesize_full_brief()`). This
-replaces the earlier per-section synthesis calls (one
-`synthesize_section()` call after sections 1, 3, and 4) with one AI call
-at the end of the brief — cheaper, and the only call with visibility
-across every section, so it's the one place cross-section connections
-(a geopolitical event in Section 1 moving a Section 3 position) can
-actually get made. The economic calendar is data-only either way — no
-synthesis, it's self-explanatory. A table of contents with per-section
-re-send buttons (`make_brief_toc_keyboard()`) follows the header, since
-this section list is now longer to scroll back through than the sections
-themselves.
+`build_morning_brief()` assembles 4 self-contained quantitative data
+sections — Global Markets, Economic Calendar, Portfolio Status, News &
+Signals (see each `_format_sectionN_*()` below) — followed by the
+web-searched Macro Intelligence narrative layer, then a single closing
+Morning Synthesis that covers everything above it
+(`brief_synthesizer.synthesize_full_brief()`). This replaces the earlier
+per-section synthesis calls (one `synthesize_section()` call after
+sections 1, 3, and 4) with one AI call at the end of the brief — cheaper,
+and the only call with visibility across every section, so it's the one
+place cross-section connections (a geopolitical event moving a Section 3
+position) can actually get made. The economic calendar is data-only — no
+synthesis, it's self-explanatory.
+
+Macro Intelligence sits *after* the four quantitative sections and
+*before* the synthesis (not inside Section 1, and not first) for two
+reasons: Section 1 (Global Markets) should be pure quantitative data — a
+web-search/Claude outage shouldn't cost it anything — and the synthesis
+call needs the narrative layer in its input, so it has to run and be
+appended to `all_text` before `synthesize_full_brief()` is called. A
+table of contents with per-section re-send buttons
+(`make_brief_toc_keyboard()`) runs right before the footer, after
+synthesis — by the time a reader taps it, every section (including the
+synthesis) already exists to jump back to.
 
 Returns a list of `(text, keyboard)` pairs rather than one big string —
 each pair is sent as its own Telegram message by
@@ -122,36 +131,23 @@ def _fetch_performance_data() -> tuple[dict, dict, dict, dict]:
 
 
 def _format_section1_global_markets(snapshot: dict, global_signals: dict) -> str:
-    """Combines market_snapshot + global_signals into Section 1, plus the
-    web-searched macro intelligence narrative layer (geopolitical/central
-    bank/economic release/overnight session/analyst action context).
+    """Combines market_snapshot + global_signals into Section 1 — quantitative
+    data only (rates, FX, commodities, futures, vol, crypto, international).
 
-    `fetch_macro_intelligence()` is isolated in its own try/except here,
-    separate from build_morning_brief()'s outer per-section try/except —
-    a web-search or Claude outage should cost the brief its narrative
-    overlay, not the quantitative snapshot underneath it. The macro intel
-    block is appended *after* the quantitative data (not before it) so
-    `synthesize_section()`'s `section_data[:...]` truncation, if it has to
-    cut anything, cuts the newer narrative addition rather than the
-    numbers the SIGNAL/POSITIONS AFFECTED synthesis actually depends on.
+    The web-searched macro intelligence narrative layer used to be appended
+    here; it's now its own section near the end of the brief (see
+    `build_morning_brief()`) so a web-search/Claude outage never costs
+    Section 1 anything, and so the synthesis call — which needs the intel
+    layer in its input — sees it as part of `all_text` regardless of
+    whether Section 1 itself succeeded.
     """
-    intel_text = ""
-    try:
-        intel = market_snapshot.fetch_macro_intelligence(regime_flags=snapshot.get("regime_flags", []))
-        intel_text = market_snapshot.format_macro_intelligence(intel)
-    except Exception:
-        logger.exception("Section 1: fetch_macro_intelligence failed — continuing without it")
-
-    parts = [
+    return "\n".join([
         "🌍 GLOBAL MARKETS",
         _DIVIDER_LIGHT,
         market_snapshot.format_market_snapshot(snapshot),
         "",
         market_snapshot.format_global_signals(global_signals),
-    ]
-    if intel_text:
-        parts.extend(["", intel_text])
-    return "\n".join(parts)
+    ])
 
 
 def _format_section2_eco_calendar(cal: dict, earnings: dict) -> str:
@@ -243,18 +239,20 @@ def _auto_cleanup_monitoring() -> int:
 def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
     """Assemble the morning brief as a list of (text, keyboard) message pairs.
 
-    Header, table of contents, then:
-      1. Global Markets    — market snapshot + global signals, no per-section synthesis
+    Header, then:
+      1. Global Markets    — market snapshot + global signals ONLY, no per-section synthesis
       2. Economic Calendar — week view + FOMC proximity + held-position earnings, no synthesis
       3. Portfolio Status  — monitor + benchmarks + sectors, no per-section synthesis
       4. News & Signals    — news triage + screener, no per-section synthesis
-      5. Morning Synthesis — single end-of-brief synthesis covering all four sections above
+      5. Macro Intelligence — web-searched narrative layer (moved out of Section 1)
+      6. Morning Synthesis — single end-of-brief synthesis covering everything above
+      7. Table of contents — per-section re-send buttons, now that every section exists
     and a footer. Each section is independently fault-tolerant: an
     exception degrades to a warning placeholder for that section only and
     never takes down the rest of the brief. Synthesis happens exactly once,
     at the end (see `brief_synthesizer.SYNTHESIS_MAX_TOKENS["full_brief"]`
     for its token budget) — see module docstring for why the per-section
-    calls were removed.
+    calls were removed and why macro intelligence sits where it does.
     """
     sections: list[tuple[str, InlineKeyboardMarkup | None]] = []
     all_text: list[str] = []
@@ -275,17 +273,9 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         logger.exception("Morning brief: monitoring housekeeping failed — continuing with brief")
 
     # ── HEADER ──────────────────────────────────────────────────
+    # No TOC yet — it moves to just before the footer (see below), once
+    # every section (including the synthesis) actually exists to jump to.
     sections.append((format_morning_brief_header(), None))
-
-    # ── TABLE OF CONTENTS ────────────────────────────────────────
-    # Private chats can't use message links, so this is a callback-driven
-    # re-send (see equity.telegram.bot._send_brief_section()) rather than a
-    # jump-to-message.
-    toc_text = (
-        f"📋 *Morning Brief — {datetime.now().strftime('%a %b %d, %Y')}*\n"
-        f"Tap any section to view it again:"
-    )
-    sections.append((toc_text, make_brief_toc_keyboard()))
 
     # ── SECTION 1: GLOBAL MARKETS ───────────────────────────────
     # Consolidates: market snapshot (rates/FX/commodities/equity futures)
@@ -373,7 +363,23 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         logger.error("Section 4 (News & Signals) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ News & signals unavailable: {exc}", None))
 
-    # ── SECTION 5: MORNING SYNTHESIS ────────────────────────────
+    # ── SECTION 5: MACRO INTELLIGENCE ───────────────────────────
+    # Web-searched narrative layer (geopolitical/central bank/economic
+    # release/overnight session/analyst action context) — placed here,
+    # after the quantitative sections and before synthesis, so a
+    # web-search/Claude outage costs the brief only this section (not
+    # Section 1), and so synthesize_full_brief() below still sees it via
+    # all_text regardless of which earlier sections succeeded.
+    try:
+        intel = market_snapshot.fetch_macro_intelligence(regime_flags=regime_flags)
+        intel_text = market_snapshot.format_macro_intelligence(intel)
+        if intel_text:
+            sections.append((intel_text, None))
+            all_text.append(intel_text)
+    except Exception:
+        logger.exception("Section 5 (Macro Intelligence) FAILED — continuing without it")
+
+    # ── SECTION 6: MORNING SYNTHESIS ────────────────────────────
     # The only AI synthesis call in the brief — see module docstring for why
     # the per-section calls were removed. Sees every section's text, so it's
     # the one place cross-section connections can be made explicit.
@@ -391,8 +397,19 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         ))
         _parse_and_persist_monitoring(full_synth, source="full_brief")
     except Exception as exc:
-        logger.error("Section 5 (Morning Synthesis) FAILED: %s", exc, exc_info=True)
+        logger.error("Section 6 (Morning Synthesis) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ Morning synthesis unavailable: {exc}", make_main_menu()))
+
+    # ── TABLE OF CONTENTS ────────────────────────────────────────
+    # Moved to just before the footer — by now every section, including
+    # the synthesis, actually exists to jump back to. Private chats can't
+    # use message links, so this is a callback-driven re-send (see
+    # equity.telegram.bot._send_brief_section()) rather than a jump-to-message.
+    toc_text = (
+        f"📋 *Morning Brief — {datetime.now().strftime('%a %b %d, %Y')}*\n"
+        f"Tap any section to view it again:"
+    )
+    sections.append((toc_text, make_brief_toc_keyboard()))
 
     # Footer
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")

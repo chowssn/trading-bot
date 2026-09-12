@@ -93,6 +93,7 @@ from equity.telegram.auth import AuthManager
 from equity.telegram.formatters import (
     format_headline_page,
     format_thread_list,
+    make_brief_toc_keyboard,
     make_confirm_cancel,
     make_discuss_menu,
     make_headline_page_keyboard,
@@ -103,6 +104,7 @@ from equity.telegram.formatters import (
     make_suggestions_keyboard,
     make_thread_list_keyboard,
     make_ticker_actions,
+    make_tickers_keyboard,
     send_in_parts,
     send_safe,
 )
@@ -532,6 +534,94 @@ async def send_brief(update, context):
         if text and text.strip():
             await send_safe(context.bot, chat_id, text, reply_markup=keyboard)
             await asyncio.sleep(0.3)
+
+
+async def _send_brief_section(update, context, section_name: str) -> None:
+    """Re-fetches and sends a single brief section on demand.
+
+    Triggered by a table-of-contents button (`make_brief_toc_keyboard()`)
+    on an already-sent brief — faster than re-running the whole brief via
+    `send_brief()`, since it only redoes the one section's fetch/format
+    work. Uses the same `_format_sectionN_*()` formatters `build_morning_brief()`
+    uses, so a re-sent section reads identically to the original.
+    """
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        if section_name == "global":
+            from equity.brief.brief_builder import _format_section1_global_markets
+            from equity.brief.market_snapshot import fetch_global_signals, fetch_market_snapshot
+
+            snapshot = await run_in_executor(fetch_market_snapshot)
+            signals = await run_in_executor(fetch_global_signals)
+            text = _format_section1_global_markets(snapshot, signals)
+            await send_safe(context.bot, chat_id, text, reply_markup=make_brief_toc_keyboard())
+
+        elif section_name == "calendar":
+            from equity.brief.brief_builder import _format_section2_eco_calendar
+            from equity.brief.earnings_monitor import fetch_earnings_calendar
+            from equity.brief.eco_calendar import fetch_eco_calendar
+
+            cal = await run_in_executor(fetch_eco_calendar, 7)
+            earnings = await run_in_executor(fetch_earnings_calendar, 14)
+            text = _format_section2_eco_calendar(cal, earnings)
+            await send_safe(context.bot, chat_id, text, reply_markup=make_brief_toc_keyboard())
+
+        elif section_name == "portfolio":
+            from equity.brief.brief_builder import _fetch_performance_data, _format_section3_portfolio_status
+            from equity.brief.sector_monitor import fetch_sector_data
+            from equity.portfolio.monitor import run_portfolio_monitor
+
+            monitor_data = await run_in_executor(run_portfolio_monitor)
+            perf_bundle = await run_in_executor(_fetch_performance_data)
+            sector_data = await run_in_executor(fetch_sector_data)
+            text = _format_section3_portfolio_status(monitor_data, *perf_bundle, sector_data)
+            alert_tickers = [
+                t for t, d in monitor_data.get("positions", {}).items()
+                if d.get("move_flag") in ("LARGE_UP", "LARGE_DOWN")
+            ]
+            kb = make_tickers_keyboard(alert_tickers) if alert_tickers else make_brief_toc_keyboard()
+            await send_safe(context.bot, chat_id, text, reply_markup=kb)
+
+        elif section_name == "news":
+            from equity.brief.brief_builder import _format_section4_news_signals
+            from equity.config.positions import POSITIONS, WATCHLIST
+            from equity.portfolio.news_triage import run_news_triage
+            from equity.screener.screener import run_screener
+
+            all_tickers = list(POSITIONS.keys()) + list(WATCHLIST.keys())
+            triage = await run_in_executor(run_news_triage, all_tickers)
+            df = await run_in_executor(run_screener)
+            text = _format_section4_news_signals(triage, df)
+            await send_safe(context.bot, chat_id, text, reply_markup=make_brief_toc_keyboard())
+
+        elif section_name == "synthesis":
+            # Re-send the most recent full brief synthesis from the saved brief.
+            synthesis = get_last_brief_synthesis(thread_manager)
+            if synthesis:
+                text = (
+                    "════════════════════════════════\n"
+                    "🎯 MORNING SYNTHESIS\n"
+                    "════════════════════════════════\n"
+                    f"{synthesis[1]}"
+                )
+                await send_safe(context.bot, chat_id, text, reply_markup=make_brief_toc_keyboard())
+            else:
+                await reply(update, context,
+                    "No synthesis available. Run /brief to generate one.",
+                    reply_markup=make_brief_toc_keyboard())
+
+        else:
+            await reply(update, context,
+                f"Unknown brief section: {section_name}",
+                reply_markup=make_brief_toc_keyboard())
+
+    except Exception as e:
+        logger.error("_send_brief_section(%s) failed: %s", section_name, e, exc_info=True)
+        await reply(update, context,
+            f"⚠️ Could not load {section_name} section: {e}",
+            reply_markup=make_brief_toc_keyboard())
 
 
 @authorized_only
@@ -1791,6 +1881,9 @@ async def handle_callback(update, context):
         text = format_headline_page(ticker, all_headlines, page, NEWS_HEADLINE_PAGE_SIZE)
         kb = make_headline_page_keyboard(ticker, page, len(all_headlines), NEWS_HEADLINE_PAGE_SIZE)
         await send_safe(context.bot, chat_id, text, reply_markup=kb)
+    elif data.startswith("brief_section_"):
+        section_name = data[len("brief_section_"):]
+        await _send_brief_section(update, context, section_name)
     elif data == "noop":
         pass
     elif data.startswith("suggest_"):

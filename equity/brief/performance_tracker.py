@@ -63,6 +63,7 @@ from equity.config.market_config import (
     SILVER_GOLD_RATIO_RISK_ON_THRESHOLD,
     SLV_SI_DIVERGENCE_ALERT_PCT,
 )
+from equity.data.price_cache import price_cache
 from equity.data.yfinance_utils import yf_download
 
 logger = logging.getLogger(__name__)
@@ -277,6 +278,38 @@ def _write_benchmark_cache(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# price_cache freshness overlay
+# ---------------------------------------------------------------------------
+
+def _overlay_price_cache_freshness(price_entries: dict) -> None:
+    """Refreshes `price`/`change_1d_pct` on each entry of a `{ticker: {...}}`
+    dict from the shared `price_cache`, in place, when that ticker is in
+    its coverage (sector/benchmark/factor ETFs, positions — see
+    price_cache.py's docstring).
+
+    The yfinance batches in this module (`fetch_benchmark_performance()`,
+    `fetch_position_relative_performance()`) are deliberately kept for
+    their 3Y/5Y CAGR and SMA/5Y-extreme history — price_cache only ever
+    keeps the latest 2 closes, not enough for either (see price_cache.py's
+    "What this cache doesn't replace"). But those batches are cached for
+    BENCHMARK_CACHE_HOURS (1h), while price_cache refreshes every 15
+    minutes during market hours — without this overlay, the same ticker's
+    1D change can silently disagree between this section and Section 1's
+    Global Signals (which reads price_cache directly) within the same
+    brief. Only the "as of right now" fields move; CAGR/MA flags stay
+    computed from the historical batch untouched. Never raises: a ticker
+    price_cache doesn't have keeps its batch-derived value.
+    """
+    for ticker, entry in price_entries.items():
+        cached = price_cache.get(ticker)
+        if not cached or cached.get("price") is None:
+            continue
+        entry["price"] = cached["price"]
+        if cached.get("change_1d_pct") is not None:
+            entry["change_1d_pct"] = cached["change_1d_pct"]
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -298,6 +331,7 @@ def fetch_benchmark_performance() -> dict:
     """
     cached = _load_benchmark_cache()
     if cached is not None:
+        _overlay_price_cache_freshness(cached.get("benchmarks", {}))
         return cached
 
     data_warnings: list[str] = []
@@ -386,6 +420,11 @@ def fetch_benchmark_performance() -> dict:
         "data_warnings": data_warnings,
     }
     _write_benchmark_cache(result)
+    # Overlay applied after the disk write — the cache should keep the
+    # batch-derived numbers so a same-hour cache-hit read still overlays
+    # fresh from price_cache at that read's own time, rather than freezing
+    # in whatever price_cache happened to hold at this fetch's moment.
+    _overlay_price_cache_freshness(result.get("benchmarks", {}))
     return result
 
 
@@ -460,6 +499,12 @@ def fetch_position_relative_performance(benchmark_data: dict | None = None) -> d
             continue
         position_change_1d_pct = _pct_change(close, -2)
         position_flags = compute_ma_flags(close, float(close.iloc[-1]))
+
+        # Freshen 1D change from price_cache — see _overlay_price_cache_freshness()
+        # docstring. Every POSITIONS ticker is in price_cache's coverage.
+        cached_pos = price_cache.get(ticker)
+        if cached_pos and cached_pos.get("change_1d_pct") is not None:
+            position_change_1d_pct = cached_pos["change_1d_pct"]
 
         sector_entry = benchmarks.get(sector_etf)
         if sector_entry is None or sector_entry.get("change_1d_pct") is None:

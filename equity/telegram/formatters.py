@@ -270,6 +270,29 @@ def make_tickers_keyboard(tickers: list[str], label: str = "Discuss") -> InlineK
     return InlineKeyboardMarkup(buttons)
 
 
+def make_brief_toc_keyboard() -> InlineKeyboardMarkup:
+    """Table of contents keyboard for morning brief.
+
+    Each button re-sends that section when tapped (see
+    `equity.telegram.bot._send_brief_section()`) — private chats can't use
+    message links, so this is a callback-driven re-send rather than a jump.
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌍 Global Markets", callback_data="brief_section_global"),
+            InlineKeyboardButton("📅 Calendar", callback_data="brief_section_calendar"),
+        ],
+        [
+            InlineKeyboardButton("💼 Portfolio", callback_data="brief_section_portfolio"),
+            InlineKeyboardButton("📰 News & Signals", callback_data="brief_section_news"),
+        ],
+        [
+            InlineKeyboardButton("🎯 Synthesis", callback_data="brief_section_synthesis"),
+            InlineKeyboardButton("🌅 Full Brief", callback_data="cmd_brief"),
+        ],
+    ])
+
+
 def make_article_keyboard(articles: list[dict]) -> InlineKeyboardMarkup:
     """Read/Discuss button pair for up to 3 thesis-alert articles (each `{'url', 'ticker'}`)."""
     buttons = []

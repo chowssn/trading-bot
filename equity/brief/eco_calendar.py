@@ -33,6 +33,30 @@ today/tomorrow view:
 Every threshold and lookup table here is imported from
 `equity.config.market_config` — nothing FOMC- or release-related is
 hardcoded in this module.
+
+Each entry also carries a `portfolio_impact` note (`_RELEASE_CONTEXT`/
+`_FOMC_CONTEXT`): a short, well-established market-convention description
+of what the release measures and its general rates/risk read-through,
+plus whichever currently-held `positions.POSITIONS` tickers sit in a
+sector that release typically moves (`POSITION_SECTOR_MAP`, filtered live
+— never a fixed ticker list, so it can't drift stale as the portfolio
+changes). This is deliberately NOT scenario-specific numeric thresholds
+or a consensus estimate — there's no free, reliable consensus-estimate
+feed wired up (FRED's release-dates endpoint carries dates only, not
+survey consensus), so `consensus` is intentionally absent from every
+event rather than populated with a fabricated number; `prior_value` (a
+real FRED series read) is the only forward-looking-adjacent figure shown.
+
+FOMC meetings are folded into `by_day` as their own HIGH-importance entry
+(`_fomc_release_entries()`), reusing `fetch_fomc_dates()`'s already-
+verified (scraped + cached + fallback) dates — not a second, independently
+maintained hardcoded FOMC date list, which is exactly how two sources of
+truth for the same dates drift apart and disagree. BOJ/ECB meeting dates
+are intentionally not added here for the same reason: this module has no
+scraped/verified source for them (unlike the Fed's own published
+calendar) — Section 5 (Macro Intelligence)'s web-searched "central_banks"
+search covers that ground with a live, sourced answer instead of a
+hardcoded date list this module can't verify.
 """
 
 import json
@@ -55,8 +79,10 @@ from equity.config.market_config import (
     FOMC_PROXIMITY_DAYS,
     IMPORTANT_RELEASES,
     KNOWN_RELEASE_TIMES,
+    POSITION_SECTOR_MAP,
     RELEASE_DATA_SERIES,
 )
+from equity.config.positions import POSITIONS
 
 load_dotenv()
 
@@ -91,6 +117,113 @@ _MONTHS = {
 }
 _FOMC_YEAR_HEADER_RE = re.compile(r"^(\d{4})\s+FOMC Meetings$")
 _FOMC_DAY_RE = re.compile(r"(\d{1,2})(?:-(\d{1,2}))?")
+
+# ---------------------------------------------------------------------------
+# Actionable context — "what does this release mean and which of my
+# actual positions is it relevant to." Deliberately NOT scenario-specific
+# numeric thresholds or fabricated tickers: each note is a short,
+# well-established market-convention description of what the release
+# measures and its general rates/risk read-through, and the position list
+# is computed live from `equity.config.positions.POSITIONS` +
+# `market_config.POSITION_SECTOR_MAP` — never a hardcoded ticker list —
+# so it always reflects whatever is actually held, not a snapshot that
+# goes stale the moment the portfolio changes.
+# ---------------------------------------------------------------------------
+
+# display_name (IMPORTANT_RELEASES key) -> (context note, impact area).
+_RELEASE_CONTEXT: dict[str, tuple[str, str]] = {
+    "Consumer Price Index": (
+        "Core inflation read. A cooler-than-prior print typically supports Fed "
+        "rate-cut odds (duration-sensitive names tend to benefit); a hotter print "
+        "typically does the opposite.",
+        "rates",
+    ),
+    "Producer Price Index": (
+        "Upstream/wholesale inflation — often leads CPI by 1-2 months.",
+        "rates",
+    ),
+    "Employment Situation": (
+        "Payrolls + unemployment rate + wage growth. A strong report tends to push "
+        "yields up (pressuring duration-sensitive names); a weak report tends to do "
+        "the opposite.",
+        "rates",
+    ),
+    "Gross Domestic Product": (
+        "Broad growth read. A below-consensus print is typically read as risk-off "
+        "for cyclicals.",
+        "cyclicals",
+    ),
+    "Personal Income and Outlays": (
+        "Includes the PCE deflator — the Fed's preferred inflation gauge.",
+        "rates",
+    ),
+    "Retail Sales": (
+        "Consumer spending health — read-through for consumer discretionary/comm names.",
+        "consumer",
+    ),
+    "Industrial Production and Capacity Utilization": (
+        "Factory-sector output — read-through for industrials/materials names.",
+        "industrials",
+    ),
+    "Housing Starts": (
+        "New residential construction — rate-sensitive, a leading housing indicator.",
+        "rates",
+    ),
+    "Consumer Sentiment": (
+        "Forward-looking consumer confidence/inflation-expectations read.",
+        "consumer",
+    ),
+    "Job Openings and Labor Turnover Survey": (
+        "Labor demand/quits — a secondary labor-market read alongside NFP.",
+        "rates",
+    ),
+    "ISM Manufacturing PMI": (
+        "Manufacturing-sector diffusion index — above 50 signals expansion.",
+        "industrials",
+    ),
+    "ISM Services PMI": (
+        "Services-sector diffusion index — above 50 signals expansion.",
+        "consumer",
+    ),
+}
+
+_FOMC_CONTEXT = (
+    "Fed rate decision + press conference. A hold or cut is typically supportive "
+    "for duration-sensitive positions; a hawkish surprise typically pressures them.",
+    "rates",
+)
+
+# impact area -> POSITION_SECTOR_MAP sector ETFs it's most relevant to.
+# Used only to *filter* currently-held POSITIONS down to the ones worth
+# flagging for a given release — never to introduce a ticker that isn't
+# already a real position.
+_IMPACT_AREA_SECTOR_ETFS: dict[str, set[str]] = {
+    "rates": {"XLK", "XLC", "XLY"},  # duration-sensitive growth sectors
+    "cyclicals": {"XLI", "XLB", "XLF"},
+    "consumer": {"XLY", "XLC"},
+    "industrials": {"XLI", "XLB"},
+}
+
+
+def _held_positions_for_impact_area(area: str) -> list[str]:
+    """Currently-held POSITIONS tickers relevant to `area`, computed live
+    from POSITION_SECTOR_MAP so this never goes stale as the portfolio
+    changes. TLT (the bond ETF position itself) is always included for
+    'rates' — it has no POSITION_SECTOR_MAP entry since it isn't mapped to
+    a sector ETF, it IS the rate-sensitive instrument.
+    """
+    sector_etfs = _IMPACT_AREA_SECTOR_ETFS.get(area, set())
+    held = {t for t, etf in POSITION_SECTOR_MAP.items() if etf in sector_etfs and t in POSITIONS}
+    if area == "rates" and "TLT" in POSITIONS:
+        held.add("TLT")
+    return sorted(held)
+
+
+def _build_portfolio_impact(note: str, area: str) -> str:
+    held = _held_positions_for_impact_area(area)
+    if held:
+        return f"{note} Held positions in scope: {', '.join(held)}."
+    return note
 
 
 # ---------------------------------------------------------------------------
@@ -340,13 +473,45 @@ def _fetch_prior_value(series_id: str | None, warnings: list[str]) -> float | No
 
 def _enrich_release(release: dict, warnings: list[str]) -> dict:
     display_name = release["display_name"]
-    return {
+    enriched = {
         "event": release["event"],
         "importance": release["importance"],
         "source": release["source"],
         "release_time": KNOWN_RELEASE_TIMES.get(display_name, "TBD"),
         "prior_value": _fetch_prior_value(RELEASE_DATA_SERIES.get(display_name), warnings),
     }
+    context = _RELEASE_CONTEXT.get(display_name)
+    if context is not None:
+        note, area = context
+        enriched["portfolio_impact"] = _build_portfolio_impact(note, area)
+    return enriched
+
+
+def _fomc_release_entries(fomc_dates: list[str], today: date, window_end: date) -> list[tuple[str, dict]]:
+    """FOMC meetings falling in [today, window_end] as (date_str, release_dict)
+    pairs, in the same shape `_enrich_release()` produces — so they merge
+    into `by_day` alongside FRED releases. Uses `fetch_fomc_dates()`'s
+    already-verified (scraped + cached + fallback) dates rather than a
+    second, independently-maintained hardcoded date list — two sources of
+    truth for the same meeting dates is how they drift apart and disagree.
+    """
+    note, area = _FOMC_CONTEXT
+    entries = []
+    for d in fomc_dates:
+        try:
+            meeting_date = date.fromisoformat(d)
+        except ValueError:
+            continue
+        if today <= meeting_date <= window_end:
+            entries.append((d, {
+                "event": "FOMC Rate Decision",
+                "importance": "HIGH",
+                "source": "Federal Reserve",
+                "release_time": "2:00 PM ET (press conf. 2:30 PM ET)",
+                "prior_value": None,
+                "portfolio_impact": _build_portfolio_impact(note, area),
+            }))
+    return entries
 
 
 def fetch_eco_calendar(days_ahead: int = 7) -> dict:
@@ -369,6 +534,15 @@ def fetch_eco_calendar(days_ahead: int = 7) -> dict:
         by_day.setdefault(r["date"], []).append(_enrich_release(r, warnings))
 
     fomc_dates = fetch_fomc_dates()
+
+    # FOMC isn't a FRED release (it's not in IMPORTANT_RELEASES/the FRED
+    # release-dates feed at all), so without this it only ever surfaced as
+    # the `fomc_note` aside below — and only within FOMC_PROXIMITY_DAYS (2)
+    # of the meeting. A meeting later in the window would otherwise be
+    # invisible to this calendar entirely.
+    for d, entry in _fomc_release_entries(fomc_dates, today, window_end):
+        by_day.setdefault(d, []).append(entry)
+
     fomc_proximity, fomc_days_away, fomc_note = _fomc_proximity(fomc_dates, today)
 
     staleness_warning = _fomc_staleness_warning(fomc_dates, today)
@@ -414,6 +588,8 @@ def format_eco_calendar(cal: dict) -> str:
             lines.append(day_label)
             for r in by_day[day_str]:
                 lines.append(f"  {r['event']} ({r['importance']})  {r['release_time']}  Prior: {_format_prior(r['prior_value'])}")
+                if r.get("portfolio_impact"):
+                    lines.append(f"    → {r['portfolio_impact']}")
             lines.append("")
 
     if cal.get("fomc_proximity") and cal.get("fomc_note"):

@@ -1165,8 +1165,25 @@ def _macro_intel_budget_ok() -> bool:
 
 def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int = 400) -> str:
     """One web search + grounded-extraction pass. Never raises — returns
-    '' on any failure (no client configured, search error, empty result)
-    so one search failing doesn't take the others down with it.
+    '' on any failure (no client configured, search error, empty result,
+    or a low-quality/non-answer extraction) so one search failing doesn't
+    take the others down with it.
+
+    The first call's `web_search_tool_result` blocks carry actual search
+    hits, but each hit's `content` is a `web_search_result` object whose
+    only text-bearing field is `encrypted_content` — an opaque, non-human-
+    readable blob meant to be round-tripped back to the API, not read
+    locally. There is no separate plaintext snippet to pull out of those
+    blocks. What IS readable and genuinely grounded in the search (as
+    opposed to Claude's own recall) is the response's `text` blocks plus
+    each block's `citations` — structured `title`/`url` pairs tying a
+    specific claim back to a specific search hit. The previous version
+    joined only the text blocks and dropped `citations` entirely, so the
+    extraction pass below was told to "include the source name for each
+    fact" with no actual source list to draw from — it could only guess
+    or invent a plausible-sounding outlet. Passing the citation list
+    through explicitly, and instructing the extraction to cite only from
+    it, closes that gap.
     """
     client = _get_macro_intel_client()
     if client is None:
@@ -1178,9 +1195,28 @@ def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int =
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": query}],
         )
-        raw_text = "\n".join(b.text for b in raw.content if hasattr(b, "text") and b.text).strip()
+
+        narrative_parts = []
+        seen_citations: set[tuple[str, str]] = set()
+        citation_lines = []
+        for block in raw.content:
+            if not (hasattr(block, "text") and block.text):
+                continue
+            narrative_parts.append(block.text)
+            for citation in getattr(block, "citations", None) or []:
+                title = getattr(citation, "title", None) or "untitled"
+                url = getattr(citation, "url", None) or ""
+                key = (title, url)
+                if key in seen_citations:
+                    continue
+                seen_citations.add(key)
+                citation_lines.append(f"- {title} ({url})" if url else f"- {title}")
+
+        raw_text = "\n".join(narrative_parts).strip()
         if not raw_text:
             return ""
+        if citation_lines:
+            raw_text += "\n\nSources actually cited by the search:\n" + "\n".join(citation_lines)
 
         extraction = client.messages.create(
             model=_MACRO_INTEL_MODEL,
@@ -1190,12 +1226,31 @@ def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int =
                 "content": (
                     f"{extract_prompt}\n\nSource:\n{raw_text}\n\n"
                     f'Rules: Only state facts in source. If absent write "not found". '
-                    f"Include source name for each fact."
+                    f"For each fact, name the source ONLY if it appears in the "
+                    f"'Sources actually cited by the search' list above — never invent "
+                    f"or infer a publication name that isn't in that list; omit the "
+                    f"source name for a fact if none of the listed sources back it."
                 ),
             }],
         )
         text_parts = [b.text for b in extraction.content if hasattr(b, "text") and b.text]
-        return "\n".join(text_parts).strip()
+        result = "\n".join(text_parts).strip()
+
+        # Quality gate — an extraction that found nothing real should omit
+        # the section entirely rather than render as a populated-looking
+        # "no qualifying events found" block. _is_not_found_placeholder()
+        # (used downstream by format_macro_intelligence()) already catches
+        # the short single-field "not found" case; this catches the
+        # longer non-answers models write instead of a bare refusal.
+        lowered = result.lower()
+        no_data_markers = ("no relevant results", "no qualifying", "cannot verify", "no information found", "none found")
+        if not result:
+            return ""
+        if len(result) < 200 and any(marker in lowered for marker in no_data_markers):
+            return ""
+        if lowered.startswith("i cannot") or lowered.startswith("i need to flag"):
+            return ""
+        return result
     except Exception as exc:
         logger.warning("fetch_macro_intelligence search failed: %s", exc)
         return ""
