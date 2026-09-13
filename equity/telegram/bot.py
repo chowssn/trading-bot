@@ -49,7 +49,7 @@ from equity.brief.brief_builder import (
     save_brief_to_thread,
 )
 from equity.brief.earnings_monitor import fetch_earnings_calendar
-from equity.brief.eco_calendar import fetch_eco_calendar
+from equity.brief.eco_calendar import _build_portfolio_impact, _fetch_fmp_eco_calendar, _RELEASE_CONTEXT, fetch_eco_calendar
 from equity.brief.market_snapshot import _get_market_session_status, fetch_market_snapshot
 from equity.brief.performance_tracker import (
     fetch_benchmark_performance,
@@ -3004,6 +3004,111 @@ async def intraday_alert_job(context) -> None:
             logger.error(f"intraday_alert_job: failed to send alert for {ticker}: {e}")
 
 
+ECO_RELEASE_SURPRISE_THRESHOLD_PCT = 10.0  # relative miss/beat vs consensus flagged as a surprise
+
+
+def _eco_release_surprise_label(actual, consensus) -> str:
+    """'' unless `actual`/`consensus` are both parseable numbers that
+    diverge by at least ECO_RELEASE_SURPRISE_THRESHOLD_PCT (relative) or
+    0.1 (absolute, for small figures like a rate where the relative move
+    can look huge off a near-zero consensus). Strips a trailing %/K/M/B —
+    FMP's actual/consensus fields come back as plain numbers or short
+    strings like '215K' depending on the series.
+    """
+    if actual is None or consensus is None:
+        return ""
+    try:
+        act_val = float(str(actual).rstrip("%KMB"))
+        con_val = float(str(consensus).rstrip("%KMB"))
+    except (ValueError, TypeError):
+        return ""
+    diff = act_val - con_val
+    diff_pct = abs(diff / con_val * 100) if con_val else 0.0
+    if diff_pct < ECO_RELEASE_SURPRISE_THRESHOLD_PCT and abs(diff) < 0.1:
+        return ""
+    return f"🟢 BEAT +{diff:.2f}" if diff > 0 else f"🔴 MISS {diff:.2f}"
+
+
+async def eco_release_alert_job(context) -> None:
+    """Runs every 5 minutes, 6am-4pm ET on weekdays — wider than
+    `_get_market_hours_now()`'s 9:30am-4pm equity session because
+    releases like CPI/NFP/retail sales post pre-market (typically
+    8:30am ET).
+
+    Depends entirely on `_fetch_fmp_eco_calendar()` (see eco_calendar.py)
+    returning `actual` values, which requires an FMP plan with
+    economic-calendar access — the configured key currently gets HTTP 402
+    on that endpoint (see that module's docstring), so this job runs on
+    schedule but finds nothing every cycle until the plan is upgraded.
+    Wired up now rather than left unbuilt so upgrading the plan alone
+    makes alerts start firing, no code change required.
+
+    Dedup reuses `_alerted_today` (eco_ prefix) — same shared dict and
+    daily-rollover reset every other alert type in this module uses,
+    rather than a second single-purpose set.
+    """
+    import pytz
+
+    if time.time() - _BOT_START_TIME < ALERT_STARTUP_GRACE_SECONDS:
+        return
+
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    if now_et.weekday() >= 5 or not (6 <= now_et.hour < 16):
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _alerted_today.get("_date") != today:
+        _alerted_today.clear()
+        _alerted_today["_date"] = today
+
+    try:
+        from datetime import date as date_cls
+        events = await run_in_executor(_fetch_fmp_eco_calendar, date_cls.today(), date_cls.today())
+    except Exception as e:
+        logger.warning(f"eco_release_alert_job: fetch failed: {e}")
+        return
+
+    for event in events:
+        actual = event.get("actual")
+        if actual is None:
+            continue
+
+        alert_key = f"eco_{event['display_name']}_{event['date']}"
+        if alert_key in _alerted_today:
+            continue
+
+        consensus = event.get("consensus")
+        name = event["display_name"]
+        surprise = _eco_release_surprise_label(actual, consensus)
+
+        lines = ["🚨 *ECONOMIC RELEASE*" if surprise else "📊 *ECONOMIC RELEASE*", f"*{name}*", ""]
+        lines.append(f"Actual: *{actual}*")
+        if consensus is not None:
+            lines.append(f"Consensus: {consensus}")
+        if surprise:
+            lines.append(f"Surprise: {surprise}")
+
+        context_pair = _RELEASE_CONTEXT.get(name)
+        if context_pair is not None:
+            note, area = context_pair
+            lines.append("")
+            lines.append(f"📋 *Portfolio impact:*\n{_build_portfolio_impact(note, area)}")
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Discuss Macro", callback_data="cmd_macro"),
+            InlineKeyboardButton("📊 /prices", callback_data="cmd_prices"),
+        ]])
+
+        try:
+            await send_safe(context.bot, TELEGRAM_USER_ID, "\n".join(lines), reply_markup=kb)
+            _alerted_today[alert_key] = True
+            _record_alert({"ticker": "MACRO", "type": "eco_release", "message": f"{name}: actual {actual}"})
+            logger.info(f"eco_release_alert_job: sent alert for {name} (surprise={bool(surprise)})")
+        except Exception as e:
+            logger.error(f"eco_release_alert_job: failed to send alert for {name}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # advisor.db backup
 # ---------------------------------------------------------------------------
@@ -3250,6 +3355,17 @@ if __name__ == "__main__":
             'misfire_grace_time': 120,  # tolerate up to 2 minutes late — suppresses the warning
             'max_instances': 1,         # never run two instances simultaneously
             'coalesce': True,           # if multiple runs were missed, only run once
+        }
+    )
+    app.job_queue.run_repeating(
+        eco_release_alert_job,
+        interval=300,    # every 5 minutes
+        first=90,
+        name="eco_release_alerts",
+        job_kwargs={
+            'misfire_grace_time': 60,
+            'max_instances': 1,
+            'coalesce': True,
         }
     )
     app.job_queue.run_daily(

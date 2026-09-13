@@ -40,12 +40,24 @@ of what the release measures and its general rates/risk read-through,
 plus whichever currently-held `positions.POSITIONS` tickers sit in a
 sector that release typically moves (`POSITION_SECTOR_MAP`, filtered live
 — never a fixed ticker list, so it can't drift stale as the portfolio
-changes). This is deliberately NOT scenario-specific numeric thresholds
-or a consensus estimate — there's no free, reliable consensus-estimate
-feed wired up (FRED's release-dates endpoint carries dates only, not
-survey consensus), so `consensus` is intentionally absent from every
-event rather than populated with a fabricated number; `prior_value` (a
-real FRED series read) is the only forward-looking-adjacent figure shown.
+changes). This is deliberately NOT scenario-specific numeric thresholds;
+`prior_value` (a real FRED series read) was, until now, the only
+forward-looking-adjacent figure shown, because FRED's release-dates
+endpoint carries dates only, not survey consensus and there was no other
+free, reliable consensus-estimate feed wired up.
+
+`consensus`/`actual` (`_fetch_fmp_eco_calendar()`) is a third, optional
+source layered on top of the two above: FMP's economic-calendar endpoint,
+matched onto the FRED-sourced releases by event name (`_FMP_EVENT_NAME_MAP`)
+and date. As of 2026-09-13 the configured `FMP_API_KEY` gets HTTP 402
+("Restricted Endpoint... upgrade your plan") on this endpoint, so it
+always returns `[]` right now and every event's `consensus`/`actual`
+stays `None` — the calendar behaves exactly as before. It's wired up
+(rather than left unbuilt) so upgrading the FMP plan alone makes
+consensus/actual start populating, no code change required. The event-name
+substrings in `_FMP_EVENT_NAME_MAP` are FMP's documented/conventional
+wording — unverified against a live response since the endpoint isn't
+reachable on the current plan; confirm and adjust once Pro access exists.
 
 FOMC meetings are folded into `by_day` as their own HIGH-importance entry
 (`_fomc_release_entries()`), reusing `fetch_fomc_dates()`'s already-
@@ -90,6 +102,8 @@ logger = logging.getLogger(__name__)
 
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 FRED_RELEASES_URL = "https://api.stlouisfed.org/fred/releases/dates"
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+FMP_ECO_CALENDAR_URL = "https://financialmodelingprep.com/stable/economic-calendar"
 REQUEST_TIMEOUT_SECONDS = 15
 _DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -192,6 +206,27 @@ _FOMC_CONTEXT = (
     "for duration-sensitive positions; a hawkish surprise typically pressures them.",
     "rates",
 )
+
+# IMPORTANT_RELEASES display_name -> substrings expected in FMP's `event`
+# field, lowercased. Best-effort / unverified — see module docstring's
+# consensus/actual paragraph for why this can't be confirmed against a
+# live response right now. Only releases with an entry here can ever get
+# consensus/actual populated; anything else falls back to FRED-only
+# exactly as before FMP was added.
+_FMP_EVENT_NAME_MAP: dict[str, tuple[str, ...]] = {
+    "Consumer Price Index": ("cpi",),
+    "Producer Price Index": ("ppi", "producer price"),
+    "Employment Situation": ("nonfarm payrolls", "unemployment rate"),
+    "Gross Domestic Product": ("gdp",),
+    "Personal Income and Outlays": ("pce",),
+    "Retail Sales": ("retail sales",),
+    "Industrial Production and Capacity Utilization": ("industrial production",),
+    "Housing Starts": ("housing starts",),
+    "Consumer Sentiment": ("michigan consumer sentiment", "consumer sentiment"),
+    "Job Openings and Labor Turnover Survey": ("jolts",),
+    "ISM Manufacturing PMI": ("ism manufacturing",),
+    "ISM Services PMI": ("ism non-manufacturing", "ism services"),
+}
 
 # impact area -> POSITION_SECTOR_MAP sector ETFs it's most relevant to.
 # Used only to *filter* currently-held POSITIONS down to the ones worth
@@ -471,7 +506,64 @@ def _fetch_prior_value(series_id: str | None, warnings: list[str]) -> float | No
     return float(series.iloc[-2]) if len(series) >= 2 else None
 
 
-def _enrich_release(release: dict, warnings: list[str]) -> dict:
+def _match_fmp_event(event_name: str) -> str | None:
+    """The IMPORTANT_RELEASES display_name `event_name` (an FMP `event`
+    field) matches via `_FMP_EVENT_NAME_MAP`, or None for anything not in
+    that map — FMP's calendar carries far more (and noisier) events than
+    IMPORTANT_RELEASES tracks.
+    """
+    name_lower = event_name.lower()
+    for display_name, substrings in _FMP_EVENT_NAME_MAP.items():
+        if any(s in name_lower for s in substrings):
+            return display_name
+    return None
+
+
+def _fetch_fmp_eco_calendar(start: date, end: date) -> list[dict]:
+    """FMP's economic calendar, filtered/normalized to the subset that
+    matches an IMPORTANT_RELEASES entry — the consensus/actual layer
+    described in the module docstring.
+
+    Never raises: no API key, an HTTP error (402 included — see module
+    docstring), or malformed JSON all just log and return `[]`, same as a
+    FRED fetch failure degrades only that one release rather than the
+    whole calendar.
+    """
+    if not FMP_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            FMP_ECO_CALENDAR_URL,
+            params={"from": start.isoformat(), "to": end.isoformat(), "apikey": FMP_API_KEY},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.info("FMP eco calendar unavailable (%s) — falling back to FRED-only calendar", exc)
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    events = []
+    for item in data:
+        display_name = _match_fmp_event(item.get("event", ""))
+        if display_name is None:
+            continue
+        event_date = (item.get("date") or "")[:10]
+        if not event_date:
+            continue
+        events.append({
+            "display_name": display_name,
+            "date": event_date,
+            "actual": item.get("actual"),
+            "consensus": item.get("estimate") if item.get("estimate") is not None else item.get("consensus"),
+        })
+    return events
+
+
+def _enrich_release(release: dict, warnings: list[str], fmp_lookup: dict[tuple[str, str], dict] | None = None) -> dict:
     display_name = release["display_name"]
     enriched = {
         "event": release["event"],
@@ -479,7 +571,13 @@ def _enrich_release(release: dict, warnings: list[str]) -> dict:
         "source": release["source"],
         "release_time": KNOWN_RELEASE_TIMES.get(display_name, "TBD"),
         "prior_value": _fetch_prior_value(RELEASE_DATA_SERIES.get(display_name), warnings),
+        "consensus": None,
+        "actual": None,
     }
+    fmp_entry = (fmp_lookup or {}).get((display_name, release["date"]))
+    if fmp_entry:
+        enriched["consensus"] = fmp_entry.get("consensus")
+        enriched["actual"] = fmp_entry.get("actual")
     context = _RELEASE_CONTEXT.get(display_name)
     if context is not None:
         note, area = context
@@ -529,9 +627,12 @@ def fetch_eco_calendar(days_ahead: int = 7) -> dict:
 
     releases = _fetch_fred_release_dates(today, window_end)
 
+    fmp_events = _fetch_fmp_eco_calendar(today, window_end)
+    fmp_lookup = {(e["display_name"], e["date"]): e for e in fmp_events}
+
     by_day: dict[str, list[dict]] = {}
     for r in sorted(releases, key=lambda r: r["date"]):
-        by_day.setdefault(r["date"], []).append(_enrich_release(r, warnings))
+        by_day.setdefault(r["date"], []).append(_enrich_release(r, warnings, fmp_lookup))
 
     fomc_dates = fetch_fomc_dates()
 
@@ -566,6 +667,20 @@ def _format_prior(value: float | None) -> str:
     return f"{value:,.1f}"
 
 
+def _format_consensus_actual(release: dict) -> str:
+    """'  Consensus: X  Actual: Y' for whichever of the two are present
+    (see FMP consensus/actual in the module docstring), or '' when
+    neither is set — which is the case for every release until the FMP
+    plan is upgraded, so this is a no-op appended to the existing line.
+    """
+    parts = []
+    if release.get("consensus") is not None:
+        parts.append(f"Consensus: {release['consensus']}")
+    if release.get("actual") is not None:
+        parts.append(f"Actual: {release['actual']}")
+    return ("  " + "  ".join(parts)) if parts else ""
+
+
 def format_eco_calendar(cal: dict) -> str:
     """Render `fetch_eco_calendar()`'s output dict as a Telegram-ready string, grouped by day."""
     try:
@@ -587,7 +702,10 @@ def format_eco_calendar(cal: dict) -> str:
                 day_label = day_str
             lines.append(day_label)
             for r in by_day[day_str]:
-                lines.append(f"  {r['event']} ({r['importance']})  {r['release_time']}  Prior: {_format_prior(r['prior_value'])}")
+                lines.append(
+                    f"  {r['event']} ({r['importance']})  {r['release_time']}  "
+                    f"Prior: {_format_prior(r['prior_value'])}{_format_consensus_actual(r)}"
+                )
                 if r.get("portfolio_impact"):
                     lines.append(f"    → {r['portfolio_impact']}")
             lines.append("")
