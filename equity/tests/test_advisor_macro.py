@@ -5,8 +5,15 @@
 get_live_macro_snapshot() reads the shared `equity.data.price_cache`
 singleton — these tests patch its `get`/`get_yield` methods rather than
 hitting real yfinance/FRED.
+
+TestGetMacroContext covers get_macro_context() (the web-searched fiscal/
+monetary baseline for MACRO thread discussions) — patching
+Advisor._web_search_and_extract() rather than the Anthropic client itself,
+since that method (shared with _fetch_web_fundamentals()) is already
+responsible for the actual search/extract/failure-handling mechanics.
 """
 
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -88,6 +95,61 @@ class TestMacroProxyTickers(unittest.TestCase):
     def test_excludes_ordinary_equity_positions(self):
         self.assertNotIn("AAPL", advisor_module.MACRO_PROXY_TICKERS)
         self.assertNotIn("MSFT", advisor_module.MACRO_PROXY_TICKERS)
+
+
+class TestGetMacroContext(unittest.TestCase):
+    def test_runs_two_baseline_searches_and_combines_results(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", side_effect=["fiscal figures", "fed figures"]) as mock_search:
+            result = adv.get_macro_context()
+        self.assertEqual(mock_search.call_count, 2)
+        self.assertIn("fiscal figures", result)
+        self.assertIn("fed figures", result)
+        self.assertIn("CURRENT MACRO DATA", result)
+
+    def test_topic_over_three_chars_adds_third_search(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="figures") as mock_search:
+            adv.get_macro_context(topic="unemployment rate")
+        self.assertEqual(mock_search.call_count, 3)
+
+    def test_short_topic_does_not_add_third_search(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="figures") as mock_search:
+            adv.get_macro_context(topic="cpi")
+        self.assertEqual(mock_search.call_count, 2)
+
+    def test_caches_within_ttl(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="figures"):
+            first = adv.get_macro_context()
+        with patch.object(Advisor, "_web_search_and_extract", side_effect=AssertionError("should be cached")):
+            second = adv.get_macro_context()
+        self.assertEqual(first, second)
+
+    def test_different_topics_cache_separately(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="A"):
+            adv.get_macro_context(topic="cpi data")
+        with patch.object(Advisor, "_web_search_and_extract", return_value="B"):
+            result = adv.get_macro_context(topic="fed funds rate")
+        self.assertIn("B", result)
+
+    def test_returns_empty_string_when_all_searches_fail(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value=""):
+            self.assertEqual(adv.get_macro_context(), "")
+
+    def test_never_raises_on_search_exception(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", side_effect=Exception("boom")):
+            self.assertEqual(adv.get_macro_context(), "")
+
+    def test_respects_shared_web_fundamentals_budget(self):
+        adv = _make_advisor()
+        adv._web_fundamentals_call_times = [time.time()] * advisor_module.WEB_FUNDAMENTALS_MAX_PER_HOUR
+        with patch.object(Advisor, "_web_search_and_extract", side_effect=AssertionError("budget exhausted — should not search")):
+            self.assertEqual(adv.get_macro_context(), "")
 
 
 class TestOtherThreadDepth(unittest.TestCase):

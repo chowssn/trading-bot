@@ -99,6 +99,11 @@ def _is_valid_ticker(ticker: str) -> bool:
         return False
     return ticker.upper() not in NON_TICKER_SUBJECTS
 
+# get_macro_context()'s TTL — same cadence as market_snapshot's
+# fetch_macro_intelligence() (MACRO_INTEL_CACHE_HOURS), so both macro
+# surfaces (brief + MACRO thread) refresh on a comparable schedule.
+_MACRO_CONTEXT_TTL_SECONDS = 21600  # 6 hours
+
 # Same idea for _get_cross_thread_context() — it queries SQLite (thread
 # list + brief thread messages) but threads don't change that frequently
 # mid-conversation. Keyed by current_thread_id since "other active
@@ -170,7 +175,20 @@ A wrong number is worse than no number — it leads to bad decisions.
 Ticker context sections labeled "searched this session" (web search) are
 current as of this discussion. Anything else — including your own training
 data — is NOT current for company-specific figures and must not be cited
-as if it were."""
+as if it were.
+
+MACRO STATISTICS — never state from training data:
+  - US national debt, annual deficit, debt/GDP ratio
+  - Fed funds rate (check context — do not assume it's unchanged)
+  - Fed balance sheet size
+  - Unemployment rate, CPI, PCE (use the most recent release in context)
+  - Any figure you would describe as "current" or "latest"
+
+When asked about a current macro statistic and no web-searched figure is
+in your context, say explicitly:
+  "My training data shows [X] as of [date], but this changes frequently —
+   check Treasury.gov / Fed.gov / BLS.gov for the current figure."
+Never present a training-data figure as current fact."""
 
 
 class Advisor:
@@ -183,8 +201,12 @@ class Advisor:
         # this is UX polish, not state that needs to survive a restart.
         self._suggestion_history: dict[str, list[str]] = {}
         # Rolling timestamps of _fetch_web_fundamentals() batches, for
-        # _web_fundamentals_budget_ok()'s hourly cap.
+        # _web_fundamentals_budget_ok()'s hourly cap. get_macro_context()
+        # shares this same budget/counter rather than a second one — see
+        # that method's docstring.
         self._web_fundamentals_call_times: list[float] = []
+        # get_macro_context()'s cache: {topic_key: (text, fetched_at)}.
+        self._macro_ctx_cache: dict[str, tuple[str, float]] = {}
 
     # ------------------------------------------------------------------
     # System prompt construction
@@ -251,6 +273,20 @@ class Advisor:
                 sections.append(macro_snapshot)
         except Exception as exc:
             logger.warning("build_system_prompt: macro snapshot failed: %s", exc)
+
+        # Web-searched fiscal/monetary baseline — only for the MACRO topic
+        # thread, where discussion is likely to touch statistics (debt,
+        # Fed funds rate, ...) that change too often to trust from
+        # training data. Other thread types skip this: it's an extra
+        # ~2 search-and-extract round trips, not worth paying on every
+        # message in an unrelated ticker/portfolio thread.
+        if current_thread_id and "MACRO" in current_thread_id.upper():
+            try:
+                macro_ctx = self.get_macro_context()
+                if macro_ctx:
+                    sections.append(macro_ctx)
+            except Exception as exc:
+                logger.warning("build_system_prompt: macro context failed: %s", exc)
 
         try:
             from equity.data.monitoring import load_monitoring
@@ -402,6 +438,105 @@ class Advisor:
             lines.append(f"Vol regime: VIX {vix['price']:.1f} | VVIX {vvix_val:.1f} → {vol_regime}")
 
         return "\n".join(lines)
+
+    def get_macro_context(self, topic: str = "") -> str:
+        """Web-searched fiscal/monetary baseline for MACRO thread discussions.
+
+        `get_live_macro_snapshot()` covers yields/FX/commodities (numeric,
+        price_cache-backed); this covers the slower-moving fiscal/monetary
+        statistics that price_cache has no series for at all and that a
+        model's training data goes stale on within weeks (national debt,
+        deficit, Fed funds rate, balance sheet size) — the MACRO STATISTICS
+        section of _DATA_INTEGRITY_RULES tells the model not to state these
+        from training data, so this is what fills the gap instead.
+
+        Runs two searches unconditionally (US fiscal position; Fed/
+        monetary) plus a third if `topic` is a real string (len > 3) —
+        e.g. a specific question worth its own targeted search beyond the
+        fixed baseline. Reuses `_web_search_and_extract()` (search +
+        grounded-extraction pass) and `_web_fundamentals_budget_ok()`
+        (shared hourly cap) rather than a new client or a second rate
+        limiter — see those methods.
+
+        Cached _MACRO_CONTEXT_TTL_SECONDS (6h) per topic, in-instance
+        (there's exactly one Advisor instance in bot.py, so this behaves
+        like a module-level cache in practice — see _macro_ctx_cache).
+        Never raises: any failure returns '' so a macro-context miss
+        never blocks the system prompt.
+        """
+        now = time.time()
+        cache_key = topic[:20]
+        cached = self._macro_ctx_cache.get(cache_key)
+        if cached is not None and now - cached[1] < _MACRO_CONTEXT_TTL_SECONDS:
+            return cached[0]
+
+        if not self._web_fundamentals_budget_ok():
+            logger.warning(
+                "get_macro_context: hourly web-search budget (%d/hr) exhausted — skipping",
+                WEB_FUNDAMENTALS_MAX_PER_HOUR,
+            )
+            return ""
+
+        # query, extract_prompt, max_tokens — one entry per search.
+        searches: list[tuple[str, str, int]] = [
+            (
+                "US national debt total current federal budget deficit "
+                "debt to GDP ratio federal interest expense",
+                "Extract current US fiscal figures from the source:\n"
+                "- Total national debt (exact figure, with as-of date)\n"
+                "- Most recent annual federal deficit\n"
+                "- Debt/GDP ratio\n"
+                "- Annual federal interest expense\n"
+                "One fact per line, with source and date. Only state figures "
+                'explicitly in the source; if a figure is absent, write "not found".',
+                300,
+            ),
+            (
+                "Federal Reserve balance sheet size current Fed funds rate "
+                "target range last FOMC decision next FOMC meeting date",
+                "Extract current Fed/monetary figures from the source:\n"
+                "- Fed funds rate (current target range)\n"
+                "- Fed balance sheet size\n"
+                "- Last FOMC decision and its date\n"
+                "- Next scheduled FOMC meeting date\n"
+                "One fact per line, with source and date. Only state figures "
+                'in the source; if absent, write "not found".',
+                300,
+            ),
+        ]
+        if topic and len(topic) > 3:
+            searches.append((
+                f"{topic} current data statistics figures",
+                f'Extract current figures about "{topic}" from the source:\n'
+                f"Give specific numbers with dates and sources. Only state what "
+                f'is explicitly in the search results; if not found, write "not found".',
+                300,
+            ))
+
+        results = []
+        with ThreadPoolExecutor(max_workers=len(searches)) as pool:
+            futures = [pool.submit(self._web_search_and_extract, q, p, mt) for q, p, mt in searches]
+            for future in as_completed(futures):
+                try:
+                    text = future.result()
+                except Exception as exc:
+                    logger.warning("get_macro_context: search failed: %s", exc)
+                    text = ""
+                if text:
+                    results.append(text)
+
+        if not results:
+            return ""
+
+        result = (
+            "--- CURRENT MACRO DATA (web-searched this session) ---\n"
+            "Use these figures, not training data, for anything they cover. "
+            "For a current statistic not covered here, follow the MACRO "
+            "STATISTICS rule above rather than stating a training-data figure.\n\n"
+            + "\n\n".join(results)
+        )
+        self._macro_ctx_cache[cache_key] = (result, now)
+        return result
 
     def _build_full_portfolio_context(self) -> str:
         """Cached wrapper around `_build_full_portfolio_context_uncached()`.
