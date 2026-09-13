@@ -98,26 +98,39 @@ class TestMacroProxyTickers(unittest.TestCase):
 
 
 class TestGetMacroContext(unittest.TestCase):
-    def test_runs_two_baseline_searches_and_combines_results(self):
+    # get_macro_context() calls the module-level _is_major_release_day()
+    # before every cache check, which (unmocked) would hit fetch_eco_calendar
+    # -> real FRED/FMP network calls. Patch it to a deterministic False for
+    # every test here except the ones that specifically exercise it, so this
+    # stays a hermetic unit test of get_macro_context() itself.
+    def setUp(self):
+        self._release_day_patch = patch.object(advisor_module, "_is_major_release_day", return_value=False)
+        self._release_day_patch.start()
+
+    def tearDown(self):
+        self._release_day_patch.stop()
+
+    def test_runs_three_baseline_searches_and_combines_results(self):
         adv = _make_advisor()
-        with patch.object(Advisor, "_web_search_and_extract", side_effect=["fiscal figures", "fed figures"]) as mock_search:
+        with patch.object(Advisor, "_web_search_and_extract", side_effect=["fiscal figures", "cpi figures", "fed figures"]) as mock_search:
             result = adv.get_macro_context()
-        self.assertEqual(mock_search.call_count, 2)
+        self.assertEqual(mock_search.call_count, 3)
         self.assertIn("fiscal figures", result)
+        self.assertIn("cpi figures", result)
         self.assertIn("fed figures", result)
         self.assertIn("CURRENT MACRO DATA", result)
 
-    def test_topic_over_three_chars_adds_third_search(self):
+    def test_topic_over_three_chars_adds_fourth_search(self):
         adv = _make_advisor()
         with patch.object(Advisor, "_web_search_and_extract", return_value="figures") as mock_search:
             adv.get_macro_context(topic="unemployment rate")
-        self.assertEqual(mock_search.call_count, 3)
+        self.assertEqual(mock_search.call_count, 4)
 
-    def test_short_topic_does_not_add_third_search(self):
+    def test_short_topic_does_not_add_fourth_search(self):
         adv = _make_advisor()
         with patch.object(Advisor, "_web_search_and_extract", return_value="figures") as mock_search:
             adv.get_macro_context(topic="cpi")
-        self.assertEqual(mock_search.call_count, 2)
+        self.assertEqual(mock_search.call_count, 3)
 
     def test_caches_within_ttl(self):
         adv = _make_advisor()
@@ -126,6 +139,25 @@ class TestGetMacroContext(unittest.TestCase):
         with patch.object(Advisor, "_web_search_and_extract", side_effect=AssertionError("should be cached")):
             second = adv.get_macro_context()
         self.assertEqual(first, second)
+
+    def test_release_day_shortens_ttl_past_baseline_but_within_release_ttl(self):
+        adv = _make_advisor()
+        cache_key = ""
+        with patch.object(Advisor, "_web_search_and_extract", return_value="figures"):
+            adv.get_macro_context()
+        # Age the cache entry past the release-day TTL (30min) but still
+        # inside the normal 6h TTL, then flip to a major-release day —
+        # the shorter TTL should force a re-fetch rather than serving stale.
+        text, fetched_at = adv._macro_ctx_cache[cache_key]
+        adv._macro_ctx_cache[cache_key] = (
+            text,
+            fetched_at - advisor_module._MACRO_CONTEXT_RELEASE_DAY_TTL_SECONDS - 1,
+        )
+        with patch.object(advisor_module, "_is_major_release_day", return_value=True), \
+             patch.object(Advisor, "_web_search_and_extract", return_value="fresh figures") as mock_search:
+            second = adv.get_macro_context()
+        self.assertEqual(mock_search.call_count, 3)
+        self.assertIn("fresh figures", second)
 
     def test_different_topics_cache_separately(self):
         adv = _make_advisor()
@@ -150,6 +182,38 @@ class TestGetMacroContext(unittest.TestCase):
         adv._web_fundamentals_call_times = [time.time()] * advisor_module.WEB_FUNDAMENTALS_MAX_PER_HOUR
         with patch.object(Advisor, "_web_search_and_extract", side_effect=AssertionError("budget exhausted — should not search")):
             self.assertEqual(adv.get_macro_context(), "")
+
+
+class TestIsMajorReleaseDay(unittest.TestCase):
+    # _is_major_release_day() imports fetch_eco_calendar() locally inside
+    # the function body, so it must be patched at its source module
+    # (equity.brief.eco_calendar), not on advisor_module.
+    def test_true_when_today_has_a_high_importance_event(self):
+        today_str = advisor_module.date.today().isoformat()
+        fake_cal = {"by_day": {today_str: [{"event": "CPI", "importance": "HIGH"}]}}
+        with patch("equity.brief.eco_calendar.fetch_eco_calendar", return_value=fake_cal):
+            self.assertTrue(advisor_module._is_major_release_day())
+
+    def test_false_when_today_only_has_low_importance_events(self):
+        today_str = advisor_module.date.today().isoformat()
+        fake_cal = {"by_day": {today_str: [{"event": "Housing Starts", "importance": "LOW"}]}}
+        with patch("equity.brief.eco_calendar.fetch_eco_calendar", return_value=fake_cal):
+            self.assertFalse(advisor_module._is_major_release_day())
+
+    def test_false_when_today_has_no_events(self):
+        with patch("equity.brief.eco_calendar.fetch_eco_calendar", return_value={"by_day": {}}):
+            self.assertFalse(advisor_module._is_major_release_day())
+
+    def test_ignores_high_importance_events_on_other_days(self):
+        # by_day can include tomorrow (days_ahead=0 still windows through
+        # tomorrow) — a HIGH event there must not count as "today".
+        fake_cal = {"by_day": {"2099-01-01": [{"event": "FOMC", "importance": "HIGH"}]}}
+        with patch("equity.brief.eco_calendar.fetch_eco_calendar", return_value=fake_cal):
+            self.assertFalse(advisor_module._is_major_release_day())
+
+    def test_never_raises_on_failure(self):
+        with patch("equity.brief.eco_calendar.fetch_eco_calendar", side_effect=Exception("FRED down")):
+            self.assertFalse(advisor_module._is_major_release_day())
 
 
 class TestOtherThreadDepth(unittest.TestCase):

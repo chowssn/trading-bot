@@ -12,6 +12,7 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 
 import anthropic
 import pandas as pd
@@ -103,6 +104,33 @@ def _is_valid_ticker(ticker: str) -> bool:
 # fetch_macro_intelligence() (MACRO_INTEL_CACHE_HOURS), so both macro
 # surfaces (brief + MACRO thread) refresh on a comparable schedule.
 _MACRO_CONTEXT_TTL_SECONDS = 21600  # 6 hours
+
+# Shorter TTL on days with a HIGH-importance scheduled release (CPI, FOMC,
+# NFP, etc. — see eco_calendar.py) since the fiscal/monetary figures this
+# caches can move within hours of one of those, not the usual 6h cadence.
+_MACRO_CONTEXT_RELEASE_DAY_TTL_SECONDS = 1800  # 30 minutes
+
+
+def _is_major_release_day() -> bool:
+    """True if today has a HIGH-importance scheduled release (FRED/FOMC).
+
+    Used by get_macro_context() to shorten its cache TTL on release days.
+    `fetch_eco_calendar()` groups events under `by_day` keyed by ISO date
+    string (there is no top-level `events` key), so today's entries are
+    `by_day[<today's date>]`; `days_ahead=0` still returns a window through
+    tomorrow (see fetch_eco_calendar's `max(days_ahead, 1)`), so today's
+    key is looked up explicitly rather than assuming it's the only one.
+    Never raises: any failure (FRED_API_KEY unset, network) is treated as
+    "no major release" rather than blocking the cache-freshness check.
+    """
+    from equity.brief.eco_calendar import fetch_eco_calendar
+
+    try:
+        cal = fetch_eco_calendar(days_ahead=0)
+        today_events = cal.get("by_day", {}).get(date.today().isoformat(), [])
+        return any(e.get("importance") == "HIGH" for e in today_events)
+    except Exception:
+        return False
 
 # Same idea for _get_cross_thread_context() — it queries SQLite (thread
 # list + brief thread messages) but threads don't change that frequently
@@ -450,24 +478,32 @@ class Advisor:
         section of _DATA_INTEGRITY_RULES tells the model not to state these
         from training data, so this is what fills the gap instead.
 
-        Runs two searches unconditionally (US fiscal position; Fed/
-        monetary) plus a third if `topic` is a real string (len > 3) —
-        e.g. a specific question worth its own targeted search beyond the
-        fixed baseline. Reuses `_web_search_and_extract()` (search +
+        Runs three searches unconditionally (US fiscal position, targeted
+        at authoritative sources; latest CPI; Fed/monetary, also targeted)
+        plus a fourth if `topic` is a real string (len > 3) — e.g. a
+        specific question worth its own targeted search beyond the fixed
+        baseline. Reuses `_web_search_and_extract()` (search +
         grounded-extraction pass) and `_web_fundamentals_budget_ok()`
         (shared hourly cap) rather than a new client or a second rate
         limiter — see those methods.
 
         Cached _MACRO_CONTEXT_TTL_SECONDS (6h) per topic, in-instance
         (there's exactly one Advisor instance in bot.py, so this behaves
-        like a module-level cache in practice — see _macro_ctx_cache).
-        Never raises: any failure returns '' so a macro-context miss
-        never blocks the system prompt.
+        like a module-level cache in practice — see _macro_ctx_cache) —
+        shortened to _MACRO_CONTEXT_RELEASE_DAY_TTL_SECONDS (30min) on a
+        day with a HIGH-importance scheduled release, since these figures
+        can move within hours of one of those. Never raises: any failure
+        returns '' so a macro-context miss never blocks the system prompt.
         """
         now = time.time()
         cache_key = topic[:20]
         cached = self._macro_ctx_cache.get(cache_key)
-        if cached is not None and now - cached[1] < _MACRO_CONTEXT_TTL_SECONDS:
+        cache_ttl = (
+            _MACRO_CONTEXT_RELEASE_DAY_TTL_SECONDS
+            if _is_major_release_day()
+            else _MACRO_CONTEXT_TTL_SECONDS
+        )
+        if cached is not None and now - cached[1] < cache_ttl:
             return cached[0]
 
         if not self._web_fundamentals_budget_ok():
@@ -477,11 +513,13 @@ class Advisor:
             )
             return ""
 
+        current_month = datetime.now().strftime("%B %Y")
+
         # query, extract_prompt, max_tokens — one entry per search.
         searches: list[tuple[str, str, int]] = [
             (
-                "US national debt total current federal budget deficit "
-                "debt to GDP ratio federal interest expense",
+                "site:fiscaldata.treasury.gov OR site:cbo.gov OR site:bls.gov "
+                "US national debt total deficit 2026 current",
                 "Extract current US fiscal figures from the source:\n"
                 "- Total national debt (exact figure, with as-of date)\n"
                 "- Most recent annual federal deficit\n"
@@ -492,8 +530,19 @@ class Advisor:
                 300,
             ),
             (
-                "Federal Reserve balance sheet size current Fed funds rate "
-                "target range last FOMC decision next FOMC meeting date",
+                f"CPI inflation {current_month} actual result BLS consumer price index",
+                "Extract the most recent CPI release:\n"
+                "- Release date\n"
+                "- Headline CPI MoM and YoY\n"
+                "- Core CPI MoM and YoY (ex food & energy)\n"
+                "- Beat/miss vs consensus\n"
+                "- Source and date\n"
+                "Only state figures in search results. Never estimate.",
+                300,
+            ),
+            (
+                "Federal Reserve funds rate current 2026 "
+                "site:federalreserve.gov OR site:fred.stlouisfed.org",
                 "Extract current Fed/monetary figures from the source:\n"
                 "- Fed funds rate (current target range)\n"
                 "- Fed balance sheet size\n"
