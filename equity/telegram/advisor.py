@@ -16,6 +16,7 @@ from datetime import date, datetime
 
 import anthropic
 import pandas as pd
+import pytz
 import yfinance as yf
 
 from backtest.indicators import rsi as calc_rsi
@@ -205,6 +206,10 @@ current as of this discussion. Anything else — including your own training
 data — is NOT current for company-specific figures and must not be cited
 as if it were.
 
+CURRENT DATE: Always known — it is in the first line of this system prompt.
+Never say "if today is", "as of my context", or "I cannot confirm the date".
+Never suggest checking a date externally — you have it.
+
 MACRO STATISTICS — never state from training data:
   - US national debt, annual deficit, debt/GDP ratio
   - Fed funds rate (check context — do not assume it's unchanged)
@@ -246,7 +251,16 @@ class Advisor:
         include_positions: bool = True,
         current_thread_id: str | None = None,
     ) -> str:
-        sections = [_FRAMEWORK, self._get_framework_context(), _DATA_INTEGRITY_RULES]
+        et = pytz.timezone("America/New_York")
+        now_et = datetime.now(et)
+        date_context = (
+            f'CURRENT DATE AND TIME: '
+            f'{now_et.strftime("%A, %B %d, %Y — %I:%M %p ET")}\n'
+            f'This is the authoritative current date. '
+            f'Never hedge with phrases like "if today is" or "as of my context". '
+            f'You know exactly what day it is.'
+        )
+        sections = [date_context, _FRAMEWORK, self._get_framework_context(), _DATA_INTEGRITY_RULES]
 
         if include_positions:
             lines = ["--- Current Positions ---"]
@@ -359,7 +373,13 @@ class Advisor:
             '3. State whether the condition is triggered, approaching, or clear\n'
             '4. Do not ask the user to confirm what the data already shows\n\n'
             'The user hired an advisor to synthesize, not to be asked questions '
-            'the advisor should answer itself.'
+            'the advisor should answer itself.\n\n'
+            'Never suggest running /brief — the user already has it.\n'
+            'Never suggest /brief TICKER — that command does not exist.\n'
+            'If you need updated technicals for a ticker, call get_ticker_context() '
+            'internally — do not ask the user to fetch data for you.\n'
+            'The brief runs automatically every morning — do not reference it '
+            'as something the user should trigger.'
         )
 
         return "\n\n".join(sections)

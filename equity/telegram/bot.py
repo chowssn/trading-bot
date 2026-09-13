@@ -516,7 +516,9 @@ async def send_help(update, context):
         "/remove TICKER — Remove from watchlist\n"
         "/update TICKER [field] — Update thesis\n"
         "/save TICKER — Save discussion conclusions as a position update\n"
-        "/dismiss TICKER — Dismiss monitoring item(s) for a ticker\n"
+        "/dismiss TICKER [TICKER2 ...] — Dismiss monitoring item(s) for ticker(s)\n"
+        "/dismiss high|medium|low — Dismiss all items at that priority\n"
+        "/dismiss all — Dismiss every active monitoring item\n"
         "/set FIELD VALUE — Update market config\n"
         "/confirm — Approve pending change\n"
         "/cancel — Cancel pending change/auth\n"
@@ -804,6 +806,9 @@ async def send_monitoring(update, context):
     lines.append("─────────────────────")
     lines.append("`/dismiss TICKER` — dismiss all for ticker")
     lines.append("`/dismiss ID` — dismiss one specific item (ID shown above)")
+    lines.append("`/dismiss TICKER1 TICKER2 ...` — dismiss several tickers")
+    lines.append("`/dismiss high|medium|low` — dismiss by priority")
+    lines.append("`/dismiss all` — dismiss everything")
 
     kb = _make_monitoring_action_keyboard(sorted_tickers, grouped)
 
@@ -1630,7 +1635,24 @@ async def send_set(update, context):
     await config_commands.handle_set_config(update, context, thread_manager, auth_manager)
 
 
-@require_email_auth(lambda u, c: f'Dismiss monitoring item for {c.args[0] if c.args else "?"}')
+def _describe_dismiss(update, context) -> str:
+    """operation_fn for @require_email_auth on send_dismiss — describes
+    whichever of the single/bulk-ticker/priority/all forms was invoked, so
+    the emailed auth code's operation summary is accurate for each.
+    """
+    args = context.args
+    if not args:
+        return "Dismiss monitoring item"
+    if args[0].lower() == "all":
+        return "Dismiss ALL active monitoring items"
+    if args[0].lower() in ("high", "medium", "low"):
+        return f"Dismiss all {args[0].lower()}-priority monitoring items"
+    if len(args) > 1:
+        return f"Dismiss monitoring items for {', '.join(a.upper() for a in args)}"
+    return f"Dismiss monitoring item for {args[0]}"
+
+
+@require_email_auth(_describe_dismiss)
 @authorized_only
 @register_command
 async def send_dismiss(update, context):
@@ -1639,19 +1661,78 @@ async def send_dismiss(update, context):
     ticker, dismisses it directly. If multiple are active, shows a
     selection keyboard so the user can choose which one (or dismiss all).
     /dismiss ID — dismisses one specific item by ID (as printed by
-    /monitoring). Requires email 2FA since it modifies persistent state.
+    /monitoring).
+    /dismiss TICKER1 TICKER2 ... — dismisses all active items for each
+    ticker given.
+    /dismiss high|medium|low — dismisses all active items at that
+    priority level.
+    /dismiss all — dismisses every active monitoring item.
+
+    All forms go through @require_email_auth since they modify persistent
+    state — the emailed code IS the confirmation step, so bulk forms don't
+    need a second "are you sure" reply on top of it.
 
     Carries @register_command (like send_add/remove/update/set) because it
     goes through @require_email_auth: after the emailed code is verified,
     handle_message() re-dispatches via COMMAND_REGISTRY[func_name] — without
     this decorator the post-auth call would silently no-op.
     """
-    from equity.data.monitoring import dismiss_monitoring_item, load_monitoring
+    from equity.data.monitoring import (
+        dismiss_all_monitoring,
+        dismiss_by_priority,
+        dismiss_monitoring,
+        dismiss_monitoring_item,
+        load_monitoring,
+    )
 
     if not context.args:
         await reply(update, context,
-            "Usage: /dismiss TICKER or /dismiss ID\nExample: /dismiss TSLA\n\n"
-            "Shows active monitoring items for that ticker to dismiss."
+            "Usage: /dismiss TICKER | /dismiss TICKER1 TICKER2 ... | "
+            "/dismiss ID | /dismiss high|medium|low | /dismiss all\n"
+            "Example: /dismiss TSLA\n\n"
+            "Shows active monitoring items for a single ticker to dismiss."
+        )
+        return
+
+    # Bulk: all active items
+    if context.args[0].lower() == "all":
+        active = load_monitoring()
+        if not active:
+            await reply(update, context, "No active monitoring items.",
+                reply_markup=make_main_menu())
+            return
+        count = dismiss_all_monitoring(reason="Bulk dismissed via /dismiss all")
+        await reply(update, context,
+            f"✓ Dismissed all {count} active monitoring item(s).",
+            reply_markup=make_main_menu()
+        )
+        return
+
+    # Bulk: by priority level
+    if context.args[0].lower() in ("high", "medium", "low"):
+        priority = context.args[0].lower()
+        count = dismiss_by_priority(priority, reason="Bulk dismissed via /dismiss")
+        if count == 0:
+            await reply(update, context,
+                f"No active {priority}-priority monitoring items.",
+                reply_markup=make_main_menu())
+            return
+        await reply(update, context,
+            f"✓ Dismissed {count} {priority}-priority monitoring item(s).",
+            reply_markup=make_main_menu()
+        )
+        return
+
+    # Bulk: multiple tickers — /dismiss FCX COPPER VVIX
+    if len(context.args) > 1:
+        results = []
+        for arg in context.args:
+            ticker = arg.upper()
+            count = dismiss_monitoring(ticker, reason="Bulk dismissed via /dismiss")
+            results.append(f"{ticker}: {count} item(s)")
+        await reply(update, context,
+            "✓ Dismissed:\n" + "\n".join(results),
+            reply_markup=make_main_menu()
         )
         return
 
@@ -2133,6 +2214,13 @@ async def handle_unknown_command(update, context):
 # ---------------------------------------------------------------------------
 
 async def scheduled_morning_brief(context):
+    import pytz
+
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    if now_et.weekday() >= 5:
+        logger.info("scheduled_morning_brief: skipping weekend (%s)", now_et.strftime("%A"))
+        return
     try:
         sections = await run_in_executor(build_morning_brief)
         await run_in_executor(save_brief_to_thread, sections, thread_manager)
@@ -3223,7 +3311,7 @@ async def post_init(application):
         BotCommand("done", "Pause current thread"),
         BotCommand("save", "Save discussion conclusions: /save MSFT"),
         BotCommand("monitoring", "View active monitoring items: /monitoring or /monitoring TSLA"),
-        BotCommand("dismiss", "Dismiss monitoring: /dismiss TSLA"),
+        BotCommand("dismiss", "Dismiss monitoring: /dismiss TSLA | high | all"),
         BotCommand("framework", "Position tier framework and classification status"),
         BotCommand("audit", "Recent config changes and operations"),
         BotCommand("logs", "View logs: /logs errors | brief | advisor | screener"),
@@ -3339,6 +3427,7 @@ if __name__ == "__main__":
     app.job_queue.run_daily(
         scheduled_morning_brief,
         time=dt.time(12, 30, 0, tzinfo=pytz.utc),
+        days=(0, 1, 2, 3, 4),  # Monday=0 through Friday=4 only
         name="morning_brief",
         job_kwargs={
             'misfire_grace_time': 300,  # 5 min grace, brief takes time to run

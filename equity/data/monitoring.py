@@ -303,6 +303,38 @@ def dismiss_monitoring(ticker: str, reason: str = "") -> int:
     return count
 
 
+def dismiss_by_priority(priority: str, reason: str = "") -> int:
+    """Dismisses all active monitoring items at a given priority level.
+    Returns count dismissed.
+    """
+    all_data = _load_all()
+    count = 0
+    for item in all_data.get("items", []):
+        if item.get("status") == "active" and item.get("priority") == priority:
+            item["status"] = "dismissed"
+            item["notes"].append(f"Dismissed {date.today()}: {reason}")
+            count += 1
+    if count > 0:
+        _save_all(all_data)
+        logger.info("dismiss_by_priority: dismissed %d %s-priority items", count, priority)
+    return count
+
+
+def dismiss_all_monitoring(reason: str = "") -> int:
+    """Dismisses every active monitoring item. Returns count dismissed."""
+    all_data = _load_all()
+    count = 0
+    for item in all_data.get("items", []):
+        if item.get("status") == "active":
+            item["status"] = "dismissed"
+            item["notes"].append(f"Dismissed {date.today()}: {reason}")
+            count += 1
+    if count > 0:
+        _save_all(all_data)
+        logger.info("dismiss_all_monitoring: dismissed %d items", count)
+    return count
+
+
 def dismiss_monitoring_item(item_id: str, reason: str = "") -> bool:
     """Dismisses a specific monitoring item by ID."""
     all_data = _load_all()
