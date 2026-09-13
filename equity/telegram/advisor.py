@@ -345,6 +345,23 @@ class Advisor:
         if cross_thread_ctx:
             sections.append(cross_thread_ctx)
 
+        sections.append(
+            '--- SYNTHESIS DISCIPLINE ---\n'
+            'Never ask the user for data the system already provides:\n'
+            '- Current prices: always in the portfolio table above\n'
+            '- 1D moves: always in the portfolio table above\n'
+            '- Thesis-breaker levels: always in position config above\n'
+            '- Yield levels: always in the live macro snapshot above\n'
+            '- RSI levels: fetch via get_ticker_context() if not in context\n\n'
+            'When assessing a thesis-breaker condition:\n'
+            '1. Read the current price from the portfolio table\n'
+            '2. Read the thesis-breaker threshold from the position config\n'
+            '3. State whether the condition is triggered, approaching, or clear\n'
+            '4. Do not ask the user to confirm what the data already shows\n\n'
+            'The user hired an advisor to synthesize, not to be asked questions '
+            'the advisor should answer itself.'
+        )
+
         return "\n\n".join(sections)
 
     def _get_framework_context(self) -> str:
@@ -1350,6 +1367,40 @@ class Advisor:
 
                 lines.append(f'Tier: {pos.get("tier", "")} | Sector: {pos.get("sector", "")}')
                 lines.append(f'Thesis written: {pos.get("last_reviewed", "unknown")}')
+
+                # Pre-computed thesis-breaker proximity, so the advisor states
+                # triggered/approaching/clear from data already in context
+                # instead of asking the user what the price is doing. Only
+                # breakers that state a single explicit "$X" level can be
+                # scored this way — most breakers are qualitative (revenue
+                # deceleration, customer concentration, etc.) and are listed
+                # as-is with no proximity claim. A level match is also
+                # phrased as "price is below/above the level", not as a
+                # confirmed breach: several breakers require the price to
+                # hold there for multiple sessions or attach other
+                # conditions, which a single current price can't confirm.
+                thesis_breakers = pos.get("thesis_breakers", [])
+                if thesis_breakers and price is not None:
+                    breaker_lines = ["Thesis-breaker status (pre-computed, verify compound conditions):"]
+                    for breaker in thesis_breakers[:4]:
+                        dollar_amounts = re.findall(r"\$(\d+\.?\d*)", breaker)
+                        if len(dollar_amounts) == 1:
+                            level = float(dollar_amounts[0])
+                            diff_pct = (price / level - 1) * 100
+                            if abs(diff_pct) < 2:
+                                status = f"⚠️ PROXIMATE ({diff_pct:+.1f}% from ${level:.2f} level)"
+                            elif diff_pct < 0:
+                                status = f"🔻 PRICE BELOW ${level:.2f} LEVEL (by {abs(diff_pct):.1f}%)"
+                            else:
+                                status = f"✅ CLEAR ({diff_pct:+.1f}% above ${level:.2f} level)"
+                            breaker_lines.append(f"  {status} | {breaker[:120]}")
+                        else:
+                            # No single unambiguous price level to compare
+                            # against (none, or more than one, mentioned) —
+                            # list the breaker without a computed status.
+                            breaker_lines.append(f"  📋 {breaker[:120]}")
+                    lines.append("\n".join(breaker_lines))
+
                 sections.append("\n".join(lines))
             elif ticker in positions_config.WATCHLIST:
                 sections.append(
