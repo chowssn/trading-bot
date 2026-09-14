@@ -1392,9 +1392,9 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
     # key -> (query, extract_prompt, max_tokens)
     searches: dict[str, tuple[str, str, int]] = {
         "geopolitical": (
-            f"market moving news {today} geopolitical oil supply "
-            f"AI regulation tech policy central bank surprise "
-            f"earnings guidance major corporate announcement",
+            f"oil price crude energy supply disruption geopolitical {today} "
+            f"AI regulation tech policy trade sanctions military conflict "
+            f"OPEC Saudi Arabia pipeline commodity market moving news",
             f"Extract geopolitical and policy events from {today} that are "
             f"moving markets (current regime: {regime_str}):\n"
             f"- Any named meetings scheduled (OPEC, GCC, G7, G20, bilateral)\n"
@@ -1437,16 +1437,19 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
             400,
         ),
         "overnight_session": (
-            f"Asia Europe markets overnight {today} Nikkei Hang Seng "
-            f"DAX FTSE key movers earnings central bank bond yields "
-            f"currency moves what happened",
+            f"Nikkei 225 Kospi Hang Seng ASX 200 DAX FTSE overnight {today} "
+            f"stock market Asia Europe open close percent change",
             f"Extract overnight session highlights:\n"
-            f"- Asia session: key index moves with specific % and driver\n"
-            f"- Europe open: key index moves with specific % and driver\n"
-            f"- Overnight bond moves: 10Y UST, JGB, Bund yield changes in bp\n"
-            f"- Any major earnings or corporate announcements overnight\n"
+            f"- Asia: Nikkei, Kospi, Hang Seng, ASX moves with driver\n"
+            f"- Europe: DAX, FTSE, CAC moves with driver\n"
+            f"- Bonds: 10Y UST, JGB, Bund yield changes in bp\n"
             f"- Single most important thing that happened overnight\n"
-            f"Format: [Region] [Index] [move%] — [Driver in ≤8 words]\n"
+            f"Format:\n"
+            f"ASIA: Nikkei [X%] | Kospi [X%] | Hang Seng [X%] | ASX [X%] — driver\n"
+            f"EUROPE: DAX [X%] | FTSE [X%] | CAC [X%] — driver\n"
+            f"BONDS: 10Y UST [±Xbp] | JGB [±Xbp] | Bund [±Xbp]\n"
+            f"LEAD: [single most important overnight development]\n"
+            f"Source every figure with [Name](url)\n"
             f"Be specific. Only from last 12 hours.",
             350,
         ),
@@ -1466,15 +1469,14 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
             350,
         ),
         "tech_narrative": (
-            f"AI artificial intelligence regulation policy slowdown "
-            f"OpenAI Anthropic Google Microsoft Meta tech earnings "
-            f"semiconductor chip {today}",
-            f"Extract up to 3 significant tech/AI developments from {today} "
+            f"earnings guidance upgrade downgrade product launch "
+            f"Microsoft Apple Nvidia AMD TSLA GOOGL META AMZN {today}",
+            f"Extract up to 3 company-specific developments from {today} "
             f"(current regime: {regime_str}):\n"
-            f"- Company/topic and what happened, one sentence\n"
-            f"- Market impact: which stocks, which direction\n"
-            f"Format: [Company/Topic] — [what happened] — [market impact] — [Source]\n"
-            f"Focus on developments that move stock prices, not generic commentary. "
+            f"- Ticker, company name, and what happened "
+            f"(earnings/guidance/product launch/M&A)\n"
+            f"- Stock impact: which direction, magnitude if known\n"
+            f"Format: [TICKER] [Company] — [what happened] — [stock impact] — [Source](url)\n"
             f'If none found, write "not found".',
             350,
         ),
