@@ -244,7 +244,7 @@
       "avg_cost": 165.15,
       "classification_status": "unclassified",
       "last_reviewed": "2026-09",
-      "macro_thesis": "",
+      "macro_thesis": "AI infrastructure buildout continues to benefit Google Cloud; advertising spend remains resilient in a soft-landing macro environment; Alphabet's vertical integration across TPUs, models, and distribution creates durable competitive moat against AI disruption narrative",
       "market_value": 3744.95,
       "peer_tickers": [],
       "sector": "Communication Services",
@@ -252,9 +252,13 @@
       "size_pct": 4.73,
       "size_target_pct": null,
       "style": "",
-      "target_exit_conditions": "",
-      "thesis": "Imported from IBKR \u2014 update via /update TICKER",
-      "thesis_breakers": [],
+      "target_exit_conditions": "Exit if price closes below 200D SMA for two consecutive sessions concurrent with XLC relative underperformance, or if core search revenue growth decelerates below 5% YoY in any reported quarter",
+      "thesis": "GOOGL is holding above its 200D SMA with recovering momentum after a short-term pullback, suggesting the AI search disruption re-pricing concern is stabilizing rather than accelerating. At a trailing P/E of 17x with dominant search, cloud, and AI infrastructure positions, the risk/reward is favorable at current levels. The 1Y return of +41.2% reflects durable earnings power that the recent consolidation has not structurally impaired.",
+      "thesis_breakers": [
+        "Two consecutive weekly closes below the 200D SMA ($336.38) accompanied by XLC underperformance",
+        "Measurable market share loss in core search revenue attributed to AI-native competitors (e.g., ChatGPT, Perplexity) reported in quarterly earnings",
+        "Forward P/E expansion above 30x without corresponding acceleration in revenue growth, signaling valuation disconnect"
+      ],
       "thesis_source": "ibkr_import",
       "tier": "core",
       "tier_v2": ""
