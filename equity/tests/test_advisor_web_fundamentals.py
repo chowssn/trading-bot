@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from equity.telegram import advisor as advisor_module
 from equity.telegram.advisor import Advisor, WEB_FUNDAMENTALS_MAX_PER_HOUR
 
 
@@ -122,6 +123,64 @@ class TestFetchWebFundamentals(unittest.TestCase):
             adv._fetch_web_fundamentals("TSLA", "")
         queries = [call.args[0] for call in mock_search.call_args_list]
         self.assertTrue(any("TSLA" in q for q in queries))
+
+
+class TestFetchWebFundamentalsCache(unittest.TestCase):
+    """_fetch_web_fundamentals()'s per-ticker-per-day cache — added so a
+    second /discuss TICKER open the same day reuses the morning's 4-search
+    batch instead of re-running it (~$0.05/open saved). Same pattern as
+    TestGetMacroContext's cache tests in test_advisor_macro.py.
+    """
+
+    def test_second_call_same_ticker_same_day_is_cached(self):
+        adv = _make_advisor()
+        with patch.object(adv, "_web_search_and_extract", return_value="fact"):
+            first = adv._fetch_web_fundamentals("TSLA", "Tesla")
+        with patch.object(adv, "_web_search_and_extract", side_effect=AssertionError("should be cached")):
+            second = adv._fetch_web_fundamentals("TSLA", "Tesla")
+        self.assertEqual(first, second)
+
+    def test_different_ticker_not_served_from_cache(self):
+        adv = _make_advisor()
+        with patch.object(adv, "_web_search_and_extract", return_value="tsla fact"):
+            adv._fetch_web_fundamentals("TSLA", "Tesla")
+        with patch.object(adv, "_web_search_and_extract", return_value="aapl fact") as mock_search:
+            result = adv._fetch_web_fundamentals("AAPL", "Apple")
+        mock_search.assert_called()
+        self.assertEqual(result["fundamentals"], "aapl fact")
+
+    def test_different_day_not_served_from_cache(self):
+        adv = _make_advisor()
+        with patch.object(adv, "_web_search_and_extract", return_value="fact"):
+            adv._fetch_web_fundamentals("TSLA", "Tesla")
+        yesterday_key = f"TSLA_{advisor_module.date.today().isoformat()}"
+        self.assertIn(yesterday_key, adv._web_fundamentals_cache)
+        with patch.object(advisor_module, "date") as mock_date:
+            mock_date.today.return_value = advisor_module.date(2099, 1, 1)
+            with patch.object(adv, "_web_search_and_extract", return_value="fresh fact") as mock_search:
+                result = adv._fetch_web_fundamentals("TSLA", "Tesla")
+        mock_search.assert_called()
+        self.assertEqual(result["fundamentals"], "fresh fact")
+
+    def test_empty_result_is_not_cached(self):
+        adv = _make_advisor()
+        with patch.object(adv, "_web_search_and_extract", return_value=""):
+            adv._fetch_web_fundamentals("TSLA", "Tesla")
+        with patch.object(adv, "_web_search_and_extract", return_value="fact") as mock_search:
+            result = adv._fetch_web_fundamentals("TSLA", "Tesla")
+        mock_search.assert_called()
+        self.assertEqual(result["fundamentals"], "fact")
+
+    def test_over_budget_result_is_not_cached(self):
+        adv = _make_advisor()
+        adv._web_fundamentals_call_times = [time.time()] * advisor_module.WEB_FUNDAMENTALS_MAX_PER_HOUR
+        with patch.object(adv, "_web_search_and_extract", side_effect=AssertionError("over budget — should not search")):
+            adv._fetch_web_fundamentals("TSLA", "Tesla")
+        adv._web_fundamentals_call_times = []
+        with patch.object(adv, "_web_search_and_extract", return_value="fact") as mock_search:
+            result = adv._fetch_web_fundamentals("TSLA", "Tesla")
+        mock_search.assert_called()
+        self.assertEqual(result["fundamentals"], "fact")
 
 
 class TestGetTickerContextWebSection(unittest.TestCase):

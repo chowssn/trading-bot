@@ -32,11 +32,53 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-6"
 
+# --- API cost tracking (approximate, for /status) ---------------------
+# Session-lifetime counters, not persisted to disk — a restart naturally
+# zeroes them, same as bot.py's _claude_call_times rate-limit window.
+# Pricing is Sonnet 4.6's published per-token rate ($/1M tokens); the
+# macro-intel and brief-synthesis clients (separate anthropic.Anthropic()
+# instances in market_snapshot.py / brief_synthesizer.py) use the same
+# model but aren't wired into this counter, so the /status figure covers
+# Advisor chat/discuss/summarize/thesis calls only — the background
+# brief/macro jobs are a separate, smaller cost surface not counted here.
+_session_api_calls: dict = {"count": 0, "est_cost_usd": 0.0}
+_SONNET_4_6_INPUT_COST_PER_MTOK = 3.0
+_SONNET_4_6_OUTPUT_COST_PER_MTOK = 15.0
+
+
+def _track_api_cost(response) -> None:
+    """Approximate-cost accounting for /status's session counter.
+
+    Best-effort and never raises — a malformed/missing `usage` field
+    (e.g. a mocked response in a test) just skips accounting rather than
+    breaking the call site that already has its result in hand.
+    """
+    try:
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        cost = (
+            input_tokens * _SONNET_4_6_INPUT_COST_PER_MTOK
+            + output_tokens * _SONNET_4_6_OUTPUT_COST_PER_MTOK
+        ) / 1_000_000
+        _session_api_calls["count"] += 1
+        _session_api_calls["est_cost_usd"] += cost
+    except Exception:
+        pass
+
+
 # Hourly cap on _fetch_web_fundamentals() batches — each batch is 4
 # searches x 2 Claude calls (a web search + a grounded-extraction pass
 # each) = 8 calls. See _web_fundamentals_budget_ok() for why this can't
 # just reuse bot.py's check_claude_rate_limit().
 WEB_FUNDAMENTALS_MAX_PER_HOUR = 8
+
+# Hard ceiling on the flattened transcript summarize_messages() sends to
+# Claude, on top of the existing 300-char per-message truncation below.
+# The per-message cap already keeps a normal thread's nightly summary
+# small; this is a safety net for the pathological case (a thread with
+# far more exchanges than usual before day-3 rollover), not a change to
+# normal-case behavior.
+SUMMARIZE_MAX_CHARS = 6000
 
 # Module-level cache for _build_full_portfolio_context() — shared across
 # Advisor instances since the content (positions + live prices) doesn't
@@ -201,10 +243,11 @@ When data is missing, say exactly:
 It is never acceptable to provide a plausible-sounding number without a source.
 A wrong number is worse than no number — it leads to bad decisions.
 
-Ticker context sections labeled "searched this session" (web search) are
-current as of this discussion. Anything else — including your own training
-data — is NOT current for company-specific figures and must not be cited
-as if it were.
+Ticker context sections labeled "searched this session" or "searched
+earlier today, reused for this discussion" (both web search — the latter
+is a same-day cache hit, not stale data) are current for today. Anything
+else — including your own training data — is NOT current for
+company-specific figures and must not be cited as if it were.
 
 CURRENT DATE: Always known — it is in the first line of this system prompt.
 Never say "if today is", "as of my context", or "I cannot confirm the date".
@@ -240,6 +283,15 @@ class Advisor:
         self._web_fundamentals_call_times: list[float] = []
         # get_macro_context()'s cache: {topic_key: (text, fetched_at)}.
         self._macro_ctx_cache: dict[str, tuple[str, float]] = {}
+        # _fetch_web_fundamentals()'s cache: {"{ticker}_{date}": web_data}.
+        # Fundamentals/consensus/events researched for a ticker don't
+        # change intraday, so a second /discuss TICKER open the same day
+        # reuses the morning's 4-search batch instead of re-running it —
+        # see _fetch_web_fundamentals()'s docstring. In-memory only, keyed
+        # by calendar date rather than a TTL (unlike _macro_ctx_cache): a
+        # restart or day rollover means fresh research, which is the
+        # correct behavior either way.
+        self._web_fundamentals_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # System prompt construction
@@ -932,6 +984,7 @@ class Advisor:
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": query}],
             )
+            _track_api_cost(response)
             raw = "\n".join(
                 b.text for b in response.content if hasattr(b, "text") and b.text
             ).strip()
@@ -953,6 +1006,7 @@ class Advisor:
                     ),
                 }],
             )
+            _track_api_cost(extraction)
             text_parts = [b.text for b in extraction.content if hasattr(b, "text") and b.text]
             return "\n".join(text_parts).strip()
         except Exception as exc:
@@ -975,7 +1029,21 @@ class Advisor:
         blocking Anthropic calls, so doing all 4 one after another would
         push a ticker-open to 40-60s+ rather than the ~10-20s a fresh
         /discuss TICKER is expected to take.
+
+        Cached per ticker per calendar day (`self._web_fundamentals_cache`)
+        — market cap/segments/consensus/recent-events don't move within a
+        session, so re-opening the same ticker later today reuses this
+        morning's batch instead of re-running 4 web searches (~$0.05) for
+        data that hasn't changed. get_ticker_context() labels this section
+        by when it was actually fetched, not "this session", so a cached
+        answer is never misrepresented as freshly searched.
         """
+        cache_key = f"{ticker}_{date.today().isoformat()}"
+        cached = self._web_fundamentals_cache.get(cache_key)
+        if cached is not None:
+            logger.info("_fetch_web_fundamentals(%s): returning today's cached result", ticker)
+            return cached
+
         if not self._web_fundamentals_budget_ok():
             logger.warning(
                 "_fetch_web_fundamentals: hourly budget (%d/hr) exhausted — skipping web search for %s",
@@ -1066,6 +1134,13 @@ class Advisor:
                     text = ""
                 if text:
                     results[key] = text
+        # Only a real, non-empty batch is cached — same principle as
+        # fetch_macro_intelligence()'s cache: an empty/skipped result (all
+        # searches failed, or the hourly budget was exhausted above) isn't
+        # worth locking in for the rest of the day, so the next open tries
+        # again rather than parroting "unavailable" until midnight.
+        if results:
+            self._web_fundamentals_cache[cache_key] = results
         return results
 
     # ------------------------------------------------------------------
@@ -1325,12 +1400,19 @@ class Advisor:
         # just not very informative.
         # ------------------------------------------------------------
         try:
+            web_cache_key = f"{ticker}_{date.today().isoformat()}"
+            was_cached = web_cache_key in self._web_fundamentals_cache
             web_data = self._fetch_web_fundamentals(ticker, company_name)
 
             if web_data:
+                freshness = (
+                    "searched earlier today, reused for this discussion"
+                    if was_cached
+                    else "searched this session"
+                )
                 lines = [
-                    "--- WEB-SEARCHED FUNDAMENTALS (searched this session) ---",
-                    "Current as of this discussion. Cross-reference against SEC filings before "
+                    f"--- WEB-SEARCHED FUNDAMENTALS ({freshness}) ---",
+                    "Current as of today. Cross-reference against SEC filings before "
                     "acting on any figure below.",
                 ]
                 section_labels = {
@@ -1559,6 +1641,7 @@ class Advisor:
                 system=system_prompt,
                 messages=messages,
             )
+            _track_api_cost(response)
             text = next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:
             logger.error("Advisor.chat: Claude API call failed for %s: %s", thread_id, exc)
@@ -1659,6 +1742,8 @@ class Advisor:
         )
         if not convo_text:
             return ""
+        if len(convo_text) > SUMMARIZE_MAX_CHARS:
+            convo_text = convo_text[:SUMMARIZE_MAX_CHARS] + "\n[truncated for summarization]"
 
         try:
             response = self.client.messages.create(
@@ -1671,6 +1756,7 @@ class Advisor:
                 ),
                 messages=[{"role": "user", "content": f"Discussion:\n{convo_text}"}],
             )
+            _track_api_cost(response)
             return next((b.text for b in response.content if b.type == "text"), "")
         except Exception as exc:
             logger.error("Advisor.summarize_messages: Claude API call failed: %s", exc)
@@ -1709,6 +1795,7 @@ class Advisor:
                     }
                 ],
             )
+            _track_api_cost(response)
             text = next((b.text for b in response.content if b.type == "text"), "")
             parsed = self._parse_thesis_json(text)
             for key in empty:
@@ -1829,6 +1916,7 @@ Rules:
                 max_tokens=800,
                 messages=[{"role": "user", "content": prompt}],
             )
+            _track_api_cost(response)
             text = next((b.text for b in response.content if b.type == "text"), "")
             parsed = self._extract_json_object(text)
         except Exception as exc:
