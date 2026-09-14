@@ -76,6 +76,7 @@ from equity.config.market_config import (
     VIX_HIGH,
     VOLATILITY_TICKERS,
 )
+from equity.brief.eco_calendar import fetch_fomc_dates
 from equity.config.positions import POSITIONS
 from equity.data.price_cache import price_cache
 from equity.data.yfinance_utils import yf_download
@@ -113,6 +114,23 @@ MACRO_INTEL_CACHE_HOURS = 6
 # scaled for one shared module-level cache instead of one per ticker.
 MACRO_INTEL_MAX_PER_HOUR = 4
 _macro_intel_call_times: list[float] = []
+
+# Market-move thresholds that force a fresh macro-intel fetch even when the
+# 6h cache (MACRO_INTEL_CACHE_HOURS) is still within its window — see
+# _should_invalidate_cache(). A big move usually means a new narrative has
+# emerged since the cache was written, and waiting out the rest of the
+# window means the brief keeps citing stale color through the move.
+MACRO_INTEL_VIX_SPIKE_PCT = 5.0        # VIX up >5% vs prior close: fear spike
+MACRO_INTEL_FUTURES_DROP_PCT = -1.5    # ES=F/NQ=F down >1.5%: risk-off event
+MACRO_INTEL_BRENT_SPIKE_PCT = 3.0      # BZ=F up >3%: energy event
+MACRO_INTEL_POSITION_DROP_PCT = -5.0   # any held position down >5%: idiosyncratic event
+
+# How many days ahead of an FOMC meeting the dedicated fomc_preview search
+# (see fetch_macro_intelligence()) turns on. Deliberately wider than
+# eco_calendar.FOMC_PROXIMITY_DAYS (2) — that constant gates position-size
+# reduction close to the meeting; this just decides when a preview search
+# is worth the extra API calls, so a full "Fed week" window is more useful.
+MACRO_INTEL_FOMC_PREVIEW_WINDOW_DAYS = 5
 
 VIX_TICKER = "^VIX"
 TREASURY_5Y_PERIOD = "5y"
@@ -1229,7 +1247,10 @@ def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int =
                     f"For each fact, name the source ONLY if it appears in the "
                     f"'Sources actually cited by the search' list above — never invent "
                     f"or infer a publication name that isn't in that list; omit the "
-                    f"source name for a fact if none of the listed sources back it."
+                    f"source name for a fact if none of the listed sources back it. "
+                    f"When a cited source has a URL in that list, format it as a "
+                    f"markdown link: [Source Name](url). If it has no URL, write just "
+                    f"the source name. Never fabricate a URL that isn't in that list."
                 ),
             }],
         )
@@ -1256,21 +1277,88 @@ def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int =
         return ""
 
 
+def _is_fomc_preview_week() -> bool:
+    """True when the next FOMC meeting is within
+    MACRO_INTEL_FOMC_PREVIEW_WINDOW_DAYS — gates the dedicated fomc_preview
+    search in fetch_macro_intelligence(). Reuses eco_calendar's own FOMC
+    date source (scrape-with-fallback, cached — see fetch_fomc_dates())
+    rather than re-deriving meeting dates here. Never raises: any failure
+    (including an empty/malformed date list) just skips the extra search.
+    """
+    try:
+        fomc_dates = fetch_fomc_dates()
+        today = date.today()
+        return any(
+            0 <= (date.fromisoformat(d) - today).days <= MACRO_INTEL_FOMC_PREVIEW_WINDOW_DAYS
+            for d in fomc_dates
+        )
+    except Exception as exc:
+        logger.warning("_is_fomc_preview_week: failed, skipping fomc_preview search: %s", exc)
+        return False
+
+
+def _should_invalidate_cache() -> bool:
+    """True if a large market move suggests a new narrative has emerged
+    since the macro-intel cache was written — forces fetch_macro_intelligence()
+    past a still-fresh (<MACRO_INTEL_CACHE_HOURS) cache to refetch.
+
+    Reads price_cache rather than fetching anything itself, so this never
+    adds its own network round-trip beyond price_cache's own (normal,
+    already-happening) refresh cycle. Never raises: any failure (price_cache
+    unavailable, a ticker missing from it) just means "don't invalidate" —
+    a missed invalidation costs a stale narrative for up to the rest of the
+    cache window, which is the pre-existing behavior; a false invalidation
+    would burn part of the hourly cold-fetch budget for nothing.
+    """
+    try:
+        vix = price_cache.get("^VIX")
+        if vix and (vix.get("change_1d_pct") or 0) > MACRO_INTEL_VIX_SPIKE_PCT:
+            logger.info("macro_intel cache invalidated: VIX spike")
+            return True
+
+        for ticker in ("ES=F", "NQ=F"):
+            d = price_cache.get(ticker)
+            if d and (d.get("change_1d_pct") or 0) < MACRO_INTEL_FUTURES_DROP_PCT:
+                logger.info("macro_intel cache invalidated: %s down sharply", ticker)
+                return True
+
+        brent = price_cache.get("BZ=F")
+        if brent and (brent.get("change_1d_pct") or 0) > MACRO_INTEL_BRENT_SPIKE_PCT:
+            logger.info("macro_intel cache invalidated: Brent spike")
+            return True
+
+        for ticker in POSITIONS:
+            d = price_cache.get(ticker)
+            if d and (d.get("change_1d_pct") or 0) < MACRO_INTEL_POSITION_DROP_PCT:
+                logger.info("macro_intel cache invalidated: %s down sharply", ticker)
+                return True
+
+        return False
+    except Exception as exc:
+        logger.warning("_should_invalidate_cache: failed, leaving cache as-is: %s", exc)
+        return False
+
+
 def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
-    """Five targeted web searches surfacing geopolitical, central-bank,
-    economic-release, overnight-session, and analyst-action narrative
-    context — the narrative layer for Section 1 (Global Markets),
-    alongside fetch_market_snapshot()/fetch_global_signals()'s
-    quantitative data.
+    """Five to seven targeted web searches surfacing geopolitical,
+    central-bank, economic-release, overnight-session, analyst-action, and
+    tech/AI narrative context (plus a dedicated FOMC preview in the days
+    before a meeting — see _is_fomc_preview_week()) — the narrative layer
+    for Section 1 (Global Markets), alongside
+    fetch_market_snapshot()/fetch_global_signals()'s quantitative data.
 
     Cached MACRO_INTEL_CACHE_HOURS (6) hours in one shared file, keyed by
     fetched_at rather than a wall-clock bucket, so build_morning_brief()
     and send_prices('all') hitting this within the same window share one
     fetch instead of each maintaining their own (buggier) notion of "this
-    hour". The 5 searches run concurrently, not sequentially — each is a
-    search-then-extract pair (2 blocking Claude calls), so doing all 5
-    back to back would be 10 serial calls and push a cold fetch to a
-    minute or more.
+    hour". A still-fresh cache is discarded early anyway when
+    _should_invalidate_cache() sees a large enough market move that a new
+    narrative likely emerged since the cache was written — otherwise a
+    move early in the window would sit un-narrated for the rest of it.
+    The searches run concurrently, not sequentially — each is a
+    search-then-extract pair (2 blocking Claude calls), so running them
+    back to back would double the serial call count and push a cold fetch
+    to a minute or more.
 
     Returns {} — never raises — if ANTHROPIC_API_KEY is unset, the hourly
     cold-fetch budget (MACRO_INTEL_MAX_PER_HOUR) is exhausted, or every
@@ -1282,7 +1370,9 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
     """
     cached = _load_macro_intel_cache()
     if cached is not None:
-        return cached
+        if not _should_invalidate_cache():
+            return cached
+        logger.info("fetch_macro_intelligence: cache invalidated by market move — refetching")
 
     if _get_macro_intel_client() is None:
         logger.warning("fetch_macro_intelligence: ANTHROPIC_API_KEY not set — skipping")
@@ -1302,15 +1392,16 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
     # key -> (query, extract_prompt, max_tokens)
     searches: dict[str, tuple[str, str, int]] = {
         "geopolitical": (
-            f"market moving geopolitical events overnight {today} "
-            f"OPEC oil supply central bank meeting G7 G20 trade "
-            f"sanctions military conflict commodity supply disruption",
+            f"market moving news {today} geopolitical oil supply "
+            f"AI regulation tech policy central bank surprise "
+            f"earnings guidance major corporate announcement",
             f"Extract geopolitical and policy events from {today} that are "
             f"moving markets (current regime: {regime_str}):\n"
             f"- Any named meetings scheduled (OPEC, GCC, G7, G20, bilateral)\n"
             f"- Military/conflict developments affecting energy or trade routes\n"
             f"- Sanctions, tariffs, or trade policy announcements\n"
             f"- Supply disruption events (pipeline, shipping, port)\n"
+            f"- AI/tech regulatory or policy actions with market impact\n"
             f"- For each: what is the market impact direction and which assets\n"
             f"Format: [Event] — [Market impact] — [Source]\n"
             f"Only events from last 24 hours. Max 4 events.",
@@ -1374,7 +1465,40 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
             f'Only actions from today. If none found, write "not found".',
             350,
         ),
+        "tech_narrative": (
+            f"AI artificial intelligence regulation policy slowdown "
+            f"OpenAI Anthropic Google Microsoft Meta tech earnings "
+            f"semiconductor chip {today}",
+            f"Extract up to 3 significant tech/AI developments from {today} "
+            f"(current regime: {regime_str}):\n"
+            f"- Company/topic and what happened, one sentence\n"
+            f"- Market impact: which stocks, which direction\n"
+            f"Format: [Company/Topic] — [what happened] — [market impact] — [Source]\n"
+            f"Focus on developments that move stock prices, not generic commentary. "
+            f'If none found, write "not found".',
+            350,
+        ),
     }
+
+    if _is_fomc_preview_week():
+        searches["fomc_preview"] = (
+            f"FOMC Federal Reserve meeting preview {today} "
+            f"rate hike dot plot expectations "
+            f"hawkish dovish dissent probability",
+            f"Extract an FOMC preview as of {today} "
+            f"(current regime: {regime_str}, held positions: {held_tickers}):\n"
+            f"- Meeting date\n"
+            f"- Current fed funds rate\n"
+            f"- Market-implied probability of hike/hold/cut\n"
+            f"- Key risk: what could surprise markets\n"
+            f"- Dot plot watch: what the new projections might show\n"
+            f"- Portfolio impact: which held positions are most affected and how\n"
+            f"Format: FOMC PREVIEW:\nMeeting date: [date]\nCurrent rate: [X]%\n"
+            f"Market pricing: [X]% probability hike/hold/cut\nKey risk: [risk]\n"
+            f"Dot plot watch: [watch]\nPortfolio impact: [impact]\n"
+            f'Source every figure. If not found, write "not found".',
+            400,
+        )
 
     results: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=len(searches)) as pool:
@@ -1431,28 +1555,29 @@ def format_macro_intelligence(intel: dict) -> str:
     lines = ["\U0001F4E1 MACRO INTELLIGENCE (web-sourced)", ""]
 
     section_labels = {
-        "geopolitical": "\U0001F310 Geopolitical",
+        "geopolitical": "\U0001F310 Geopolitical & Market News",
         "central_banks": "\U0001F3E6 Central Banks",
         "eco_releases": "\U0001F4CA Today's Releases",
         "overnight_session": "\U0001F319 Overnight Session",
         "analyst_notes": "\U0001F4CB Analyst Actions",
+        "tech_narrative": "\U0001F916 Tech & AI",
+        "fomc_preview": "\U0001F3DB FOMC Preview",
     }
 
-    # The extract prompts ask for a short bulleted/tabular format, but a
-    # web-search-grounded extraction routinely comes back as a full
-    # markdown writeup (headers, horizontal rules) several times that
-    # length regardless — observed live: ~800-1200 chars/section. Hard
-    # capped per section so 5 sections can't crowd out the quantitative
-    # data both synthesize_section() and synthesize_global_signals()
-    # truncate this whole block alongside (see their `section_data[:...]`),
-    # and so the brief itself stays dense rather than narrative.
-    _MAX_SECTION_CHARS = 450
-
+    # No per-section character cap here — a prior 450-char cap with a
+    # rsplit()-to-word-boundary-plus-"…" cut routinely sliced a section off
+    # mid-sentence (the extraction pass isn't told about this limit, so it
+    # writes complete sentences that this then chopped). synthesize_section()
+    # and synthesize_global_signals() still cap the whole macro-intel block
+    # alongside the rest of the section data before handing it to the brief
+    # LLM (see their `section_data[:...]`), and send_safe() splits/sends
+    # whatever's left at Telegram's message-length limit — so full section
+    # content flows through here and gets truncated, if at all, at a
+    # message/paragraph boundary further downstream instead of a raw
+    # character count.
     for key, label in section_labels.items():
         content = intel.get(key, "")
         if not _is_not_found_placeholder(content):
-            if len(content) > _MAX_SECTION_CHARS:
-                content = content[:_MAX_SECTION_CHARS].rsplit(" ", 1)[0] + "…"
             lines.append(f"*{label}*")
             lines.append(content)
             lines.append("")
