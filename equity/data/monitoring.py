@@ -100,19 +100,34 @@ def _extract_ticker(raw_ticker: str) -> list[str]:
     return valid
 
 
+MAX_PER_TICKER_PER_DAY = 2
+
+
 def add_monitoring_items(new_items: list[dict]) -> None:
     """Adds new monitoring items from synthesis output.
 
-    Deduplicates by ticker + item text similarity — see `_similar()`. When a
-    new item supersedes an existing active item for the same ticker (an
+    Deduplicates by ticker + item text similarity — see `_semantically_similar()`.
+    When a new item supersedes an existing active item for the same ticker (an
     updated threshold, or language showing a level was reached — see
     `_supersedes()`), the old item is resolved instead of left stale
     alongside the new one.
+
+    Capped at `MAX_PER_TICKER_PER_DAY` items added per ticker per day, across
+    all sources (e.g. brief synthesis and prices synthesis both run and can
+    both propose items for the same ticker) — counted against items already
+    `active` with today's `added_date`, before this call's own additions.
+
     `new_items`: list of {ticker, item, priority, source (optional)}.
     """
     existing = _load_all()
     today_str = str(date.today())
     items = existing.setdefault("items", [])
+
+    today_counts: dict[str, int] = {}
+    for item in items:
+        if item.get("added_date") == today_str and item.get("status") == "active":
+            t = item.get("ticker", "")
+            today_counts[t] = today_counts.get(t, 0) + 1
 
     added = 0
     superseded = 0
@@ -120,6 +135,13 @@ def add_monitoring_items(new_items: list[dict]) -> None:
         ticker = new.get("ticker", "").upper()
         item_text = new.get("item", "")
         if not ticker or not item_text:
+            continue
+
+        if today_counts.get(ticker, 0) >= MAX_PER_TICKER_PER_DAY:
+            logger.debug(
+                "add_monitoring_items: skipping %s — already at %d items today",
+                ticker, MAX_PER_TICKER_PER_DAY,
+            )
             continue
 
         ticker_active = [
@@ -140,7 +162,7 @@ def add_monitoring_items(new_items: list[dict]) -> None:
         # Skip as a duplicate only if a still-active item (not one just
         # resolved above) is a near-identical repeat.
         still_active = [e for e in ticker_active if id(e) not in resolved_now_ids]
-        if any(_similar(e.get("item", ""), item_text) for e in still_active):
+        if any(_semantically_similar(e.get("item", ""), item_text) for e in still_active):
             continue
 
         item_id = f"{ticker.lower()}_{today_str}_{added}"
@@ -156,6 +178,7 @@ def add_monitoring_items(new_items: list[dict]) -> None:
             "notes": [],
         })
         added += 1
+        today_counts[ticker] = today_counts.get(ticker, 0) + 1
 
     if added > 0 or superseded > 0:
         _save_all(existing)
@@ -190,9 +213,14 @@ def _supersedes(new_text: str, existing_text: str) -> bool:
 
 
 def deduplicate_monitoring() -> int:
-    """Resolves duplicate active items for the same ticker where a newer one
-    supersedes an older one (see `_supersedes()`). Idempotent — safe to call
-    on every brief run (see `brief_builder.build_morning_brief()`).
+    """Resolves duplicate active items for the same ticker: where a newer one
+    supersedes an older one (see `_supersedes()`), and — separately — where
+    a newer and older item are just paraphrases of the same condition with
+    no supersession signal (`_semantically_similar()` true, `_supersedes()`
+    false), e.g. brief and prices synthesis both proposing the same item the
+    same day in different words. In both cases the older item is resolved
+    and the newer kept. Idempotent — safe to call on every brief run (see
+    `brief_builder.build_morning_brief()`).
 
     Also normalizes malformed `ticker` fields that survived into storage
     from an earlier synthesis parse, before `_parse_and_persist_monitoring()`
@@ -277,6 +305,17 @@ def deduplicate_monitoring() -> int:
                         f"Superseded {today_str} during dedup by: {newer['item'][:60]}"
                     )
                     resolved += 1
+                elif _semantically_similar(newer.get("item", ""), older.get("item", "")):
+                    # Same condition, no supersession signal (no escalation
+                    # language, no changed number) — a plain paraphrase of
+                    # the same item, e.g. from brief + prices synthesis both
+                    # proposing it the same day. Keep the newer, resolve the
+                    # rest rather than leaving both active side by side.
+                    older["status"] = "resolved"
+                    older.setdefault("notes", []).append(
+                        f"Duplicate of newer item during dedup: {newer['item'][:60]}"
+                    )
+                    resolved += 1
 
     if resolved > 0 or normalized > 0:
         _save_all(data)
@@ -351,6 +390,73 @@ def dismiss_monitoring_item(item_id: str, reason: str = "") -> bool:
 def get_monitoring_for_ticker(ticker: str) -> list[dict]:
     """Returns active monitoring items for a specific ticker."""
     return [i for i in load_monitoring() if i.get("ticker", "").upper() == ticker.upper()]
+
+
+def _extract_key_signals(text: str) -> set[str]:
+    """Extracts key signals from monitoring item text for semantic comparison.
+
+    Two items covering the same ticker+level+direction should be flagged
+    as duplicates even if worded differently.
+
+    Extracts:
+    - Price levels (e.g. $81.00, $110, 29200)
+    - Direction words (above, below, break, cross, close, open)
+    - Time conditions (consecutive, session, daily, weekly)
+    """
+    signals = set()
+
+    # Extract dollar amounts / numeric levels
+    for m in re.findall(r'\$?([\d,]+\.?\d*)', text):
+        val = m.replace(',', '')
+        try:
+            signals.add(f'level_{float(val):.1f}')
+        except ValueError:
+            pass
+
+    # Extract direction
+    text_lower = text.lower()
+    for word in ['above', 'below', 'break', 'cross', 'close', 'open']:
+        if word in text_lower:
+            signals.add(f'dir_{word}')
+
+    # Extract time conditions
+    for word in ['consecutive', 'session', 'daily', 'weekly']:
+        if word in text_lower:
+            signals.add(f'time_{word}')
+
+    return signals
+
+
+def _semantically_similar(text1: str, text2: str) -> bool:
+    """Returns True if two monitoring items describe the same condition,
+    even if worded differently.
+
+    Two items are semantically similar if:
+    1. They share >=60% word overlap (existing `_similar()` logic), OR
+    2. They share the same price level(s) AND same direction
+       (e.g. "below $81.00" and "close below $81.00 three times")
+    """
+    # Existing word overlap check
+    if _similar(text1, text2):
+        return True
+
+    # Semantic signal overlap
+    s1 = _extract_key_signals(text1)
+    s2 = _extract_key_signals(text2)
+
+    if not s1 or not s2:
+        return False
+
+    # Must share at least one price level AND one direction
+    levels1 = {s for s in s1 if s.startswith('level_')}
+    levels2 = {s for s in s2 if s.startswith('level_')}
+    dirs1 = {s for s in s1 if s.startswith('dir_')}
+    dirs2 = {s for s in s2 if s.startswith('dir_')}
+
+    shared_levels = levels1 & levels2
+    shared_dirs = dirs1 & dirs2
+
+    return bool(shared_levels and shared_dirs)
 
 
 def _similar(a: str, b: str) -> bool:
