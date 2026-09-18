@@ -1396,6 +1396,14 @@ async def send_status(update, context):
     # so report against the hourly limit it's actually tracking.
     lines.append(f"🤖 Claude calls (last hour): {len(_claude_call_times)}/{MAX_CLAUDE_CALLS_PER_HOUR}")
 
+    # Approximate spend — Advisor chat/discuss/summarize/thesis calls only
+    # (see _track_api_cost()'s docstring for what this doesn't cover:
+    # the separate macro-intel and brief-synthesis clients).
+    from equity.telegram.advisor import _session_api_calls
+    calls = _session_api_calls["count"]
+    cost = _session_api_calls["est_cost_usd"]
+    lines.append(f"💰 API: {calls} calls this session | ~${cost:.3f} est. (advisor only)")
+
     # advisor.db size
     db_path = Path("equity/data/advisor.db")
     if db_path.exists():

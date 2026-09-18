@@ -1117,10 +1117,14 @@ def format_global_signals(signals: dict) -> str:
 # *dates*: this adds the consensus/prior/"what a beat means" color FRED's
 # release calendar doesn't carry, plus geopolitical/central-bank/overnight-
 # session/analyst-action context that has no quantitative source at all in
-# this module. Same _search-then-extract shape as
-# equity.telegram.advisor._web_search_and_extract() (search grounded in
-# live results, then a second grounded-extraction pass that refuses to
-# state anything not literally in the source).
+# this module. Single-call search-and-synthesize shape (see
+# _macro_search_and_synthesize()): Claude reads the actual web_search
+# results and writes the briefing prose directly, in the same turn — no
+# second grounded-extraction pass. Unlike
+# equity.telegram.advisor._web_search_and_extract()'s two-call
+# search-then-extract shape, this trades the extraction pass's "only state
+# facts literally in source" guardrail for denser, more connected prose;
+# `system` still tells the model never to fabricate.
 # ---------------------------------------------------------------------------
 
 _macro_intel_client: "anthropic.Anthropic | None" = None
@@ -1181,99 +1185,78 @@ def _macro_intel_budget_ok() -> bool:
     return True
 
 
-def _macro_search_and_extract(query: str, extract_prompt: str, max_tokens: int = 400) -> str:
-    """One web search + grounded-extraction pass. Never raises — returns
-    '' on any failure (no client configured, search error, empty result,
-    or a low-quality/non-answer extraction) so one search failing doesn't
-    take the others down with it.
+def _get_held_tickers() -> str:
+    """Comma-separated top-15 held tickers, for the synthesis system prompt."""
+    try:
+        return ", ".join(list(POSITIONS.keys())[:15])
+    except Exception:
+        return ""
 
-    The first call's `web_search_tool_result` blocks carry actual search
-    hits, but each hit's `content` is a `web_search_result` object whose
-    only text-bearing field is `encrypted_content` — an opaque, non-human-
-    readable blob meant to be round-tripped back to the API, not read
-    locally. There is no separate plaintext snippet to pull out of those
-    blocks. What IS readable and genuinely grounded in the search (as
-    opposed to Claude's own recall) is the response's `text` blocks plus
-    each block's `citations` — structured `title`/`url` pairs tying a
-    specific claim back to a specific search hit. The previous version
-    joined only the text blocks and dropped `citations` entirely, so the
-    extraction pass below was told to "include the source name for each
-    fact" with no actual source list to draw from — it could only guess
-    or invent a plausible-sounding outlet. Passing the citation list
-    through explicitly, and instructing the extraction to cite only from
-    it, closes that gap.
+
+def _macro_search_and_synthesize(
+    query: str,
+    context_prompt: str,
+    max_tokens: int = 500,
+    regime_flags: list[str] | None = None,
+) -> str:
+    """Single-call pattern: Claude searches and synthesizes in one turn.
+    No extraction pass — Claude reads the actual web_search results and
+    writes a direct, actionable briefing paragraph.
+
+    This produces better output than the previous search-then-extract
+    shape because:
+    - Claude sees the actual web content, not a formatted summary
+    - No "not found" from over-strict extraction rules
+    - Claude can connect multiple sources into a coherent narrative
+    - Output is prose ready for the brief, not structured fields
+
+    `regime_flags` (from fetch_macro_intelligence()'s caller) is folded
+    into the system prompt when present, so the synthesis interprets news
+    through the current regime lens rather than in a vacuum.
+
+    Never raises — returns '' on any failure (no client configured,
+    search error, or an empty response) so one search failing doesn't
+    take the others down with it.
     """
     client = _get_macro_intel_client()
     if client is None:
         return ""
+    regime_str = ""
+    if regime_flags:
+        regime_str = (
+            f"Current market regime flags: {', '.join(regime_flags)}. "
+            f"Interpret news through this lens. "
+        )
     try:
-        raw = client.messages.create(
+        response = client.messages.create(
             model=_MACRO_INTEL_MODEL,
             max_tokens=max_tokens,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": query}],
-        )
-
-        narrative_parts = []
-        seen_citations: set[tuple[str, str]] = set()
-        citation_lines = []
-        for block in raw.content:
-            if not (hasattr(block, "text") and block.text):
-                continue
-            narrative_parts.append(block.text)
-            for citation in getattr(block, "citations", None) or []:
-                title = getattr(citation, "title", None) or "untitled"
-                url = getattr(citation, "url", None) or ""
-                key = (title, url)
-                if key in seen_citations:
-                    continue
-                seen_citations.add(key)
-                citation_lines.append(f"- {title} ({url})" if url else f"- {title}")
-
-        raw_text = "\n".join(narrative_parts).strip()
-        if not raw_text:
-            return ""
-        if citation_lines:
-            raw_text += "\n\nSources actually cited by the search:\n" + "\n".join(citation_lines)
-
-        extraction = client.messages.create(
-            model=_MACRO_INTEL_MODEL,
-            max_tokens=max_tokens,
+            system=(
+                f"You are writing the macro intelligence section of a morning "
+                f"brief for a discretionary portfolio manager. "
+                f"Today is {datetime.now().strftime('%A, %B %d, %Y')}. "
+                f"The portfolio holds: {_get_held_tickers()}. "
+                f"{regime_str}"
+                f"Search for the information requested. "
+                f"Write a direct, dense briefing — not a structured extraction. "
+                f"Name specific price levels, specific companies, specific events. "
+                f"Connect events to held positions by ticker. "
+                f"If you find conflicting information, note it and use the more "
+                f"credible source. "
+                f"Never fabricate. If genuinely nothing found, say so in one line."
+            ),
             messages=[{
                 "role": "user",
-                "content": (
-                    f"{extract_prompt}\n\nSource:\n{raw_text}\n\n"
-                    f'Rules: Only state facts in source. If absent write "not found". '
-                    f"For each fact, name the source ONLY if it appears in the "
-                    f"'Sources actually cited by the search' list above — never invent "
-                    f"or infer a publication name that isn't in that list; omit the "
-                    f"source name for a fact if none of the listed sources back it. "
-                    f"When a cited source has a URL in that list, format it as a "
-                    f"markdown link: [Source Name](url). If it has no URL, write just "
-                    f"the source name. Never fabricate a URL that isn't in that list."
-                ),
+                "content": f"{context_prompt}\n\nSearch query: {query}",
             }],
         )
-        text_parts = [b.text for b in extraction.content if hasattr(b, "text") and b.text]
-        result = "\n".join(text_parts).strip()
-
-        # Quality gate — an extraction that found nothing real should omit
-        # the section entirely rather than render as a populated-looking
-        # "no qualifying events found" block. _is_not_found_placeholder()
-        # (used downstream by format_macro_intelligence()) already catches
-        # the short single-field "not found" case; this catches the
-        # longer non-answers models write instead of a bare refusal.
-        lowered = result.lower()
-        no_data_markers = ("no relevant results", "no qualifying", "cannot verify", "no information found", "none found")
-        if not result:
-            return ""
-        if len(result) < 200 and any(marker in lowered for marker in no_data_markers):
-            return ""
-        if lowered.startswith("i cannot") or lowered.startswith("i need to flag"):
-            return ""
-        return result
+        text = "\n".join(
+            b.text for b in response.content if hasattr(b, "text") and b.text
+        ).strip()
+        return text if text else ""
     except Exception as exc:
-        logger.warning("fetch_macro_intelligence search failed: %s", exc)
+        logger.warning("_macro_search_and_synthesize failed: %s", exc)
         return ""
 
 
@@ -1340,11 +1323,12 @@ def _should_invalidate_cache() -> bool:
 
 
 def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
-    """Five to seven targeted web searches surfacing geopolitical,
-    central-bank, economic-release, overnight-session, analyst-action, and
-    tech/AI narrative context (plus a dedicated FOMC preview in the days
-    before a meeting — see _is_fomc_preview_week()) — the narrative layer
-    for Section 1 (Global Markets), alongside
+    """Seven to eight targeted web searches surfacing the day's lead
+    market-moving story, central-bank, energy/geopolitical, overnight-
+    session, tech/AI, analyst-action, and economic-release narrative
+    context (plus a dedicated FOMC preview in the days before a meeting —
+    see _is_fomc_preview_week()) — the narrative layer for Section 1
+    (Global Markets), alongside
     fetch_market_snapshot()/fetch_global_signals()'s quantitative data.
 
     Cached MACRO_INTEL_CACHE_HOURS (6) hours in one shared file, keyed by
@@ -1355,10 +1339,11 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
     _should_invalidate_cache() sees a large enough market move that a new
     narrative likely emerged since the cache was written — otherwise a
     move early in the window would sit un-narrated for the rest of it.
-    The searches run concurrently, not sequentially — each is a
-    search-then-extract pair (2 blocking Claude calls), so running them
-    back to back would double the serial call count and push a cold fetch
-    to a minute or more.
+    The searches run concurrently, not sequentially — each is one
+    search-and-synthesize call (see _macro_search_and_synthesize()), but
+    a blocking Claude call with a live web search still takes several
+    seconds, so running 7-8 of them back to back would push a cold fetch
+    well past what a morning brief should wait on.
 
     Returns {} — never raises — if ANTHROPIC_API_KEY is unset, the hourly
     cold-fetch budget (MACRO_INTEL_MAX_PER_HOUR) is exhausted, or every
@@ -1386,127 +1371,113 @@ def fetch_macro_intelligence(regime_flags: list[str] | None = None) -> dict:
         return {}
 
     today = datetime.now().strftime("%B %d, %Y")
-    regime_str = ", ".join(regime_flags) if regime_flags else "none"
-    held_tickers = " ".join(list(POSITIONS.keys())[:10])  # top 10 by dict order
 
-    # key -> (query, extract_prompt, max_tokens)
+    # key -> (query, context_prompt, max_tokens)
     searches: dict[str, tuple[str, str, int]] = {
-        "geopolitical": (
-            f"oil price crude energy supply disruption geopolitical {today} "
-            f"AI regulation tech policy trade sanctions military conflict "
-            f"OPEC Saudi Arabia pipeline commodity market moving news",
-            f"Extract geopolitical and policy events from {today} that are "
-            f"moving markets (current regime: {regime_str}):\n"
-            f"- Any named meetings scheduled (OPEC, GCC, G7, G20, bilateral)\n"
-            f"- Military/conflict developments affecting energy or trade routes\n"
-            f"- Sanctions, tariffs, or trade policy announcements\n"
-            f"- Supply disruption events (pipeline, shipping, port)\n"
-            f"- AI/tech regulatory or policy actions with market impact\n"
-            f"- For each: what is the market impact direction and which assets\n"
-            f"Format: [Event] — [Market impact] — [Source]\n"
-            f"Only events from last 24 hours. Max 4 events.",
+        "lead_story": (
+            f"market moving news today {today} stocks oil Fed AI earnings",
+            (
+                "What is the single most important development moving markets today? "
+                "Search for it, then write 3-4 sentences: what happened, why it matters, "
+                "and which specific tickers in the portfolio are affected and how. "
+                "Be specific — name price levels, percentages, companies. "
+                "Include the source in parentheses at the end."
+            ),
             400,
         ),
         "central_banks": (
-            f"Federal Reserve ECB BOJ Bank of England central bank "
-            f"{today} meeting decision preview rate hike cut "
-            f"governor speech statement overnight",
-            f"Extract central bank intelligence from {today} "
-            f"(current regime: {regime_str}):\n"
-            f"- Next scheduled meeting date for Fed, ECB, BOJ, BOE\n"
-            f"- Current market probability for each (hike/hold/cut)\n"
-            f"- Any overnight speeches or statements with key quotes\n"
-            f"- Any consensus surveys or analyst previews published\n"
-            f"- Implied rate path changes from overnight sessions\n"
-            f"Format: [Bank] — [Next meeting: date] — [Market pricing] — [Key development]\n"
-            f"Only developments from last 24 hours.",
-            400,
+            f"Federal Reserve ECB BOJ rate decision {today} hike cut hold",
+            (
+                "What is the current central bank situation? "
+                "Search and write 2-3 sentences covering: "
+                "current Fed funds rate, last decision date and outcome, "
+                "next meeting date, and market pricing for that meeting. "
+                "If BOJ or ECB had a decision recently, include it. "
+                "Specific numbers only — no ranges without evidence."
+            ),
+            350,
         ),
-        "eco_releases": (
-            f"economic data release today {today} CPI PPI NFP GDP "
-            f"retail sales jobs report preview consensus estimate "
-            f"what to expect market impact",
-            f"Extract today's scheduled economic releases with context:\n"
-            f"- Release name, time (ET), and consensus estimate\n"
-            f"- Prior reading and trend\n"
-            f"- What a beat vs miss would mean for markets\n"
-            f"- Any specific thresholds the market is watching\n"
-            f"- Named analyst previews if available\n"
-            f"Format: [Release] [Time ET] — Consensus: [X] — Prior: [Y] — Watch: [threshold]\n"
-            f"Only releases scheduled for today.",
-            400,
+        "energy_geo": (
+            f"oil price Brent WTI Saudi Arabia OPEC energy supply {today}",
+            (
+                "What is the oil and energy situation today? "
+                "Write 2-3 sentences: current Brent and WTI prices, "
+                "what is driving the move (supply/demand/geopolitical), "
+                "and implications for CCJ, CEG, FCX, CAT in the portfolio. "
+                "If there is a geopolitical event affecting supply, name it specifically."
+            ),
+            350,
         ),
-        "overnight_session": (
-            f"Nikkei 225 Kospi Hang Seng ASX 200 DAX FTSE overnight {today} "
-            f"stock market Asia Europe open close percent change",
-            f"Extract overnight session highlights:\n"
-            f"- Asia: Nikkei, Kospi, Hang Seng, ASX moves with driver\n"
-            f"- Europe: DAX, FTSE, CAC moves with driver\n"
-            f"- Bonds: 10Y UST, JGB, Bund yield changes in bp\n"
-            f"- Single most important thing that happened overnight\n"
-            f"Format:\n"
-            f"ASIA: Nikkei [X%] | Kospi [X%] | Hang Seng [X%] | ASX [X%] — driver\n"
-            f"EUROPE: DAX [X%] | FTSE [X%] | CAC [X%] — driver\n"
-            f"BONDS: 10Y UST [±Xbp] | JGB [±Xbp] | Bund [±Xbp]\n"
-            f"LEAD: [single most important overnight development]\n"
-            f"Source every figure with [Name](url)\n"
-            f"Be specific. Only from last 12 hours.",
+        "overnight": (
+            f"Nikkei Kospi Hang Seng DAX FTSE overnight {today} markets",
+            (
+                "Write one line per region: "
+                "Asia: [Nikkei X%, Kospi X%, HSI X%] — [driver in 5 words]. "
+                "Europe: [DAX X%, FTSE X%] — [driver in 5 words]. "
+                "US futures: [ES X%, NQ X%] — [driver]. "
+                "Use actual percentages from search results. "
+                'If a market is not found, skip it rather than writing "not found".'
+            ),
+            250,
+        ),
+        "tech_ai": (
+            f"AI tech Microsoft Google Apple Nvidia semiconductor {today} news",
+            (
+                "What happened in tech and AI today that affects the portfolio? "
+                "Write 2-3 sentences covering any: earnings/guidance changes, "
+                "AI narrative developments, semiconductor news, analyst actions. "
+                "Name specific tickers and price reactions. "
+                "If nothing material, write one sentence saying so."
+            ),
             350,
         ),
         "analyst_notes": (
-            f"analyst upgrade downgrade price target {held_tickers} "
-            f"{today} Goldman Sachs Morgan Stanley JPMorgan "
-            f"Bank of America Citi research note",
-            f"Extract analyst actions for held positions from {today}:\n"
-            f"- Firm name, ticker, action (upgrade/downgrade/initiate/reiterate)\n"
-            f"- Old rating → New rating\n"
-            f"- Old target → New target\n"
-            f"- One-line rationale\n"
-            f"Format: [Firm] [TICKER] [action] [old→new rating] [old→new target] — [rationale]\n"
-            # "not found" (not a bespoke phrase) so format_macro_intelligence()'s
-            # shared not-found filter actually hides this section when empty.
-            f'Only actions from today. If none found, write "not found".',
-            350,
+            f"analyst upgrade downgrade price target {_get_held_tickers()} {today}",
+            (
+                "List any analyst rating changes or price target changes today "
+                "for stocks in the portfolio. "
+                "Format each as: [Firm] [TICKER] — [action] — [old→new target] — [rationale]. "
+                "Only include actions from today. "
+                'If none found, write one line: "No analyst actions today."'
+            ),
+            300,
         ),
-        "tech_narrative": (
-            f"earnings guidance upgrade downgrade product launch "
-            f"Microsoft Apple Nvidia AMD TSLA GOOGL META AMZN {today}",
-            f"Extract up to 3 company-specific developments from {today} "
-            f"(current regime: {regime_str}):\n"
-            f"- Ticker, company name, and what happened "
-            f"(earnings/guidance/product launch/M&A)\n"
-            f"- Stock impact: which direction, magnitude if known\n"
-            f"Format: [TICKER] [Company] — [what happened] — [stock impact] — [Source](url)\n"
-            f'If none found, write "not found".',
-            350,
+        "eco_releases": (
+            f"economic data release today {today} CPI PPI NFP GDP retail sales actual result",
+            (
+                "What economic data was released today? "
+                "For each release: name, actual vs consensus, beat/miss, "
+                "and one-sentence market impact. "
+                "If no releases today, say so in one line and name "
+                "the next important release this week."
+            ),
+            300,
         ),
     }
 
     if _is_fomc_preview_week():
         searches["fomc_preview"] = (
-            f"FOMC Federal Reserve meeting preview {today} "
-            f"rate hike dot plot expectations "
-            f"hawkish dovish dissent probability",
-            f"Extract an FOMC preview as of {today} "
-            f"(current regime: {regime_str}, held positions: {held_tickers}):\n"
-            f"- Meeting date\n"
-            f"- Current fed funds rate\n"
-            f"- Market-implied probability of hike/hold/cut\n"
-            f"- Key risk: what could surprise markets\n"
-            f"- Dot plot watch: what the new projections might show\n"
-            f"- Portfolio impact: which held positions are most affected and how\n"
-            f"Format: FOMC PREVIEW:\nMeeting date: [date]\nCurrent rate: [X]%\n"
-            f"Market pricing: [X]% probability hike/hold/cut\nKey risk: [risk]\n"
-            f"Dot plot watch: [watch]\nPortfolio impact: [impact]\n"
-            f'Source every figure. If not found, write "not found".',
+            f"FOMC Federal Reserve meeting preview dot plot {today}",
+            (
+                "Write a 3-sentence FOMC preview: "
+                "(1) What is the market pricing (% probability hike/hold/cut) "
+                "and what changed since the last meeting? "
+                "(2) What does the dot plot risk look like — "
+                "one-and-done or sustained hikes? "
+                "(3) What is the single most important thing to watch at 2PM ET "
+                "and how does it affect TLT, MSFT, AMZN, growth multiples? "
+                "Use specific numbers from search results."
+            ),
             400,
         )
 
     results: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=len(searches)) as pool:
         future_to_key = {
-            pool.submit(_macro_search_and_extract, query, extract_prompt, max_tokens): key
-            for key, (query, extract_prompt, max_tokens) in searches.items()
+            pool.submit(
+                _macro_search_and_synthesize, query, context_prompt, max_tokens, regime_flags
+            ): key
+            for key, (query, context_prompt, max_tokens) in searches.items()
         }
         for future in as_completed(future_to_key):
             key = future_to_key[future]
@@ -1557,13 +1528,14 @@ def format_macro_intelligence(intel: dict) -> str:
     lines = ["\U0001F4E1 MACRO INTELLIGENCE (web-sourced)", ""]
 
     section_labels = {
-        "geopolitical": "\U0001F310 Geopolitical & Market News",
+        "lead_story": "\U0001F4CC Lead",
         "central_banks": "\U0001F3E6 Central Banks",
-        "eco_releases": "\U0001F4CA Today's Releases",
-        "overnight_session": "\U0001F319 Overnight Session",
-        "analyst_notes": "\U0001F4CB Analyst Actions",
-        "tech_narrative": "\U0001F916 Tech & AI",
+        "energy_geo": "⛽ Energy & Geopolitical",
+        "overnight": "\U0001F319 Overnight",
+        "tech_ai": "\U0001F916 Tech & AI",
         "fomc_preview": "\U0001F3DB FOMC Preview",
+        "analyst_notes": "\U0001F4CB Analyst Actions",
+        "eco_releases": "\U0001F4CA Today's Releases",
     }
 
     # No per-section character cap here — a prior 450-char cap with a
