@@ -1643,6 +1643,35 @@ class Advisor:
             )
             _track_api_cost(response)
             text = next((b.text for b in response.content if b.type == "text"), "")
+
+            if response.stop_reason == "max_tokens":
+                logger.info(
+                    "Advisor.chat: response truncated (max_tokens) for %s, requesting continuation",
+                    thread_id,
+                )
+                try:
+                    continuation_messages = messages + [
+                        {"role": "assistant", "content": text},
+                        {"role": "user", "content": "Please continue from where you left off."},
+                    ]
+                    continuation = self.client.messages.create(
+                        model=MODEL,
+                        max_tokens=2000,
+                        system=system_prompt,
+                        messages=continuation_messages,
+                    )
+                    _track_api_cost(continuation)
+                    continuation_text = next(
+                        (b.text for b in continuation.content if b.type == "text"), ""
+                    )
+                    if continuation_text:
+                        text = f"{text}\n\n{continuation_text}"
+                except Exception as exc:
+                    # Truncated response is still usable on its own — a failed
+                    # continuation shouldn't turn a partial answer into an error.
+                    logger.warning(
+                        "Advisor.chat: continuation call failed for %s: %s", thread_id, exc
+                    )
         except Exception as exc:
             logger.error("Advisor.chat: Claude API call failed for %s: %s", thread_id, exc)
             text = f"⚠️ Claude API error: {exc}"

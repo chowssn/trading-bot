@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -66,6 +67,20 @@ def split_message(text: str, max_length: int = 4000) -> list[str]:
     return [p for p in parts if p]
 
 
+def _clean_response_text(text: str) -> str:
+    """Remove any leaked function call markup from advisor responses."""
+    # Remove <functioncalls>...</functioncalls> blocks entirely
+    text = re.sub(r'<functioncalls>.*?</functioncalls>', '', text,
+                  flags=re.DOTALL)
+    # Remove individual invoke tags
+    text = re.sub(r'<invoke>.*?</invoke>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<parameter name="[^"]*">.*?</parameter>', '', text,
+                  flags=re.DOTALL)
+    # Clean up extra blank lines left behind
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 async def send_safe(bot, chat_id: int, text: str,
                     reply_markup=None) -> None:
     """
@@ -75,6 +90,10 @@ async def send_safe(bot, chat_id: int, text: str,
     Only attaches reply_markup to the last part.
     """
     if not text or not text.strip():
+        return
+
+    text = _clean_response_text(text)
+    if not text:
         return
 
     parts = split_message(text, max_length=4000)
