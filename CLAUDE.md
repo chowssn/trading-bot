@@ -92,6 +92,32 @@ consistent with copper (HG=F) and is standard market practice.
 limitations above (`_KNOWN_LIMITATIONS`) and reports them as INFO rather
 than WARNING, so PASS reflects genuinely unexpected data issues only.
 
+CFTC COT Treasury positioning (`fetch_cot_positioning()` in
+`equity/brief/market_snapshot.py`) parses the weekly Traders in Financial
+Futures file at `cftc.gov/dea/newcot/FinFutWk.txt`. That file has **no
+header row** and is read positionally (`_COT_COL_*`) — `csv.DictReader`
+would consume the first contract as a header and silently return zeros.
+Market names in `COT_TREASURY_MARKETS` must match exactly, not by
+substring: "UST BOND - CHICAGO BOARD OF TRADE" (ZB) is a substring of
+"ULTRA UST BOND - CHICAGO BOARD OF TRADE" (UB, a different contract).
+The file carries one week only, so there is no history for percentile or
+"record positioning" flags — extremeness is measured as net / open
+interest against the `COT_PCT_OI_*` heuristics. A true percentile needs
+the annual archive at `cftc.gov/files/dea/history/fut_fin_txt_<year>.zip`.
+Note that leveraged-fund Treasury shorts are structurally large (the
+hedge leg of the cash-futures basis trade), so the sign is not a
+directional signal on its own.
+
+SEC EDGAR filings (`fetch_edgar_filings()` in
+`equity/portfolio/news_triage.py`) use the **submissions API**
+(`data.sec.gov/submissions/CIK*.json`), which is scoped to the filer —
+not EDGAR full-text search (`efts.sec.gov`), which matches filing text
+and so returns every filing that merely mentions a ticker. Every SEC
+request needs a declared `User-Agent` or it gets a 403 HTML page instead
+of JSON; override the default via `SEC_EDGAR_USER_AGENT` in `.env`.
+ETFs and non-US listings (QQQ, TLT, SPY, BYDDY…) have no ticker-mapped
+CIK and are skipped — that is correct, not a failure.
+
 ## Tech stack
 - Python 3.12, venv
 - pandas for data handling

@@ -66,9 +66,9 @@ def _track_api_cost(response) -> None:
         pass
 
 
-# Hourly cap on _fetch_web_fundamentals() batches — each batch is 4
+# Hourly cap on _fetch_web_fundamentals() batches — each batch is 5
 # searches x 2 Claude calls (a web search + a grounded-extraction pass
-# each) = 8 calls. See _web_fundamentals_budget_ok() for why this can't
+# each) = 10 calls. See _web_fundamentals_budget_ok() for why this can't
 # just reuse bot.py's check_claude_rate_limit().
 WEB_FUNDAMENTALS_MAX_PER_HOUR = 8
 
@@ -217,6 +217,11 @@ Four-question framework:
 (1) Is it a great business? ROIC-led quality filter.
 (2) Is market mispricing it? 1Y return + RSI dislocation.
 (3) Why might the market be right? Stress-test the thesis.
+    Include supply/demand technical factors in the bear case, not just
+    fundamental ones: secondary offering overhang, lockup expirations,
+    insider selling patterns, shelf registrations. These create a
+    near-term ceiling even when the fundamental thesis is intact — and
+    they are a separate question from whether the business is sound.
 (4) Is now a good entry? RSI 14D direction + timing signal.
 
 Exit rule: thesis broken — not price target.
@@ -663,16 +668,50 @@ class Advisor:
                 if text:
                     results.append(text)
 
-        if not results:
+        # CFTC COT positioning — not a web search: a parsed public CFTC
+        # file, 24h-cached in market_snapshot. Appended so the advisor has
+        # current spec/real-money Treasury positioning when TLT, yields or
+        # the rate thesis come up, instead of reasoning from training data.
+        # Imported locally to keep the brief package out of advisor's
+        # import path at module load.
+        try:
+            from equity.brief.market_snapshot import (
+                fetch_cot_positioning,
+                format_cot_positioning,
+            )
+
+            cot_block = format_cot_positioning(fetch_cot_positioning())
+        except Exception as exc:
+            logger.warning("get_macro_context: COT positioning failed: %s", exc)
+            cot_block = ""
+
+        if not results and not cot_block:
             return ""
 
-        result = (
-            "--- CURRENT MACRO DATA (web-searched this session) ---\n"
-            "Use these figures, not training data, for anything they cover. "
-            "For a current statistic not covered here, follow the MACRO "
-            "STATISTICS rule above rather than stating a training-data figure.\n\n"
-            + "\n\n".join(results)
-        )
+        # Two separately labeled blocks, not one. COT is a parsed public
+        # CFTC file, not a web search, and this codebase's data-integrity
+        # rules turn on the model knowing exactly where a figure came
+        # from — folding it under the "web-searched this session" header
+        # would mislabel its provenance.
+        parts = []
+        if results:
+            parts.append(
+                "--- CURRENT MACRO DATA (web-searched this session) ---\n"
+                "Use these figures, not training data, for anything they cover. "
+                "For a current statistic not covered here, follow the MACRO "
+                "STATISTICS rule above rather than stating a training-data figure.\n\n"
+                + "\n\n".join(results)
+            )
+        if cot_block:
+            parts.append(
+                "--- CFTC POSITIONING (parsed from CFTC's weekly public file) ---\n"
+                "Official CFTC data, released Fridays for the prior Tuesday — not a "
+                "web search and not training data. Cite the report date when "
+                "referencing it, and treat it as a position snapshot, not a "
+                "price forecast.\n\n" + cot_block
+            )
+
+        result = "\n\n".join(parts)
         self._macro_ctx_cache[cache_key] = (result, now)
         return result
 
@@ -1014,26 +1053,27 @@ class Advisor:
             return ""
 
     def _fetch_web_fundamentals(self, ticker: str, company_name: str = "") -> dict:
-        """Four targeted web searches filling get_ticker_context()'s data
+        """Five targeted web searches filling get_ticker_context()'s data
         gaps — market cap/shares/segments/customers, earnings date +
-        analyst consensus, recent material events (last 90 days), and
-        named competitors. Returns {section_key: extracted_text}; a
+        analyst consensus, recent material events (last 90 days), named
+        competitors, and corporate actions affecting near-term share
+        supply/demand (offerings, lockups, insider sales, buybacks). Returns {section_key: extracted_text}; a
         section is simply absent from the dict if its search found
         nothing or failed (never a fabricated placeholder).
 
         Results are used in this conversation's context only — nothing
         here is written to thread history or any other persisted store.
 
-        The 4 searches are independent (each its own search + extraction
+        The 5 searches are independent (each its own search + extraction
         pair) and run concurrently, not sequentially — each pair is two
-        blocking Anthropic calls, so doing all 4 one after another would
+        blocking Anthropic calls, so doing all 5 one after another would
         push a ticker-open to 40-60s+ rather than the ~10-20s a fresh
         /discuss TICKER is expected to take.
 
         Cached per ticker per calendar day (`self._web_fundamentals_cache`)
         — market cap/segments/consensus/recent-events don't move within a
         session, so re-opening the same ticker later today reuses this
-        morning's batch instead of re-running 4 web searches (~$0.05) for
+        morning's batch instead of re-running 5 web searches (~$0.06) for
         data that hasn't changed. get_ticker_context() labels this section
         by when it was actually fetched, not "this session", so a cached
         answer is never misrepresented as freshly searched.
@@ -1115,6 +1155,24 @@ class Advisor:
                 f"- Key competitive threats or vulnerabilities\n"
                 f"- Any recent competitive wins or losses vs named peers\n"
                 f'Do not estimate market share if not found — write "not found".',
+                400,
+            ),
+            "corporate_actions": (
+                f"{ticker} {name_ctx} secondary offering lockup expiration "
+                f"insider selling share buyback SEC filing 2026",
+                f"Extract corporate action intelligence for {ticker} "
+                f"that affects near-term supply/demand:\n"
+                f"- Any secondary offerings: price, size, date, discount to market\n"
+                f"- Lockup expiration dates (IPO or secondary lockups)\n"
+                f"- Insider selling: who, how many shares, at what price\n"
+                f"- Share buyback: authorized amount, pace, remaining\n"
+                f"- Any shelf registrations (S-3) filed recently\n"
+                f"- Block trades or large institutional sells reported\n"
+                f"- For each: state the overhang or tailwind implication\n"
+                f"Only include events from last 90 days. "
+                f'If none found, write "no material corporate actions found".\n'
+                f"Format: [Event] — [size/price] — [overhang/tailwind implication] "
+                f"— [Source, Date]",
                 400,
             ),
         }
@@ -1420,6 +1478,7 @@ class Advisor:
                     "earnings_consensus": "EARNINGS & ANALYST CONSENSUS",
                     "recent_events": "MATERIAL EVENTS (last 90 days)",
                     "competitive": "COMPETITIVE LANDSCAPE",
+                    "corporate_actions": "CORPORATE ACTIONS & SUPPLY/DEMAND",
                 }
                 for key, label in section_labels.items():
                     if web_data.get(key):

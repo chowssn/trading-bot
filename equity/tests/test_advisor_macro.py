@@ -103,11 +103,22 @@ class TestGetMacroContext(unittest.TestCase):
     # -> real FRED/FMP network calls. Patch it to a deterministic False for
     # every test here except the ones that specifically exercise it, so this
     # stays a hermetic unit test of get_macro_context() itself.
+    #
+    # get_macro_context() also appends CFTC COT positioning, which it
+    # imports from market_snapshot inside the function body — so it's
+    # patched at its source module, and defaulted to "no data" here so
+    # these tests neither hit cftc.gov nor depend on a cache file. The
+    # COT-specific paths are exercised explicitly below.
     def setUp(self):
         self._release_day_patch = patch.object(advisor_module, "_is_major_release_day", return_value=False)
         self._release_day_patch.start()
+        self._cot_patch = patch(
+            "equity.brief.market_snapshot.fetch_cot_positioning", return_value={}
+        )
+        self._cot_patch.start()
 
     def tearDown(self):
+        self._cot_patch.stop()
         self._release_day_patch.stop()
 
     def test_runs_three_baseline_searches_and_combines_results(self):
@@ -167,7 +178,7 @@ class TestGetMacroContext(unittest.TestCase):
             result = adv.get_macro_context(topic="fed funds rate")
         self.assertIn("B", result)
 
-    def test_returns_empty_string_when_all_searches_fail(self):
+    def test_returns_empty_string_when_all_searches_fail_and_no_cot(self):
         adv = _make_advisor()
         with patch.object(Advisor, "_web_search_and_extract", return_value=""):
             self.assertEqual(adv.get_macro_context(), "")
@@ -176,6 +187,36 @@ class TestGetMacroContext(unittest.TestCase):
         adv = _make_advisor()
         with patch.object(Advisor, "_web_search_and_extract", side_effect=Exception("boom")):
             self.assertEqual(adv.get_macro_context(), "")
+
+    def test_cot_block_appended_under_its_own_provenance_header(self):
+        """COT is a parsed CFTC file, not a web search — it must not be
+        folded under the 'web-searched this session' header."""
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="a web fact"), \
+             patch("equity.brief.market_snapshot.format_cot_positioning", return_value="COT BLOCK"):
+            result = adv.get_macro_context()
+        self.assertIn("web-searched this session", result)
+        self.assertIn("CFTC POSITIONING", result)
+        self.assertIn("COT BLOCK", result)
+        # The COT header must come after the web-search block ends, not inside it.
+        self.assertGreater(result.index("CFTC POSITIONING"), result.index("a web fact"))
+
+    def test_cot_survives_total_search_failure(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value=""), \
+             patch("equity.brief.market_snapshot.format_cot_positioning", return_value="COT BLOCK"):
+            result = adv.get_macro_context()
+        self.assertIn("COT BLOCK", result)
+        self.assertNotIn("web-searched this session", result)
+
+    def test_cot_failure_does_not_break_macro_context(self):
+        adv = _make_advisor()
+        with patch.object(Advisor, "_web_search_and_extract", return_value="a web fact"), \
+             patch("equity.brief.market_snapshot.fetch_cot_positioning",
+                   side_effect=RuntimeError("cftc down")):
+            result = adv.get_macro_context()
+        self.assertIn("a web fact", result)
+        self.assertNotIn("CFTC POSITIONING", result)
 
     def test_respects_shared_web_fundamentals_budget(self):
         adv = _make_advisor()

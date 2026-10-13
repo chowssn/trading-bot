@@ -34,6 +34,8 @@ are long-dormant/legacy codes that may 404 depending on the account's FRED
 catalog access; see `_fetch_fred_series_cached()`.
 """
 
+import csv
+import io
 import json
 import logging
 import operator
@@ -45,6 +47,7 @@ from pathlib import Path
 
 import anthropic
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from fredapi import Fred
 
@@ -52,6 +55,12 @@ from equity.config.market_config import (
     COMMODITY_TICKERS,
     COMMODITY_TICKERS_EXTENDED,
     CREDIT_TICKERS,
+    COT_CACHE_HOURS,
+    COT_PCT_OI_EXTREME,
+    COT_PCT_OI_STRETCHED,
+    COT_SHORT_BASE_RATIO,
+    COT_TENOR_ORDER,
+    COT_TREASURY_MARKETS,
     CROSS_ASSET_RATIOS,
     CRYPTO_TICKERS,
     EQUITY_BENCHMARKS,
@@ -1571,6 +1580,298 @@ def format_macro_intelligence(intel: dict) -> str:
         except ValueError:
             pass
     lines.append(footer)
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# CFTC COT positioning — Treasury futures
+# ----------------------------------------------------------------------
+
+_COT_URL = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+_COT_CACHE_PATH = _CACHE_DIR / "cot_positioning.json"
+_COT_TIMEOUT_SECONDS = 15
+
+# Column offsets in FinFutWk.txt. The file is comma-delimited with NO
+# HEADER ROW — its first line is already data — so it has to be read
+# positionally. (csv.DictReader would silently consume that first
+# contract as the header and then return None for every field, yielding
+# an all-zero parse rather than an error.) Offsets below are from the
+# CFTC Traders in Financial Futures (TFF) futures-only layout and were
+# verified against the 2026-10-06 report: for every row,
+# dealer+asset-mgr+leveraged+other longs plus all four spread columns
+# equal Tot_Rept_Positions_Long_All (col 20), and likewise for shorts.
+_COT_COL_MARKET = 0
+_COT_COL_REPORT_DATE = 2
+_COT_COL_OPEN_INTEREST = 7
+_COT_COL_DEALER_LONG = 8
+_COT_COL_DEALER_SHORT = 9
+_COT_COL_AM_LONG = 11
+_COT_COL_AM_SHORT = 12
+_COT_COL_LEV_LONG = 14
+_COT_COL_LEV_SHORT = 15
+_COT_MIN_COLUMNS = 16
+
+
+def _cot_int(row: list[str], index: int) -> int | None:
+    """One COT numeric cell as an int, or None if absent/blank/non-numeric.
+
+    Cells are space-padded in the raw file and a withheld value is a
+    bare ".", so this returns None rather than 0 for a missing figure —
+    0 is a real position size and must not stand in for "unknown".
+    """
+    try:
+        raw = row[index].strip()
+    except IndexError:
+        return None
+    if not raw or raw == ".":
+        return None
+    try:
+        return int(raw.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _load_cot_cache() -> dict | None:
+    """Cached COT payload if it's younger than COT_CACHE_HOURS, else None."""
+    if not _COT_CACHE_PATH.exists():
+        return None
+    try:
+        age_hours = (time.time() - _COT_CACHE_PATH.stat().st_mtime) / 3600
+        if age_hours >= COT_CACHE_HOURS:
+            return None
+        return json.loads(_COT_CACHE_PATH.read_text())
+    except Exception:
+        logger.debug("COT cache unreadable — refetching", exc_info=True)
+        return None
+
+
+def fetch_cot_positioning() -> dict:
+    """CFTC Commitment of Traders positioning for benchmark Treasury futures.
+
+    Source is the weekly Traders in Financial Futures (TFF) text report at
+    `_COT_URL`, released Fridays ~3:30 PM ET with positions as of the
+    prior Tuesday. Free public data, no API key.
+
+    Returns `{"report_date": "YYYY-MM-DD", "positions": {tenor: {...}},
+    "fetched_at": iso}` covering 2Y/5Y/10Y/30Y (`COT_TREASURY_MARKETS`),
+    with net/long/short for each of the three participant classes that
+    matter here — leveraged funds (hedge-fund "spec" positioning), asset
+    managers (real money: pensions, mutual funds) and dealers (primary
+    dealers, largely structural hedging) — plus open interest and each
+    net as a share of it.
+
+    `{}` on any failure (network, HTTP error, unparseable file), never an
+    exception: this feeds one optional brief section and must not be able
+    to take the brief down.
+
+    Cached to `equity/data/cache/cot_positioning.json` for
+    COT_CACHE_HOURS, same cache shape (`fetched_at` + payload,
+    mtime-age-checked on read) as `_load_fed_funds_cache()`.
+    """
+    cached = _load_cot_cache()
+    if cached is not None:
+        return cached
+
+    try:
+        # CFTC serves this file without requiring a User-Agent, but send
+        # an identifying one anyway — it's the courtesy the SEC and most
+        # other public-data hosts require outright.
+        response = requests.get(
+            _COT_URL,
+            timeout=_COT_TIMEOUT_SECONDS,
+            headers={"User-Agent": "equity-brief/1.0 (personal research)"},
+        )
+        response.raise_for_status()
+        result = _parse_cot_file(response.text)
+    except Exception as exc:
+        logger.warning("fetch_cot_positioning failed: %s", exc)
+        return {}
+
+    if not result.get("positions"):
+        # Reaching the file but matching no Treasury contract means the
+        # layout or the market names changed — worth a warning, and not
+        # worth caching an empty result for 24h.
+        logger.warning(
+            "fetch_cot_positioning: no Treasury contracts matched in %s — "
+            "CFTC market names or column layout may have changed",
+            _COT_URL,
+        )
+        return {}
+
+    result["fetched_at"] = datetime.now().isoformat()
+    try:
+        _COT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _COT_CACHE_PATH.write_text(json.dumps(result))
+    except Exception:
+        logger.debug("Could not write COT cache", exc_info=True)
+    return result
+
+
+def _parse_cot_file(text: str) -> dict:
+    """Parse FinFutWk.txt into `{"report_date", "positions"}`.
+
+    Read positionally (see `_COT_COL_*`) because the file carries no
+    header row. Market names are matched exactly against
+    `COT_TREASURY_MARKETS`, not by substring — "UST BOND - CHICAGO BOARD
+    OF TRADE" (ZB) is a substring of "ULTRA UST BOND - CHICAGO BOARD OF
+    TRADE" (UB, a different contract), so substring matching would let
+    whichever row came last overwrite the 30Y entry.
+
+    A row whose leveraged-fund or asset-manager figures are missing is
+    skipped rather than recorded with zeros.
+    """
+    result: dict = {"positions": {}, "report_date": None}
+
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        if len(row) < _COT_MIN_COLUMNS:
+            continue
+
+        tenor = COT_TREASURY_MARKETS.get(row[_COT_COL_MARKET].strip())
+        if tenor is None:
+            continue
+
+        lev_long = _cot_int(row, _COT_COL_LEV_LONG)
+        lev_short = _cot_int(row, _COT_COL_LEV_SHORT)
+        am_long = _cot_int(row, _COT_COL_AM_LONG)
+        am_short = _cot_int(row, _COT_COL_AM_SHORT)
+        if None in (lev_long, lev_short, am_long, am_short):
+            logger.debug("COT: incomplete row for %s — skipping", tenor)
+            continue
+
+        dealer_long = _cot_int(row, _COT_COL_DEALER_LONG)
+        dealer_short = _cot_int(row, _COT_COL_DEALER_SHORT)
+        open_interest = _cot_int(row, _COT_COL_OPEN_INTEREST)
+
+        lev_net = lev_long - lev_short
+        am_net = am_long - am_short
+        report_date = row[_COT_COL_REPORT_DATE].strip()
+        if not result["report_date"]:
+            result["report_date"] = report_date
+
+        entry = {
+            "lev_net": lev_net,
+            "lev_long": lev_long,
+            "lev_short": lev_short,
+            "am_net": am_net,
+            "am_long": am_long,
+            "am_short": am_short,
+            "open_interest": open_interest,
+            "report_date": report_date,
+        }
+        if dealer_long is not None and dealer_short is not None:
+            entry["dealer_net"] = dealer_long - dealer_short
+            entry["dealer_long"] = dealer_long
+            entry["dealer_short"] = dealer_short
+        # Net as a share of open interest — the only cross-tenor
+        # comparable measure available from a single weekly snapshot.
+        if open_interest:
+            entry["lev_pct_oi"] = lev_net / open_interest
+            entry["am_pct_oi"] = am_net / open_interest
+
+        result["positions"][tenor] = entry
+
+    return result
+
+
+def _cot_extreme_flag(entry: dict) -> str:
+    """Positioning-stretch marker for one tenor, from |lev net| / open interest."""
+    pct_oi = entry.get("lev_pct_oi")
+    if pct_oi is None:
+        return ""
+    if abs(pct_oi) >= COT_PCT_OI_EXTREME:
+        return f" ⚠️ CROWDED ({pct_oi:+.0%} of OI)"
+    if abs(pct_oi) >= COT_PCT_OI_STRETCHED:
+        return f" ({pct_oi:+.0%} of OI)"
+    return ""
+
+
+def _format_cot_interpretation(positions: dict) -> list[str]:
+    """TLT-relevant reads across the 10Y/30Y points. Empty if neither is present."""
+    pos_10y, pos_30y = positions.get("10Y"), positions.get("30Y")
+    lines: list[str] = []
+
+    if pos_10y:
+        pct_oi = pos_10y.get("lev_pct_oi")
+        if pos_10y["lev_net"] < 0 and pct_oi is not None and abs(pct_oi) >= COT_PCT_OI_STRETCHED:
+            lines.append(
+                f"• 10Y spec net short {pos_10y['lev_net']:,} ({pct_oi:+.0%} of OI) — "
+                f"large short base, so a thesis break unwinds violently"
+            )
+
+    # Compared on magnitudes and gated on both legs actually being short:
+    # a raw `net_30y < net_10y * 0.5` comparison inverts once either net
+    # turns positive, and would print a short-covering read off two long
+    # positions.
+    if pos_10y and pos_30y and pos_10y["lev_net"] < 0 and pos_30y["lev_net"] < 0:
+        if abs(pos_30y["lev_net"]) < abs(pos_10y["lev_net"]) * COT_SHORT_BASE_RATIO:
+            lines.append(
+                f"• 30Y spec short ({pos_30y['lev_net']:,}) is well under half the 10Y "
+                f"short ({pos_10y['lev_net']:,}) — watch the long end for covering first"
+            )
+
+    if pos_10y and pos_10y["am_net"] > 0 and pos_10y["lev_net"] < 0:
+        lines.append(
+            f"• Real money net long ({pos_10y['am_net']:+,}) against specs net short "
+            f"({pos_10y['lev_net']:+,}) — asset managers are buying what specs are selling"
+        )
+
+    if lines:
+        # Leveraged funds carry a structural short in Treasury futures as
+        # the hedge leg of the cash-futures basis trade (long cash bond,
+        # short future). A large spec short is therefore the normal
+        # state, not a standing contrarian signal — the information is in
+        # the change and in how it sits vs. open interest, not in the
+        # sign. Stated here so the reader and the advisor don't read
+        # "net short" as a bearish rates view.
+        lines.append(
+            "• Caveat: leveraged-fund shorts are partly the hedge leg of the "
+            "cash-futures basis trade, not a directional rates view"
+        )
+        return ["*Portfolio interpretation (TLT):*"] + lines
+    return []
+
+
+def format_cot_positioning(cot_data: dict) -> str:
+    """Render `fetch_cot_positioning()`'s output for the brief.
+
+    Returns '' for empty/failed data so the caller can skip the section
+    entirely rather than printing an empty header.
+    """
+    positions = (cot_data or {}).get("positions")
+    if not positions:
+        return ""
+
+    report_date = cot_data.get("report_date") or "unknown date"
+    lines = [
+        f"📊 CFTC COT POSITIONING (positions as of {report_date})",
+        _DIVIDER,
+    ]
+
+    for tenor in COT_TENOR_ORDER:
+        entry = positions.get(tenor)
+        if not entry:
+            continue
+
+        lev_net, am_net = entry["lev_net"], entry["am_net"]
+        lev_dir = "🔴 SHORT" if lev_net < 0 else "🟢 LONG"
+        am_dir = "🔴 SHORT" if am_net < 0 else "🟢 LONG"
+
+        lines.append(f"*{tenor} Treasury*{_cot_extreme_flag(entry)}")
+        lines.append(f"  Spec (hedge funds): {lev_dir} {lev_net:+,}")
+        lines.append(f"  Real money (AM):    {am_dir} {am_net:+,}")
+        if entry.get("dealer_net") is not None:
+            dealer_net = entry["dealer_net"]
+            dealer_dir = "🔴 SHORT" if dealer_net < 0 else "🟢 LONG"
+            lines.append(f"  Dealers:            {dealer_dir} {dealer_net:+,}")
+        lines.append("")
+
+    interpretation = _format_cot_interpretation(positions)
+    if interpretation:
+        lines.extend(interpretation)
+        lines.append("")
+
+    lines.append(_DIVIDER)
     return "\n".join(lines)
 
 

@@ -607,3 +607,88 @@ CLASSIFICATION_STATUS = {
 
 # Position sizing alerts — flag when position is outside tier bounds
 POSITION_SIZE_ALERT_ENABLED = True
+
+# ============================================================
+# CFTC COT POSITIONING — Treasury futures (TFF report)
+# Source: https://www.cftc.gov/dea/newcot/FinFutWk.txt
+# Released Fridays ~3:30 PM ET, positions as of the prior Tuesday.
+#
+# Keys are the EXACT `Market_and_Exchange_Names` strings in the file.
+# Matching must be exact, not substring: "UST BOND - CHICAGO BOARD OF
+# TRADE" is a substring of "ULTRA UST BOND - CHICAGO BOARD OF TRADE"
+# (a different contract, UB vs ZB), so substring matching would collapse
+# the two. ULTRA UST 10Y (TN) and ULTRA UST BOND (UB) are deliberately
+# excluded — they are separate contracts from the ZN/ZB benchmarks.
+# ============================================================
+COT_TREASURY_MARKETS = {
+    "UST 2Y NOTE - CHICAGO BOARD OF TRADE": "2Y",
+    "UST 5Y NOTE - CHICAGO BOARD OF TRADE": "5Y",
+    "UST 10Y NOTE - CHICAGO BOARD OF TRADE": "10Y",
+    "UST BOND - CHICAGO BOARD OF TRADE": "30Y",
+}
+
+COT_TENOR_ORDER = ["2Y", "5Y", "10Y", "30Y"]
+COT_CACHE_HOURS = 24          # data only changes weekly; 24h is conservative
+
+# Extremeness is measured as |net position| / open interest, NOT as a raw
+# contract count. Raw thresholds don't travel across tenors: as of the
+# 2026-10-06 report, leveraged-fund net shorts were -2.14M contracts in
+# 10Y, -2.13M in 5Y, -1.26M in 2Y and -190K in 30Y, so any single raw
+# cutoff in the hundreds of thousands either fires on every tenor or on
+# none. Normalizing by open interest gives -37%, -31%, -28% and -10%
+# respectively — comparable across the curve.
+#
+# These two cutoffs are heuristics, not percentiles: the weekly file is a
+# single snapshot with no history, so "stretched" here means large
+# relative to the contract's own open interest, never "a record". A true
+# percentile needs the CFTC annual archive
+# (https://www.cftc.gov/files/dea/history/fut_fin_txt_<year>.zip).
+COT_PCT_OI_STRETCHED = 0.25   # |net| > 25% of OI: notable
+COT_PCT_OI_EXTREME = 0.35     # |net| > 35% of OI: crowded
+
+# A 30Y-vs-10Y short-base ratio below this reads as "30Y shorts are much
+# smaller than 10Y" (compared on magnitudes, and only when both are net
+# short — see _format_cot_interpretation()).
+COT_SHORT_BASE_RATIO = 0.5
+
+# ============================================================
+# SEC EDGAR FILINGS — supply/demand-relevant filings for holdings
+# ============================================================
+EDGAR_LOOKBACK_DAYS = 7
+EDGAR_MAX_TICKERS = 10          # cap per run, to stay well inside SEC rate limits
+EDGAR_MAX_FILINGS_PER_TICKER = 3
+EDGAR_CACHE_HOURS = 6
+EDGAR_REQUEST_DELAY_SECONDS = 0.15   # SEC fair-access limit is 10 req/s
+
+# Forms that move near-term share supply/demand. Matched exactly against
+# the submissions API's `form` field, so each variant has to be listed
+# (S-3 vs S-3ASR, 424B5 vs 424B3) rather than prefix-matched — a prefix
+# match on "S-3" would also catch "S-3/A" amendments, which is fine, but
+# one on "4" would catch 424B5, 4/A and 40-F alike.
+EDGAR_FORMS_OF_INTEREST = {
+    "8-K": "material event",
+    "8-K/A": "material event (amended)",
+    "S-3": "shelf registration",
+    "S-3ASR": "automatic shelf registration",
+    "S-1": "registration statement",
+    "424B5": "prospectus — takedown off shelf",
+    "424B3": "prospectus supplement",
+    "4": "insider transaction",
+}
+
+# 8-K item codes worth flagging. The submissions API returns these in an
+# `items` field (e.g. "2.02,9.01"), which saves fetching and parsing the
+# filing document itself.
+EDGAR_8K_ITEMS_OF_INTEREST = {
+    "1.01": "material agreement entered",
+    "1.02": "material agreement terminated",
+    "2.02": "results of operations",
+    "2.03": "material debt obligation",
+    "3.01": "delisting / listing-rule failure",
+    "3.02": "unregistered equity sale (dilution)",
+    "4.01": "auditor change",
+    "4.02": "non-reliance on prior financials",
+    "5.02": "director/officer departure or appointment",
+    "7.01": "regulation FD disclosure",
+    "8.01": "other material event",
+}

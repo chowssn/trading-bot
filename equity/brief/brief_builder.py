@@ -177,13 +177,18 @@ def _format_section3_portfolio_status(monitor_data, perf_data, rel_data, spot_da
     return "\n".join(parts)
 
 
-def _format_section4_news_signals(triage: dict, df_screener) -> str:
-    """News triage + screener results."""
+def _format_section4_news_signals(triage: dict, df_screener, edgar: dict | None = None) -> str:
+    """News triage + recent SEC filings + screener results."""
     parts = [
         "📰 NEWS & SIGNALS",
         _DIVIDER_LIGHT,
         news_triage.format_news_triage(triage),
     ]
+    # format_edgar_filings() returns '' when nothing was filed in the
+    # window, which is the common case on any given day.
+    edgar_text = news_triage.format_edgar_filings(edgar) if edgar else ""
+    if edgar_text:
+        parts.extend(["", edgar_text])
     if df_screener is not None and len(df_screener) > 0:
         parts.extend(["", "📊 SCREENER", screener.format_screener_output(df_screener)])
     else:
@@ -292,6 +297,22 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         logger.error("Section 1 (Global Markets) FAILED: %s", exc, exc_info=True)
         sections.append((f"⚠️ Global markets data unavailable: {exc}", None))
 
+    # ── SECTION 1b: CFTC COT POSITIONING ────────────────────────
+    # Rates/macro data, so it sits with Section 1 rather than getting a
+    # section number of its own. Its own try/except: weekly CFTC data is
+    # a nice-to-have and a fetch failure must not blank Section 1.
+    # format_cot_positioning() returns '' on empty data, which skips the
+    # section rather than printing a bare header.
+    try:
+        cot_text = market_snapshot.format_cot_positioning(
+            market_snapshot.fetch_cot_positioning()
+        )
+        if cot_text:
+            sections.append((cot_text, None))
+            all_text.append(cot_text)
+    except Exception as exc:
+        logger.warning("COT positioning failed — continuing without it: %s", exc)
+
     # ── SECTION 2: ECONOMIC CALENDAR ────────────────────────────
     # No synthesis — data only, self-explanatory.
     try:
@@ -335,7 +356,15 @@ def build_morning_brief() -> list[tuple[str, "InlineKeyboardMarkup | None"]]:
         triage = news_triage.run_news_triage(positions.get_all_tickers())
         df_screener = screener.run_screener()
 
-        s4_text = _format_section4_news_signals(triage, df_screener)
+        # Held positions only (not the watchlist) — EDGAR is capped at
+        # EDGAR_MAX_TICKERS per run, so spend it on what we own.
+        try:
+            edgar = news_triage.fetch_edgar_filings(list(positions.POSITIONS.keys()))
+        except Exception as exc:
+            logger.warning("EDGAR filings fetch failed — continuing without it: %s", exc)
+            edgar = {}
+
+        s4_text = _format_section4_news_signals(triage, df_screener, edgar)
 
         thesis_alert_tickers = [t for t, d in triage.items() if d.get("has_thesis_alert")]
         thesis_articles = [

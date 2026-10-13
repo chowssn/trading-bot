@@ -80,14 +80,17 @@ class TestWebFundamentalsBudget(unittest.TestCase):
 
 
 class TestFetchWebFundamentals(unittest.TestCase):
-    def test_runs_four_searches_and_returns_keyed_results(self):
+    def test_runs_five_searches_and_returns_keyed_results(self):
         adv = _make_advisor()
         with patch.object(adv, "_web_search_and_extract", return_value="some fact") as mock_search:
             result = adv._fetch_web_fundamentals("TSLA", "Tesla")
-        self.assertEqual(mock_search.call_count, 4)
+        self.assertEqual(mock_search.call_count, 5)
         self.assertEqual(
             set(result.keys()),
-            {"fundamentals", "earnings_consensus", "recent_events", "competitive"},
+            {
+                "fundamentals", "earnings_consensus", "recent_events",
+                "competitive", "corporate_actions",
+            },
         )
 
     def test_one_search_failing_does_not_drop_the_others(self):
@@ -101,7 +104,7 @@ class TestFetchWebFundamentals(unittest.TestCase):
         with patch.object(adv, "_web_search_and_extract", side_effect=_side_effect):
             result = adv._fetch_web_fundamentals("TSLA", "Tesla")
         self.assertNotIn("competitive", result)
-        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result), 4)
 
     def test_empty_extraction_result_omitted_from_dict(self):
         adv = _make_advisor()
