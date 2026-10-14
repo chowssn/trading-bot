@@ -958,6 +958,63 @@ SECTOR_QUERY_CONTEXT = {
             'new switch platform launch earnings beat'
         ),
     },
+    'Investment Banking': {
+        'business_terms': (
+            'M&A advisory restructuring fees capital markets '
+            'deal volume announced completed transactions '
+            'managing director headcount productivity '
+            'financial sponsor private equity activity'
+        ),
+        'risk_terms': (
+            'M&A slowdown deal pipeline delay '
+            'restructuring cycle fade credit spreads tightening '
+            'compensation ratio pressure banker attrition '
+            'regulatory antitrust deal approval'
+        ),
+        'valuation_terms': 'P/E advisory peer multiple compensation ratio',
+        'catalyst_terms': (
+            'M&A volume rebound sponsor exit activity '
+            'restructuring mandate earnings revenue beat'
+        ),
+    },
+    'Pharmaceuticals': {
+        'business_terms': (
+            'drug sales blockbuster franchise patent expiry '
+            'pipeline Phase 3 oncology vaccines '
+            'Keytruda Gardasil revenue concentration '
+            'licensing acquisition business development'
+        ),
+        'risk_terms': (
+            'patent cliff loss of exclusivity biosimilar '
+            'IRA Medicare drug price negotiation '
+            'clinical trial failure FDA rejection '
+            'China sales decline tariff pharma'
+        ),
+        'valuation_terms': 'P/E pipeline NPV dividend yield patent cliff discount',
+        'catalyst_terms': (
+            'FDA approval PDUFA date Phase 3 readout '
+            'acquisition announcement earnings guidance'
+        ),
+    },
+    'Electric Vehicles': {
+        'business_terms': (
+            'vehicle delivery production Cybercab robotaxi '
+            'energy storage Megapack Powerwall '
+            'FSD autonomy software revenue '
+            'China Shanghai factory BYD competition'
+        ),
+        'risk_terms': (
+            'demand slowdown price cut margin compression '
+            'BYD competition China market share '
+            'Elon Musk distraction regulatory NHTSA '
+            'FSD delay autonomy timeline'
+        ),
+        'valuation_terms': 'P/E delivery multiple EV/EBITDA autonomy premium',
+        'catalyst_terms': (
+            'delivery numbers quarterly robotaxi launch '
+            'FSD milestone Megapack order earnings'
+        ),
+    },
     'ETF / Index': {
         'business_terms': (
             'fund flows AUM sector rotation '
