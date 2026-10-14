@@ -507,6 +507,7 @@ async def send_help(update, context):
         "/monitoring [TICKER] — Active monitoring items, carried forward across briefs\n\n"
         "*Discussion*\n"
         "/discuss TICKER — Discuss a ticker\n"
+        "/refresh TICKER — Force fresh web search for a ticker\n"
         "/macro — Macro and regime discussion\n"
         "/portfolio_review — In-depth portfolio review\n"
         "/switch thread_id — Switch active thread\n"
@@ -882,6 +883,51 @@ async def send_discuss(update, context):
         )
         return
     await start_or_resume_discussion(context.args[0], update, context)
+
+
+@authorized_only
+async def send_refresh_ticker(update, context):
+    """/refresh TICKER — forces fresh web searches for a ticker.
+
+    Invalidates the advisor's daily web-fundamentals cache and pre-fetches
+    the ticker context, so the next /discuss TICKER uses current data.
+    """
+    if not context.args:
+        await reply(update, context, "Usage: /refresh TICKER\nExample: /refresh CEG")
+        return
+
+    ticker = context.args[0].upper()
+    if not _is_valid_ticker(ticker):
+        await reply(update, context, f"Invalid ticker: {ticker}")
+        return
+
+    # Invalidating with the hourly web budget exhausted would discard
+    # today's cached research and fetch nothing in its place.
+    if not advisor._web_fundamentals_budget_available():
+        await reply(update, context,
+            f"⚠️ Hourly web search budget exhausted — keeping today's cached {ticker} data. "
+            f"Try again later.",
+            reply_markup=make_main_menu(),
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"🔄 Refreshing {ticker} — running fresh web searches (~30s)...",
+    )
+
+    advisor.invalidate_ticker_cache(ticker)
+    try:
+        await run_in_executor(advisor.get_ticker_context, ticker)
+        await reply(update, context,
+            f"✅ {ticker} context refreshed. Open /discuss {ticker} for updated analysis.",
+            reply_markup=make_tickers_keyboard([ticker]),
+        )
+    except Exception as e:
+        await reply(update, context,
+            f"⚠️ Refresh failed for {ticker}: {e}",
+            reply_markup=make_main_menu(),
+        )
 
 
 @authorized_only
@@ -2197,6 +2243,7 @@ KNOWN_COMMANDS = [
     "switch", "add", "remove", "update", "set", "save", "framework",
     "confirm", "cancel", "done", "audit", "logs", "status", "logout",
     "start", "help", "monitoring", "dismiss", "restart", "kill",
+    "refresh",
 ]
 
 
@@ -3301,6 +3348,7 @@ async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("brief", "Full morning brief"),
         BotCommand("discuss", "Discuss a ticker: /discuss APP"),
+        BotCommand("refresh", "Force fresh web search for a ticker"),
         BotCommand("macro", "Macro and regime discussion"),
         BotCommand("prices", "Live prices — yields, FX, commodities, positions"),
         BotCommand("portfolio", "Portfolio price action"),
@@ -3400,6 +3448,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("watchlist", send_watchlist))
     app.add_handler(CommandHandler("threads", send_threads))
     app.add_handler(CommandHandler("discuss", send_discuss))
+    app.add_handler(CommandHandler("refresh", send_refresh_ticker))
     app.add_handler(CommandHandler("macro", send_macro))
     app.add_handler(CommandHandler("prices", send_prices))
     app.add_handler(CommandHandler("portfolio_review", send_portfolio_review))

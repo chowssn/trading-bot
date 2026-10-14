@@ -226,6 +226,7 @@ def _is_valid_ticker(ticker: str) -> bool:
         return False
     return ticker.upper() not in NON_TICKER_SUBJECTS
 
+
 # get_macro_context()'s TTL — same cadence as market_snapshot's
 # fetch_macro_intelligence() (MACRO_INTEL_CACHE_HOURS), so both macro
 # surfaces (brief + MACRO thread) refresh on a comparable schedule.
@@ -500,7 +501,7 @@ class Advisor:
             sections.append(cross_thread_ctx)
 
         sections.append(
-            '--- SYNTHESIS DISCIPLINE ---\n'
+            '--- SYNTHESIS DISCIPLINE — ABSOLUTE RULES ---\n'
             'Never ask the user for data the system already provides:\n'
             '- Current prices: always in the portfolio table above\n'
             '- 1D moves: always in the portfolio table above\n'
@@ -512,8 +513,28 @@ class Advisor:
             '2. Read the thesis-breaker threshold from the position config\n'
             '3. State whether the condition is triggered, approaching, or clear\n'
             '4. Do not ask the user to confirm what the data already shows\n\n'
-            'The user hired an advisor to synthesize, not to be asked questions '
-            'the advisor should answer itself.\n\n'
+            'NEVER ask the user to provide data you can fetch yourself. This includes:\n'
+            '- Company news, earnings results, analyst ratings\n'
+            '- Contract details, deal announcements, press releases\n'
+            '- Price data, technical levels, RSI readings\n'
+            '- Competitor information, market share data\n\n'
+            'When you need current data that is not in your context:\n'
+            '- State what you know from current context\n'
+            '- State explicitly what is missing\n'
+            '- Proceed with the analysis using available data\n'
+            '- Flag the gap as something to verify, not a blocker\n\n'
+            'NEVER say:\n'
+            '- "Can you paste in the details..."\n'
+            '- "If you have a news article you can share..."\n'
+            '- "What can you share on..."\n'
+            '- "I need you to provide..."\n\n'
+            'ALWAYS say instead:\n'
+            '- "I don\'t have [X] in my current context — my web search from [time] '
+            'did not surface this. Here is my analysis with available data: [proceed]"\n'
+            '- "This is a data gap I flagged — for a complete picture, verify [X] '
+            'at [source]. Based on what I have: [proceed with analysis]"\n\n'
+            'The user hired an advisor to synthesize and decide, not to act as a '
+            'data entry clerk feeding you information you should fetch yourself.\n\n'
             'Never suggest running /brief — the user already has it.\n'
             'Never suggest /brief TICKER — that command does not exist.\n'
             'If you need updated technicals for a ticker, call get_ticker_context() '
@@ -1066,6 +1087,34 @@ class Advisor:
     # verified market cap/shares/segment/customer detail, earnings date +
     # analyst consensus, recent material events, and named competitors —
     # none of which yfinance or FMP's free tier reliably carries.
+
+    def _web_fundamentals_budget_available(self) -> bool:
+        """Non-consuming peek at _web_fundamentals_budget_ok()'s hourly cap.
+
+        Callers that invalidate the cache before re-fetching check this
+        first: invalidating with the budget exhausted would discard today's
+        batch and get nothing back (_fetch_web_fundamentals() returns {}).
+        """
+        now = time.time()
+        recent = [t for t in self._web_fundamentals_call_times if now - t < 3600]
+        return len(recent) < WEB_FUNDAMENTALS_MAX_PER_HOUR
+
+    def invalidate_ticker_cache(self, ticker: str) -> None:
+        """Drop the daily _fetch_web_fundamentals() cache for `ticker`, so the
+        next get_ticker_context() call runs fresh web searches. Called only
+        by bot.py's /refresh TICKER — the sole explicit invalidation path.
+        """
+        prefix = f'{ticker.upper()}_'
+        keys_to_remove = [
+            k for k in self._web_fundamentals_cache if k.upper().startswith(prefix)
+        ]
+        for k in keys_to_remove:
+            del self._web_fundamentals_cache[k]
+        if keys_to_remove:
+            logger.info(
+                'invalidate_ticker_cache: cleared %d cache entries for %s',
+                len(keys_to_remove), ticker,
+            )
 
     def _web_fundamentals_budget_ok(self) -> bool:
         """Self-contained hourly cap on _fetch_web_fundamentals() batches.
