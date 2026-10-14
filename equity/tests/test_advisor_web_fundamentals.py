@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from equity.config.market_config import SECTOR_QUERY_CONTEXT
 from equity.telegram import advisor as advisor_module
 from equity.telegram.advisor import Advisor, WEB_FUNDAMENTALS_MAX_PER_HOUR
 
@@ -233,6 +234,63 @@ class TestGetTickerContextWebSection(unittest.TestCase):
             result = adv.get_ticker_context("TSLA")  # must not raise
         self.assertIn("WEB-SEARCHED FUNDAMENTALS: unavailable", result)
         self.assertIn("PRICE & TECHNICALS", result)
+
+
+class TestSectorContext(unittest.TestCase):
+    def _with_config(self, positions=None, watchlist=None):
+        return patch.multiple(
+            advisor_module.positions_config,
+            POSITIONS=positions or {}, WATCHLIST=watchlist or {},
+        )
+
+    def test_override_beats_broad_gics_label(self):
+        # TSM is labelled "Information Technology" in config, which would
+        # fuzzy-match generic Technology; the override must win.
+        with self._with_config({"TSM": {"sector": "Information Technology"}}):
+            ctx = advisor_module._get_sector_context("TSM")
+        self.assertIs(ctx, SECTOR_QUERY_CONTEXT["Semiconductors"])
+
+    def test_exact_sector_label_match(self):
+        with self._with_config({"XYZ": {"sector": "Insurance"}}):
+            ctx = advisor_module._get_sector_context("XYZ")
+        self.assertIs(ctx, SECTOR_QUERY_CONTEXT["Insurance"])
+
+    def test_fuzzy_sector_label_match(self):
+        with self._with_config(watchlist={"XYZ": {"sector": "Utilities"}}):
+            ctx = advisor_module._get_sector_context("XYZ")
+        self.assertIs(ctx, SECTOR_QUERY_CONTEXT["Nuclear / Utilities"])
+
+    def test_missing_sector_returns_empty_not_first_entry(self):
+        with self._with_config({"XYZ": {}}):
+            self.assertEqual(advisor_module._get_sector_context("XYZ"), {})
+
+    def test_unknown_ticker_and_unmatched_sector_return_empty(self):
+        with self._with_config({"XYZ": {"sector": "Consumer Cyclical"}}):
+            self.assertEqual(advisor_module._get_sector_context("XYZ"), {})
+            self.assertEqual(advisor_module._get_sector_context("NOPE"), {})
+
+
+class TestBuildQuery(unittest.TestCase):
+    def test_caps_sector_terms_at_eight_words(self):
+        q = advisor_module._build_query("base", "a b c d e f g h i j", "CCJ", "Cameco")
+        self.assertEqual(q, "CCJ Cameco a b c d e f g h base")
+
+    def test_empty_sector_terms_and_name_normalise_whitespace(self):
+        self.assertEqual(advisor_module._build_query("base  terms", "", "CCJ", ""), "CCJ base terms")
+
+
+class TestFetchWebFundamentalsSectorInjection(unittest.TestCase):
+    def test_sector_terms_injected_except_corporate_actions(self):
+        adv = _make_advisor()
+        ctx = SECTOR_QUERY_CONTEXT["Uranium / Mining"]
+        with patch.object(adv, "_web_search_and_extract", return_value="fact") as mock_search:
+            adv._fetch_web_fundamentals("CCJ", "Cameco")
+        queries = [call.args[0] for call in mock_search.call_args_list]
+        for terms_key in ("business_terms", "valuation_terms", "catalyst_terms", "risk_terms"):
+            first_word = ctx[terms_key].split()[0]
+            self.assertTrue(any(first_word in q for q in queries), terms_key)
+        corporate = next(q for q in queries if "secondary offering" in q)
+        self.assertNotIn("uranium", corporate)
 
 
 if __name__ == "__main__":

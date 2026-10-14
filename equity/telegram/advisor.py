@@ -24,7 +24,7 @@ from equity.brief import market_snapshot
 from equity.data.price_cache import price_cache
 from equity.config import positions as positions_config
 from equity.config import settings
-from equity.config.market_config import HIGHLIGHT_MA_PERIODS
+from equity.config.market_config import HIGHLIGHT_MA_PERIODS, SECTOR_QUERY_CONTEXT
 from equity.screener import quality_scorer
 from equity.telegram.threads import ThreadManager
 
@@ -128,6 +128,82 @@ class _NotATickerError(Exception):
     renders a clear "not a tradable ticker" message instead of being
     lumped in with (and logged as) an actual fetch failure.
     """
+
+
+# Curated ticker → SECTOR_QUERY_CONTEXT key. Checked *before* the
+# POSITIONS/WATCHLIST 'sector' label, because those labels are broad GICS
+# sectors ("Information Technology", "Financials") — matching on them
+# alone would give TSM/CDNS/ANET generic Technology terms and leave
+# PGR/SMFG/CCJ with no context at all.
+TICKER_SECTOR_OVERRIDES = {
+    'CCJ': 'Uranium / Mining',
+    'CEG': 'Nuclear / Utilities',
+    'URA': 'Uranium / Mining',
+    'SKHY': 'Semiconductors',
+    'TSM': 'Semiconductors',
+    'NVDA': 'Semiconductors',
+    'AMD': 'Semiconductors',
+    'SMH': 'Semiconductors',
+    'ANET': 'Networking / Infrastructure',
+    'CDNS': 'EDA / Electronic Design',
+    'BYDDY': 'China / EM ADR',
+    'EWW': 'ETF / Index',
+    'FCX': 'Copper / Materials',
+    'NUE': 'Copper / Materials',
+    'PPLT': 'Copper / Materials',
+    'UMAC': 'Defense / Aerospace',
+    'QBTS': 'Technology',
+    'RDDT': 'Social Media / Digital Ads',
+    'APP': 'Social Media / Digital Ads',
+    'SMFG': 'Japan / Asia Financials',
+    'PGR': 'Insurance',
+    'ABT': 'Healthcare / Medtech',
+    'BSX': 'Healthcare / Medtech',
+    'ZTS': 'Healthcare / Medtech',
+    'HLI': 'Technology',
+    'JKHY': 'Technology',
+    'ADP': 'Technology',
+    'CTAS': 'Industrials',
+    'CAT': 'Industrials',
+    'PWR': 'Industrials',
+    'VRT': 'Industrials',
+}
+
+
+def _get_sector_context(ticker: str) -> dict:
+    """Sector query context (SECTOR_QUERY_CONTEXT entry) for `ticker`:
+    TICKER_SECTOR_OVERRIDES first, then the POSITIONS/WATCHLIST 'sector'
+    label (exact, then case-insensitive substring match either way).
+    Empty dict if nothing matches — callers then fall back to generic
+    queries.
+    """
+    override = TICKER_SECTOR_OVERRIDES.get(ticker)
+    if override in SECTOR_QUERY_CONTEXT:
+        return SECTOR_QUERY_CONTEXT[override]
+
+    pos = positions_config.POSITIONS.get(ticker) or positions_config.WATCHLIST.get(ticker) or {}
+    sector = (pos.get('sector') or '').strip()
+    if not sector:
+        # Guard matters: '' is a substring of every key, so the fuzzy
+        # loop below would hand an unlabelled ticker the first entry.
+        return {}
+    if sector in SECTOR_QUERY_CONTEXT:
+        return SECTOR_QUERY_CONTEXT[sector]
+
+    sector_lower = sector.lower()
+    for key, ctx in SECTOR_QUERY_CONTEXT.items():
+        if key.lower() in sector_lower or sector_lower in key.lower():
+            return ctx
+    return {}
+
+
+def _build_query(base_terms: str, sector_terms: str, ticker: str, company_name: str) -> str:
+    """`{ticker} {company_name} {sector snippet} {base_terms}`, whitespace
+    normalised. The sector snippet is capped at its first 8 words so the
+    injected terms steer the search without drowning the base query.
+    """
+    sector_snippet = ' '.join(sector_terms.split()[:8]) if sector_terms else ''
+    return ' '.join(f'{ticker} {company_name} {sector_snippet} {base_terms}'.split())
 
 
 def _is_valid_ticker(ticker: str) -> bool:
@@ -1092,13 +1168,20 @@ class Advisor:
             return {}
 
         name_ctx = company_name or ticker
+        # Sector-specific terms steer each search toward the metrics that
+        # matter for this kind of business (EV/lb for miners, NIM for
+        # Japanese banks…). Empty for unmapped tickers → generic queries.
+        sector_ctx = _get_sector_context(ticker)
 
         # query, extract_prompt, max_tokens — one entry per search.
         searches: dict[str, tuple[str, str, int]] = {
             "fundamentals": (
-                f"{ticker} {name_ctx} stock market cap shares outstanding "
-                f"revenue breakdown by segment geography fiscal 2025 2026 "
-                f"customer concentration top customers",
+                _build_query(
+                    "stock market cap shares outstanding "
+                    "revenue breakdown by segment geography fiscal 2025 2026 "
+                    "customer concentration top customers",
+                    sector_ctx.get("business_terms", ""), ticker, name_ctx,
+                ),
                 f"Extract these specific facts about {ticker} from the source:\n"
                 f"- Market cap (current, verified)\n"
                 f"- Shares outstanding (current)\n"
@@ -1111,9 +1194,12 @@ class Advisor:
                 500,
             ),
             "earnings_consensus": (
-                f"{ticker} {name_ctx} next earnings date "
-                f"analyst price target consensus EPS revenue estimate "
-                f"Wall Street forecast",
+                _build_query(
+                    "next earnings date "
+                    "analyst price target consensus EPS revenue estimate "
+                    "Wall Street forecast",
+                    sector_ctx.get("valuation_terms", ""), ticker, name_ctx,
+                ),
                 f"Extract these specific facts about {ticker} from the source:\n"
                 f"- Next earnings date (exact date or expected quarter)\n"
                 f"- Consensus EPS estimate for next quarter\n"
@@ -1128,9 +1214,12 @@ class Advisor:
                 400,
             ),
             "recent_events": (
-                f"{ticker} {name_ctx} news contract award regulatory "
-                f"management change acquisition partnership earnings results "
-                f"guidance update last 90 days",
+                _build_query(
+                    "news contract award regulatory "
+                    "management change acquisition partnership earnings results "
+                    "guidance update last 90 days",
+                    sector_ctx.get("catalyst_terms", ""), ticker, name_ctx,
+                ),
                 f"Extract material events for {ticker} from the last 90 days:\n"
                 f"- Any contract wins or losses (include value if disclosed)\n"
                 f"- Regulatory filings or decisions (FDA, FCC, DOD, SEC, etc.)\n"
@@ -1145,8 +1234,11 @@ class Advisor:
                 500,
             ),
             "competitive": (
-                f"{ticker} {name_ctx} competitors market share competitive position "
-                f"industry landscape peer comparison",
+                _build_query(
+                    "competitors market share competitive position "
+                    "industry landscape peer comparison",
+                    sector_ctx.get("risk_terms", ""), ticker, name_ctx,
+                ),
                 f"Extract competitive context for {ticker}:\n"
                 f"- Primary competitors (name each, one line on why they compete)\n"
                 f"- Market position (leader/challenger/niche, and in which specific market)\n"
@@ -1157,6 +1249,7 @@ class Advisor:
                 f'Do not estimate market share if not found — write "not found".',
                 400,
             ),
+            # No sector injection — corporate actions are universal.
             "corporate_actions": (
                 f"{ticker} {name_ctx} secondary offering lockup expiration "
                 f"insider selling share buyback SEC filing 2026",

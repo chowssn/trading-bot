@@ -692,3 +692,284 @@ EDGAR_8K_ITEMS_OF_INTEREST = {
     "7.01": "regulation FD disclosure",
     "8.01": "other material event",
 }
+
+# ============================================================
+# SECTOR QUERY CONTEXT
+# Injects sector-specific search terms into web fundamentals queries
+# (advisor._fetch_web_fundamentals). Keyed by sector label — resolved
+# from advisor.TICKER_SECTOR_OVERRIDES first, then POSITIONS/WATCHLIST
+# [ticker]['sector'] (exact, then fuzzy match).
+# ============================================================
+
+SECTOR_QUERY_CONTEXT = {
+    'Technology': {
+        'business_terms': (
+            'software revenue ARR recurring contracts '
+            'cloud hyperscaler Microsoft Azure AWS Google '
+            'enterprise customers churn NRR'
+        ),
+        'risk_terms': (
+            'competition open source pricing pressure '
+            'customer concentration cloud spending slowdown '
+            'AI disruption regulatory antitrust'
+        ),
+        'valuation_terms': 'EV/Revenue Rule of 40 FCF margin expansion',
+        'catalyst_terms': 'product launch earnings guidance raise contract win',
+    },
+    'Semiconductors': {
+        'business_terms': (
+            'fab capacity utilization inventory correction '
+            'AI chip HBM memory TSMC Samsung supply chain '
+            'hyperscaler capex NVIDIA AMD Intel orders backlog'
+        ),
+        'risk_terms': (
+            'export controls China restrictions inventory glut '
+            'capex cuts from hyperscalers pricing pressure '
+            'geopolitical Taiwan risk supply disruption'
+        ),
+        'valuation_terms': 'P/Book cycle trough EV/EBITDA upcycle',
+        'catalyst_terms': (
+            'earnings wafer shipments capacity expansion '
+            'new chip architecture design win'
+        ),
+    },
+    'Nuclear / Utilities': {
+        'business_terms': (
+            'power purchase agreement PPA nuclear capacity factor '
+            'hyperscaler data center power contract Microsoft Google Amazon '
+            'baseload capacity FERC NERC regulatory rate case '
+            'natural gas merchant generation fleet capacity'
+        ),
+        'risk_terms': (
+            'regulatory NRC license extension plant shutdown '
+            'natural gas price merchant exposure '
+            'interest rate sensitivity utility multiple '
+            'acquisition integration leverage debt covenant'
+        ),
+        'valuation_terms': 'EV/EBITDA regulated utility P/E dividend yield',
+        'catalyst_terms': (
+            'new PPA signed capacity auction result '
+            'rate case approval earnings guidance'
+        ),
+    },
+    'Uranium / Mining': {
+        'business_terms': (
+            'uranium spot price long-term contract utility buyer '
+            'Cameco Kazatomprom production volume '
+            'nuclear fuel cycle enrichment conversion'
+        ),
+        'risk_terms': (
+            'spot price decline utility contract cancellation '
+            'Kazakhstan production flood geopolitical '
+            'reactor shutdown demand destruction'
+        ),
+        'valuation_terms': 'EV/lb uranium in ground NAV premium spot price',
+        'catalyst_terms': (
+            'spot price move long-term contract signed '
+            'utility procurement cycle reactor restart'
+        ),
+    },
+    'Industrials': {
+        'business_terms': (
+            'infrastructure government contract backlog '
+            'construction data center power grid '
+            'copper steel commodity input costs '
+            'reshoring manufacturing capex cycle'
+        ),
+        'risk_terms': (
+            'commodity input cost inflation tariffs '
+            'government spending cuts infrastructure bill '
+            'copper price demand China slowdown '
+            'interest rate construction financing'
+        ),
+        'valuation_terms': 'EV/EBITDA backlog multiple P/E cycle',
+        'catalyst_terms': (
+            'major contract award infrastructure bill funding '
+            'backlog growth earnings guidance'
+        ),
+    },
+    'Copper / Materials': {
+        'business_terms': (
+            'copper production mine grade concentrate '
+            'Chile Peru Indonesia Freeport operations '
+            'gold byproduct molybdenum byproduct '
+            'smelter TC/RC treatment refining charges'
+        ),
+        'risk_terms': (
+            'copper price decline China demand slowdown '
+            'mine disruption labor strike water rights '
+            'energy cost Chile royalty tax '
+            'environmental permit delay'
+        ),
+        'valuation_terms': 'EV/lb copper reserves NAV P/NAV cycle multiple',
+        'catalyst_terms': (
+            'copper price move China PMI infrastructure stimulus '
+            'mine production update quarterly earnings'
+        ),
+    },
+    'China / EM ADR': {
+        'business_terms': (
+            'China revenue market share EV battery '
+            'BYD CATL NIO domestic competition '
+            'export markets Europe tariffs subsidy '
+            'ADR delisting risk VIE structure'
+        ),
+        'risk_terms': (
+            'China regulatory crackdown delisting risk '
+            'US-China trade tensions tariffs sanctions '
+            'ADR audit PCAOB compliance '
+            'VIE structure risk domestic competition'
+        ),
+        'valuation_terms': 'P/E China tech discount VIE haircut ADR premium',
+        'catalyst_terms': (
+            'China stimulus EV subsidy policy change '
+            'export market expansion earnings beat'
+        ),
+    },
+    'Japan / Asia Financials': {
+        'business_terms': (
+            'BOJ rate hike NIM expansion net interest margin '
+            'loan growth deposit cost yen carry trade '
+            'Japanese bank dividend yield buyback '
+            'SMFG MUFG Mizuho domestic vs international'
+        ),
+        'risk_terms': (
+            'yen carry trade unwind BOJ policy reversal '
+            'Japan credit quality NPL ratio '
+            'US-Japan rate differential currency risk '
+            'domestic deflation reversal'
+        ),
+        'valuation_terms': 'P/Book ROE Japanese bank NIM expansion discount',
+        'catalyst_terms': (
+            'BOJ rate decision NIM guidance raise '
+            'dividend increase buyback announcement'
+        ),
+    },
+    'Healthcare / Medtech': {
+        'business_terms': (
+            'FDA approval clinical trial device approval '
+            'procedure volume hospital capex '
+            'recurring revenue consumables service contract '
+            'Medicare reimbursement rate'
+        ),
+        'risk_terms': (
+            'FDA rejection clinical trial failure '
+            'Medicare reimbursement cut competitive device '
+            'hospital budget pressure elective procedure slowdown'
+        ),
+        'valuation_terms': 'EV/Revenue medtech premium P/E pipeline value',
+        'catalyst_terms': (
+            'FDA decision PDUFA date trial readout '
+            'new product launch clearance earnings'
+        ),
+    },
+    'Insurance': {
+        'business_terms': (
+            'combined ratio loss ratio expense ratio '
+            'premium growth rate increases '
+            'catastrophe exposure reinsurance '
+            'investment portfolio yield float'
+        ),
+        'risk_terms': (
+            'catastrophe loss hurricane wildfire '
+            'reserve strengthening adverse development '
+            'competitive pricing pressure soft market '
+            'investment portfolio credit risk'
+        ),
+        'valuation_terms': 'P/Book ROE combined ratio premium to book',
+        'catalyst_terms': (
+            'rate hardening pricing update '
+            'catastrophe season loss estimate earnings'
+        ),
+    },
+    'Defense / Aerospace': {
+        'business_terms': (
+            'DoD contract NDAA defense budget '
+            'drone UAV unmanned autonomous '
+            'ITAR export license foreign military sales '
+            'backlog program of record'
+        ),
+        'risk_terms': (
+            'budget cut continuing resolution sequestration '
+            'program cancellation cost overrun '
+            'ITAR violation export control '
+            'DJI competition import ban reversal'
+        ),
+        'valuation_terms': 'EV/EBITDA defense multiple backlog coverage',
+        'catalyst_terms': (
+            'contract award program win NDAA provision '
+            'export license approval earnings'
+        ),
+    },
+    'Social Media / Digital Ads': {
+        'business_terms': (
+            'DAU MAU ARPU ad revenue CPM CPC '
+            'advertiser demand holiday season Q4 '
+            'AI content recommendation feed algorithm '
+            'data licensing AI training revenue'
+        ),
+        'risk_terms': (
+            'ad market slowdown recession advertiser cuts '
+            'Apple ATT privacy regulation '
+            'TikTok competition user growth deceleration '
+            'content moderation regulatory fine'
+        ),
+        'valuation_terms': 'EV/Revenue P/E ad revenue multiple MAU monetization',
+        'catalyst_terms': (
+            'Q4 holiday ad spend earnings beat '
+            'new ad format product launch data deal'
+        ),
+    },
+    'EDA / Electronic Design': {
+        'business_terms': (
+            'EDA software design starts semiconductor '
+            'hyperscaler custom silicon ASIC '
+            'AI chip design Nvidia Apple custom '
+            'subscription recurring revenue renewal rate'
+        ),
+        'risk_terms': (
+            'export controls China EDA ban '
+            'design start slowdown capex cuts '
+            'hyperscaler in-house EDA tool competition '
+            'Synopsys Mentor competition'
+        ),
+        'valuation_terms': 'EV/Revenue Rule of 40 subscription multiple',
+        'catalyst_terms': (
+            'hyperscaler design win custom chip program '
+            'earnings backlog guidance raise'
+        ),
+    },
+    'Networking / Infrastructure': {
+        'business_terms': (
+            'data center switching routing hyperscaler '
+            'Microsoft Azure AWS Google capex '
+            'AI fabric spine-leaf architecture '
+            'port speed 400G 800G 1.6T upgrade cycle'
+        ),
+        'risk_terms': (
+            'hyperscaler capex cut spending pause '
+            'Cisco Juniper competition white box '
+            'supply chain lead times inventory '
+            'AI spending narrative shift'
+        ),
+        'valuation_terms': 'P/E EV/Revenue hyperscaler capex correlation',
+        'catalyst_terms': (
+            'hyperscaler capex guidance product win '
+            'new switch platform launch earnings beat'
+        ),
+    },
+    'ETF / Index': {
+        'business_terms': (
+            'fund flows AUM sector rotation '
+            'benchmark rebalancing constituent change '
+            'expense ratio tracking error'
+        ),
+        'risk_terms': (
+            'sector outflow rotation away '
+            'constituent weight reduction '
+            'benchmark change reconstitution'
+        ),
+        'valuation_terms': 'premium discount to NAV fund flow trend',
+        'catalyst_terms': 'sector rotation rebalancing fund flow data',
+    },
+}
